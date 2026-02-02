@@ -1,0 +1,82 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lollmsbot"
+version = "0.1.0"
+description = "Lollms Bot Framework - A multi-channel AI agent platform"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "ParisNeo"}
+]
+keywords = ["bot", "ai", "agent", "chatbot", "lollms", "telegram", "discord"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Communications :: Chat",
+    "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
+dependencies = [
+    "pydantic>=2.0",
+    "fastapi",
+    "uvicorn",
+    "websockets",
+    "requests",
+    "aiohttp",
+    "python-telegram-bot",
+    "discord.py",
+    "click",
+    "aiosqlite",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "black",
+    "ruff",
+    "mypy",
+]
+
+[project.scripts]
+lollmsbot = "lollmsbot.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/ParisNeo/lollmsBot"
+Repository = "https://github.com/ParisNeo/lollmsBot.git"
+Issues = "https://github.com/ParisNeo/lollmsBot/issues"
+
+[tool.setuptools.packages.find]
+include = ["lollmsbot*"]
+
+[tool.black]
+line-length = 88
+target-version = ["py39", "py310", "py311", "py312"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py39"
+select = ["E", "F", "I", "N", "W", "UP", "B", "C4", "SIM"]
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
