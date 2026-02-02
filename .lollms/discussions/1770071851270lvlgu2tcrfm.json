@@ -1,0 +1,87 @@
+{
+  "id": "1770071851270lvlgu2tcrfm",
+  "title": "New Discussion",
+  "messages": [
+    {
+      "role": "system",
+      "content": "🤖 **Agent Mode Activated.** Architect is ready."
+    }
+  ],
+  "timestamp": 1770071851271,
+  "groupId": null,
+  "plan": null,
+  "capabilities": {
+    "codeGenType": "full",
+    "allowedFormats": {
+      "fullFile": true,
+      "insert": false,
+      "replace": false,
+      "delete": false
+    },
+    "fileRename": true,
+    "fileDelete": true,
+    "fileSelect": true,
+    "fileReset": true,
+    "imageGen": true,
+    "webSearch": false,
+    "arxivSearch": false,
+    "funMode": false,
+    "thinkingMode": "none",
+    "herdMode": false,
+    "herdDynamicMode": true,
+    "herdParticipants": [],
+    "herdPreAnswerParticipants": [
+      {
+        "model": "Qwen3 vl 235",
+        "personality": "default_coder"
+      },
+      {
+        "model": "Qwen3 vl 235",
+        "personality": "default_coder"
+      }
+    ],
+    "herdPostAnswerParticipants": [
+      {
+        "model": "Qwen3 vl 235",
+        "personality": "code_reviewer"
+      },
+      {
+        "model": "Qwen3 vl 235",
+        "personality": "code_reviewer"
+      }
+    ],
+    "herdRounds": 2,
+    "agentMode": true,
+    "autoContextMode": false,
+    "gitWorkflow": true,
+    "guiState": {
+      "agentBadge": true,
+      "autoContextBadge": true,
+      "herdBadge": true
+    },
+    "gitCommit": true,
+    "herdPreCodeParticipants": [
+      {
+        "model": "Qwen3 vl 235",
+        "personality": "default_coder"
+      },
+      {
+        "model": "Qwen3 vl 235",
+        "personality": "default_coder"
+      }
+    ],
+    "herdPostCodeParticipants": [
+      {
+        "model": "Qwen3 vl 235",
+        "personality": "code_reviewer"
+      },
+      {
+        "model": "Qwen3 vl 235",
+        "personality": "code_reviewer"
+      }
+    ],
+    "responseMode": "balanced"
+  },
+  "personalityId": "default_coder",
+  "importedSkills": []
+}
