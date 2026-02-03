@@ -140,8 +140,6 @@ lollmsbot gateway --host 127.0.0.1 --port 8800
 
 ## 🛠️ Build Status
 
-[
-[
 
 ## 🤝 Contributing
 
@@ -152,8 +150,6 @@ lollmsbot gateway --host 127.0.0.1 --port 8800
 See [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ## 📄 License
-
-[
 
 ```
 Copyright 2026 ParisNeo
