@@ -67,7 +67,7 @@ docker run -p 8800:8800 \
 ```bash
 docker-compose up -d
 # lollmsBot: http://localhost:8800
-# LoLLMS UI:  http://localhost:7860
+# LoLLMS UI:  http://localhost:9642
 ```
 
 ## ⚙️ Configuration
