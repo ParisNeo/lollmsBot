@@ -148,7 +148,7 @@ class HttpTool(Tool):
             # Block localhost and private IPs by default for security
             hostname = parsed.hostname
             if hostname:
-                blocked_hosts = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
+                blocked_hosts = {"localhost", "127.0.0.1", "localhost", "::1"}
                 if hostname in blocked_hosts:
                     return False, f"Access to '{hostname}' is not allowed"
                 

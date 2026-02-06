@@ -5,7 +5,7 @@ description = "LoLLMS-based personal AI assistant (Clawdbot-style)"
 authors = [{ name = "Your Name" }]
 requires-python = ">=3.10"
 dependencies = [
-    "lollms-client>=0.19.0",   # LoLLMS client[web:41]
+    "lollms-client>=1.11.4",   # LoLLMS client[web:41]
     "python-dotenv>=1.0.0",    # .env loading[web:46]
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.30.0",
@@ -16,7 +16,16 @@ dependencies = [
     "discord.py[voice]>=2.3.2",     # Discord bot[web:discord.py]
     "slack-sdk>=3.30.0",     # Slack[web:slack-sdk]
     "openai", # for lollms
-    "PyNaCl"
+    "PyNaCl",
+    "jinja2"
+]
+
+[project.optional-dependencies]
+telegram = [
+    "python-telegram-bot>=20.0",  # Modern async Telegram bot library
+]
+all = [
+    "python-telegram-bot>=20.0",
 ]
 
 [project.scripts]

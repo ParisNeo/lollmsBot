@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LollmsBot - AI Assistant</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Fira+Code&display=swap" rel="stylesheet">
+    <!-- Use relative paths for static files so they work when mounted as sub-app -->
+    <link rel="stylesheet" href="./static/css/style.css">
+</head>
+<body>
+    <div class="app">
+        <!-- Header -->
+        <header class="header">
+            <div class="logo">
+                <div class="logo-icon">AI</div>
+                <span>LollmsBot</span>
+            </div>
+            <div class="header-actions">
+                <button class="btn-icon" id="menu-btn" title="Menu">☰</button>
+                <button class="btn-icon" id="settings-btn" title="Settings">⚙</button>
+            </div>
+        </header>
+        
+        <!-- Sidebar -->
+        <aside class="sidebar">
+            <div class="sidebar-section">
+                <button class="new-chat-btn" id="new-chat-btn">
+                    <span>+</span>
+                    New Chat
+                </button>
+            </div>
+            
+            <div class="sidebar-section">
+                <div class="sidebar-title">Conversations</div>
+                <div class="conversation-list" id="conversation-list">
+                    <div class="conversation-item active">
+                        <div class="conversation-icon">C</div>
+                        <span>Current Chat</span>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="sidebar-section">
+                <div class="sidebar-title">Available Tools</div>
+                <div class="tools-grid">
+                    <div class="tool-badge" title="File operations">Files</div>
+                    <div class="tool-badge" title="HTTP requests">HTTP</div>
+                    <div class="tool-badge" title="Calendar">Calendar</div>
+                    <div class="tool-badge" title="Shell commands">Shell</div>
+                </div>
+            </div>
+            
+            <div class="sidebar-section" style="margin-top: auto;">
+                <div class="status-indicator">
+                    <span class="status-dot" id="status-dot"></span>
+                    <span id="status-text">Connecting...</span>
+                </div>
+            </div>
+        </aside>
+        
+        <!-- Main Chat Area -->
+        <main class="chat-container">
+            <div class="messages-area" id="messages-area">
+                <!-- Welcome screen -->
+                <div class="welcome-screen" id="welcome-screen">
+                    <div class="welcome-icon">🤖</div>
+                    <div class="welcome-title">Welcome to LollmsBot</div>
+                    <div class="welcome-subtitle">Your AI assistant is ready</div>
+                </div>
+            </div>
+            
+            <div class="input-area">
+                <div class="input-container">
+                    <textarea 
+                        class="message-input" 
+                        id="message-input"
+                        placeholder="Message LollmsBot..."
+                        rows="1"
+                    ></textarea>
+                    <div class="input-actions">
+                        <button class="send-btn" id="send-btn" title="Send">➤</button>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+    
+    <!-- Settings Modal -->
+    <div class="modal-overlay" id="settings-modal">
+        <div class="modal">
+            <div class="modal-header">
+                <h3 class="modal-title">Settings</h3>
+                <button class="modal-close" id="close-settings">x</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label class="form-label">LoLLMS Host</label>
+                    <input type="text" class="form-input" id="lollms-host" value="{{ lollms_host }}">
+                    <span class="form-hint">URL of your LoLLMS server</span>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Max History</label>
+                    <input type="number" class="form-input" id="max-history" value="{{ max_history }}" min="1" max="100">
+                    <span class="form-hint">Maximum conversation turns to remember</span>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" id="close-settings-btn">Cancel</button>
+                <button class="btn btn-primary" id="save-settings">Save</button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Use relative path for JS file -->
+    <script src="./static/js/app.js"></script>
+</body>
+</html>

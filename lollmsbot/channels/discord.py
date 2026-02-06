@@ -1,194 +1,402 @@
 import asyncio
 import logging
-from typing import Optional, Any
+import platform
+import subprocess
+from datetime import datetime
+from typing import Optional, Set, Dict, Any, List
+from dataclasses import dataclass, field
 
 import discord
-from discord.ext import commands
-import httpx
+from discord import Embed, Color, File
+
+from lollmsbot.agent import Agent, PermissionLevel
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-class DiscordChannel:
-    """Discord bot channel that forwards messages to lollmsBot gateway."""
 
+@dataclass
+class DiscordUserSession:
+    """Per-user session data for maintaining state."""
+    user_id: str
+    history: List[Dict[str, str]] = field(default_factory=list)
+    max_history: int = 10
+    personality: Optional[str] = None
+    
+    def add_exchange(self, user_msg: str, bot_response: str):
+        """Add a conversation exchange to history."""
+        self.history.append({"role": "user", "content": user_msg})
+        self.history.append({"role": "assistant", "content": bot_response})
+        # Trim to max history
+        while len(self.history) > self.max_history * 2:
+            self.history.pop(0)
+    
+    def get_context_prompt(self, current_message: str) -> str:
+        """Build a prompt with conversation context."""
+        if not self.history:
+            return current_message
+        
+        context_parts = []
+        # Add personality if set
+        if self.personality:
+            context_parts.append(f"[System: You are {self.personality}]")
+        
+        # Add recent history
+        for entry in self.history[-6:]:  # Last 3 exchanges
+            prefix = "User" if entry["role"] == "user" else "Assistant"
+            context_parts.append(f"{prefix}: {entry['content']}")
+        
+        context_parts.append(f"User: {current_message}")
+        context_parts.append("Assistant:")
+        
+        return "\n".join(context_parts)
+
+
+class DiscordChannel:
+    """Enhanced Discord bot channel with full LoLLMS Agent capabilities and file delivery."""
+    
     def __init__(
         self,
+        agent: Agent,
         bot_token: Optional[str] = None,
-        gateway_url: str = "http://localhost:8800",
-        command_prefix: str = "!",
+        allowed_guilds: Optional[Set[int]] = None,
+        allowed_users: Optional[Set[int]] = None,
+        blocked_users: Optional[Set[int]] = None,
+        require_mention_in_guild: bool = True,
+        require_mention_in_dm: bool = False,
     ):
+        self.agent = agent
         self.bot_token = bot_token
-        self.gateway_url = gateway_url
-        self.client = httpx.AsyncClient(timeout=30.0)
+        self.allowed_guilds = allowed_guilds
+        self.allowed_users = allowed_users
+        self.blocked_users = blocked_users or set()
+        self.require_mention_in_guild = require_mention_in_guild
+        self.require_mention_in_dm = require_mention_in_dm
+        
         self._is_running = False
         self._ready_event = asyncio.Event()
-        self.command_prefix = command_prefix
         
-        # Discord intents - ALL required for proper message handling
         self.intents = discord.Intents.default()
         self.intents.message_content = True
         self.intents.guilds = True
         self.intents.guild_messages = True
         self.intents.dm_messages = True
         
-        # Use discord.Client instead of commands.Bot to avoid command framework conflicts
         self.bot = discord.Client(intents=self.intents)
+        self._setup_handlers()
+        
+        # Register file delivery callback with agent
+        self.agent.set_file_delivery_callback(self._deliver_files)
 
+    def _setup_handlers(self) -> None:
+        """Set up Discord.py event handlers."""
+        
         @self.bot.event
         async def on_ready():
             self._is_running = True
             self._ready_event.set()
-            logger.info(f"🤖 Discord bot '{self.bot.user}' ({self.bot.user.id}) connected!")
-            logger.info(f"   Guilds: {len(self.bot.guilds)} servers")
+            logger.info(f"🤖 Discord bot '{self.bot.user}' ready!")
+            logger.info(f"   Servers: {len(self.bot.guilds)}")
             for guild in self.bot.guilds:
-                logger.info(f"   - {guild.name} (ID: {guild.id})")
-                # Log channel permissions
-                for channel in guild.text_channels[:3]:  # Log first 3 channels
-                    perms = channel.permissions_for(guild.me)
-                    logger.info(f"     #{channel.name}: read_messages={perms.read_messages}, send_messages={perms.send_messages}")
-            print(f"🤖 Discord bot '{self.bot.user}' ready!")
+                logger.info(f"   • {guild.name}")
+            print(f"🤖 Discord ready with full agent capabilities!")
 
         @self.bot.event
         async def on_message(message: discord.Message):
-            # CRITICAL: Log ALL messages to see if event fires
-            logger.info(f"RAW MESSAGE from {message.author} in #{getattr(message.channel, 'name', 'DM')}: '{message.content[:100]}'")
-            logger.info(f"  Message type: {message.type}, System: {message.is_system()}")
-            logger.info(f"  Author bot? {message.author.bot}, Self? {message.author == self.bot.user}")
-            logger.info(f"  Guild? {message.guild is not None}")
-            
-            # Ignore own messages
-            if message.author == self.bot.user:
-                logger.debug("  -> Ignoring: own message")
-                return
-            
-            # Ignore other bots
-            if message.author.bot:
-                logger.debug("  -> Ignoring: other bot")
-                return
-            
-            # Check if bot is mentioned in any form
-            is_mentioned = False
-            content_mentions_bot = False
-            
-            if self.bot.user:
-                # Check mentions list
+            await self._handle_message(message)
+
+    def _can_interact(self, message: discord.Message) -> tuple[bool, str]:
+        """Check if we should process this message."""
+        if message.author == self.bot.user:
+            return False, "own message"
+        if message.author.bot:
+            return False, "bot message"
+        if message.author.id in self.blocked_users:
+            return False, "user blocked"
+        if self.allowed_users is not None:
+            if message.author.id not in self.allowed_users:
+                return False, "not in allowed users"
+        if message.guild:
+            if self.allowed_guilds is not None:
+                if message.guild.id not in self.allowed_guilds:
+                    return False, "guild not allowed"
+            if self.require_mention_in_guild:
                 is_mentioned = self.bot.user in message.mentions
-                logger.info(f"  In mentions list: {is_mentioned}")
-                
-                # Check content for mention patterns
-                mention_patterns = [
-                    f"<@{self.bot.user.id}>",
-                    f"<@!{self.bot.user.id}>",
-                ]
-                for pattern in mention_patterns:
-                    if pattern in message.content:
-                        content_mentions_bot = True
-                        logger.info(f"  Found mention pattern: {pattern}")
-                        break
-                
-                # Also check if message starts with @botname (though Discord converts this)
-                if message.content.startswith(f"@{self.bot.user.name}"):
-                    content_mentions_bot = True
-                    logger.info(f"  Found @username mention")
-            
-            # Check for command prefix
-            is_command = message.content.startswith(self.command_prefix + "ask")
-            logger.info(f"  is_mentioned={is_mentioned}, content_mentions_bot={content_mentions_bot}, is_command={is_command}")
-            
-            # Must be mentioned OR use command
-            if not is_mentioned and not content_mentions_bot and not is_command:
-                logger.debug("  -> Ignoring: not mentioned and not command")
-                return
-            
-            # Security: Don't respond to DMs unless explicitly enabled
-            if not message.guild:
-                logger.info(f"DM from {message.author}: {message.content[:50]}...")
-            # Enable DMs - process normally
+                if not is_mentioned and not self._content_mentions_bot(message):
+                    return False, "not mentioned in guild"
+        else:
+            if self.require_mention_in_dm:
+                if self.bot.user not in message.mentions:
+                    return False, "not mentioned in DM"
+        return True, ""
 
-            logger.info(f"PROCESSING message from {message.author} in #{message.channel}: {message.content[:80]}...")
-            
-            # Clean message content - remove bot mentions for cleaner processing
-            clean_content = message.content
-            if self.bot.user:
-                # Remove all mention patterns
-                mention_patterns = [
-                    f"<@{self.bot.user.id}>",
-                    f"<@!{self.bot.user.id}>",
-                    f"@{self.bot.user.name}",
-                ]
-                if self.bot.user.discriminator != "0":
-                    mention_patterns.append(f"@{self.bot.user.name}#{self.bot.user.discriminator}")
-                
-                for pattern in mention_patterns:
-                    clean_content = clean_content.replace(pattern, "")
-                
-                clean_content = clean_content.strip()
-                logger.info(f"  Cleaned content: '{clean_content[:80]}'")
+    def _content_mentions_bot(self, message: discord.Message) -> bool:
+        """Check if message content contains bot mention."""
+        if not self.bot.user:
+            return False
+        patterns = [
+            f"<@{self.bot.user.id}>",
+            f"<@!{self.bot.user.id}>",
+        ]
+        return any(p in message.content for p in patterns)
 
-            # Show typing indicator while processing
-            async with message.channel.typing():
+    def _extract_clean_content(self, message: discord.Message) -> str:
+        """Extract message content, removing bot mentions."""
+        if not self.bot.user:
+            return message.content.strip()
+        
+        content = message.content
+        patterns = [
+            f"<@{self.bot.user.id}>",
+            f"<@!{self.bot.user.id}>",
+            f"@{self.bot.user.name}",
+        ]
+        if self.bot.user.discriminator != "0":
+            patterns.append(f"@{self.bot.user.name}#{self.bot.user.discriminator}")
+        
+        for pattern in patterns:
+            content = content.replace(pattern, "")
+        
+        return content.strip()
+
+    def _get_user_id(self, message: discord.Message) -> str:
+        """Generate consistent user ID."""
+        return f"discord:{message.author.id}"
+    
+    def _get_discord_user_id(self, agent_user_id: str) -> Optional[int]:
+        """Extract Discord user ID from agent user ID."""
+        if agent_user_id.startswith("discord:"):
+            try:
+                return int(agent_user_id.split(":", 1)[1])
+            except ValueError:
+                pass
+        return None
+
+    async def _deliver_files(self, user_id: str, files: List[Dict[str, Any]]) -> bool:
+        """Deliver files to a Discord user via DM.
+        
+        This is the callback registered with the Agent for file delivery.
+        Files are always sent via DM to avoid cluttering guild channels.
+        
+        Args:
+            user_id: Agent-format user ID (e.g., "discord:123456").
+            files: List of file dicts with 'path', 'filename', 'description' keys.
+            
+        Returns:
+            True if all files were delivered successfully.
+        """
+        discord_id = self._get_discord_user_id(user_id)
+        if not discord_id:
+            logger.warning(f"Cannot deliver files: unknown user format {user_id}")
+            return False
+        
+        if not files:
+            logger.debug(f"No files to deliver for {user_id}")
+            return True
+        
+        try:
+            # Get or create DM channel
+            user = await self.bot.fetch_user(discord_id)
+            if not user:
+                logger.warning(f"Cannot deliver files: user {discord_id} not found")
+                return False
+            
+            dm_channel = await user.create_dm()
+            
+            logger.info(f"📤 Delivering {len(files)} file(s) to user {discord_id}")
+            
+            # Send intro message
+            file_list = ", ".join([f.get("filename", "unnamed") for f in files])
+            if len(files) == 1:
+                await dm_channel.send(f"📎 Here's your file: **{file_list}**")
+            else:
+                await dm_channel.send(f"📎 Here are your {len(files)} files: **{file_list}**")
+            
+            # Send each file
+            success_count = 0
+            for file_info in files:
+                file_path = file_info.get("path")
+                filename = file_info.get("filename") or Path(file_path).name
+                description = file_info.get("description", "")
+                
+                if not file_path or not Path(file_path).exists():
+                    logger.warning(f"File not found for delivery: {file_path}")
+                    await dm_channel.send(f"⚠️ Could not find file: {filename}")
+                    continue
+                
                 try:
-                    payload = {"message": clean_content if clean_content else message.content}
-                    logger.info(f"  POST to {self.gateway_url}/chat: {payload}")
+                    # Send with optional description
+                    if description:
+                        await dm_channel.send(description[:1900])  # Discord limit
                     
-                    resp = await self.client.post(
-                        f"{self.gateway_url}/chat",
-                        json=payload,
-                        headers={"Content-Type": "application/json"},
-                    )
-                    
-                    logger.info(f"  Gateway response: {resp.status_code}")
-                    
-                    if resp.status_code == 200:
-                        reply = resp.json().get("reply", "No response")[:1900]  # Discord limit
-                        logger.info(f"  Reply: {reply[:80]}...")
-                        await message.reply(f"```{reply}```")
-                        logger.info(f"  -> Reply sent successfully")
-                    else:
-                        error_msg = f"Gateway error: HTTP {resp.status_code}"
-                        logger.error(f"  {error_msg}")
-                        await message.reply(f"❌ {error_msg}")
-                        
-                except httpx.RequestError as e:
-                    error_msg = f"Network error connecting to gateway: {e}"
-                    logger.error(f"  {error_msg}")
-                    await message.reply(f"🌐 {error_msg}")
+                    # Send file
+                    discord_file = File(file_path, filename=filename)
+                    await dm_channel.send(file=discord_file)
+                    success_count += 1
+                    logger.info(f"✅ Delivered file {filename} to user {discord_id}")
                 except Exception as e:
-                    error_msg = f"Unexpected error: {e}"
-                    logger.error(f"  {error_msg}", exc_info=True)
-                    await message.reply(f"🚨 {error_msg}")
+                    logger.error(f"Failed to send file {filename}: {e}")
+                    await dm_channel.send(f"❌ Failed to send {filename}: {str(e)[:100]}")
+            
+            return success_count == len(files)
+            
+        except Exception as e:
+            logger.error(f"Failed to deliver files to {user_id}: {e}")
+            return False
+
+    async def _handle_message(self, message: discord.Message) -> None:
+        """Process an incoming Discord message with full agent capabilities."""
+
+        
+        location = "DM" if message.guild is None else f"#{message.channel.name}"
+        logger.info(f"Message from {message.author} in {location}: '{message.content[:100]}'")
+        
+        can_interact, reason = self._can_interact(message)
+        if not can_interact:
+            logger.debug(f"Ignoring: {reason}")
+            return
+        
+        clean_content = self._extract_clean_content(message)
+        if not clean_content:
+            return
+        
+        user_id = self._get_user_id(message)
+        is_dm = message.guild is None
+        
+        async with message.channel.typing():
+            try:
+                # Use the shared Agent for processing
+                result = await self.agent.chat(
+                    user_id=user_id,
+                    message=clean_content,
+                    context={
+                        "channel": "discord",
+                        "discord_guild_id": message.guild.id if message.guild else None,
+                        "discord_channel_id": message.channel.id,
+                        "discord_is_dm": is_dm,
+                    },
+                )
+                
+                # Handle permission denied
+                if result.get("permission_denied"):
+                    await message.reply("⛔ You don't have permission to use this bot.")
+                    return
+                
+                # Handle error
+                if not result.get("success"):
+                    error_msg = result.get("error", "Unknown error")
+                    await message.reply(f"❌ Error: {error_msg[:500]}")
+                    return
+                
+                # Get response
+                response = result.get("response", "No response")
+                
+                # Get files info
+                files_to_send = result.get("files_to_send", [])
+                tools_used = result.get("tools_used", [])
+                
+                # Build response with file info
+                final_response = response
+                
+                # If files were generated, mention them
+                if files_to_send:
+                    file_count = len(files_to_send)
+                    file_list = ", ".join([f.get("filename", "unnamed") for f in files_to_send[:3]])
+                    if file_count > 3:
+                        file_list += f" and {file_count - 3} more"
+                    
+                    # Add file delivery notice
+                    if is_dm:
+                        final_response += f"\n\n📎 I've sent {file_count} file(s): {file_list}"
+                    else:
+                        final_response += f"\n\n📎 Check your DMs! I've sent you {file_count} file(s): {file_list}"
+                
+                # Send text response (respecting Discord's 2000 char limit)
+                await self._send_response(message, final_response)
+                
+                # Log tool usage
+                if tools_used:
+                    logger.info(f"🔧 Tools used for {user_id}: {', '.join(tools_used)}")
+                
+            except Exception as exc:
+                logger.exception(f"Error processing message: {exc}")
+                try:
+                    await message.reply("🚨 An error occurred. Please try again.")
+                except Exception:
+                    pass
+
+    async def _send_response(self, message: discord.Message, response: str) -> None:
+        """Send response with appropriate formatting."""
+        # Discord has 2000 char limit for regular messages
+        MAX_LEN = 1950
+        
+        if len(response) <= MAX_LEN:
+            await message.reply(response)
+            return
+        
+        # For long responses, split intelligently
+        chunks = self._split_message(response, MAX_LEN)
+        
+        # Send first chunk as reply, rest as follow-ups
+        for i, chunk in enumerate(chunks):
+            if i == 0:
+                await message.reply(chunk)
+            else:
+                await message.channel.send(chunk)
+            
+            # Small delay to avoid rate limiting
+            if i < len(chunks) - 1:
+                await asyncio.sleep(0.5)
+
+    def _split_message(self, text: str, max_len: int = 1950) -> List[str]:
+        """Split long message into Discord-compatible chunks."""
+        if len(text) <= max_len:
+            return [text]
+        
+        chunks = []
+        remaining = text
+        
+        while remaining:
+            if len(remaining) <= max_len:
+                chunks.append(remaining)
+                break
+            
+            # Find good break point
+            split_at = remaining.rfind('\n\n', 0, max_len)
+            if split_at == -1:
+                split_at = remaining.rfind('\n', 0, max_len)
+            if split_at == -1:
+                split_at = remaining.rfind('. ', 0, max_len)
+            if split_at == -1:
+                split_at = remaining.rfind(' ', 0, max_len)
+            if split_at == -1:
+                split_at = max_len
+            
+            chunks.append(remaining[:split_at])
+            remaining = remaining[split_at:].lstrip()
+        
+        return chunks
 
     async def start(self):
         """Start Discord bot."""
         if not self.bot_token:
-            raise ValueError("Discord bot token is required to start the channel")
+            raise ValueError("Discord bot token required")
         
-        logger.info(f"Starting Discord bot (connecting to gateway at {self.gateway_url})...")
-        # Set logging to INFO to see all messages
+        logger.info("Starting Discord bot with full agent capabilities...")
         logging.getLogger('discord').setLevel(logging.INFO)
         await self.bot.start(self.bot_token)
 
     async def stop(self):
         """Graceful shutdown."""
         self._is_running = False
-        await self.client.aclose()
         await self.bot.close()
         logger.info("Discord bot stopped")
 
     @property
     def is_running(self) -> bool:
-        """Check if the bot is running and ready."""
         return self._is_running and self._ready_event.is_set()
 
     async def wait_for_ready(self, timeout: float = 30.0) -> bool:
-        """Wait for the bot to become ready.
-        
-        Args:
-            timeout: Maximum time to wait in seconds.
-            
-        Returns:
-            True if ready, False if timeout.
-        """
         try:
             await asyncio.wait_for(self._ready_event.wait(), timeout=timeout)
             return True
@@ -197,4 +405,4 @@ class DiscordChannel:
 
     def __repr__(self) -> str:
         status = "ready" if self.is_running else "connecting" if self._is_running else "stopped"
-        return f"DiscordChannel({status}, guilds={len(self.bot.guilds) if self.bot.user else 'N/A'})"
+        return f"DiscordChannel({status}, agent={self.agent.name})"

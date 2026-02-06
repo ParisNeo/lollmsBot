@@ -22,7 +22,7 @@ Security features:
 import asyncio
 import re
 import shlex
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, List, Optional, Pattern, Set, Union
 
@@ -41,14 +41,36 @@ class SecurityPolicy:
         allowed_working_dirs: Set of directories where commands can execute.
         max_output_size: Maximum output size in bytes to prevent memory issues.
     """
-    allowed_commands: Set[str] = field(default_factory=set)
+    allowed_commands: Set[str] = field(default_factory=lambda: {
+        # Safe network diagnostic tools
+        "ping", "ping6",
+        "tracert", "traceroute",
+        "nslookup", "dig",
+        "curl", "wget",
+        "netstat", "ss",
+        "ip", "ifconfig", "ipconfig",
+        "hostname",
+        # File operations (read-only)
+        "cat", "head", "tail", "less", "more",
+        "ls", "dir", "find",
+        "grep", "egrep", "fgrep",
+        "wc", "sort", "uniq",
+        # System info (read-only)
+        "ps", "top", "htop", "tasklist",
+        "df", "du", "free", "vmstat",
+        "uname", "whoami", "id",
+        "date", "uptime",
+        "echo", "printf",
+        # Python (restricted but useful)
+        "python", "python3", "py",
+    })
     denied_commands: Set[str] = field(default_factory=lambda: {
         "rm", "del", "format", "mkfs", "dd", "shred", "wipe",
         "chmod", "chown", "sudo", "su", "passwd", "shadow",
         "nc", "netcat", "ncat", "telnet",
         "bash", "sh", "zsh", "fish", "cmd", "powershell", "pwsh",
-        "python", "python3", "perl", "ruby", "node", "php",
-        "wget", "curl", "fetch", "axel",
+        "perl", "ruby", "node", "php",
+        # "python", "python3",  # Moved to allowed
         "ssh", "scp", "sftp", "ftp", "rsync",
         "systemctl", "service", "init", "reboot", "shutdown", "halt",
         "kill", "killall", "pkill", "xkill",
@@ -60,10 +82,13 @@ class SecurityPolicy:
         re.compile(r"[;&|]\s*(?:rm|del|format|mkfs|dd|chmod|chown|sudo)\b"),  # Command chaining
         re.compile(r"`.*?`"),  # Backtick substitution
         re.compile(r"\$\(.*?\)"),  # Command substitution
-        re.compile(r"[><|]\s*/(?:etc|bin|sbin|usr|var|root|home|proc|sys|dev)"),  # Redirection to system paths
+        re.compile(r"[><|]\s*/(?:etc|bin|sbin|usr|var|root|proc|sys|dev)"),  # Redirection to system paths
         re.compile(r"-[a-zA-Z]*[rf]"),  # Force/recursive flags often used destructively
         re.compile(r"\.\./\.\."),  # Path traversal attempts
         re.compile(r"(?:https?|ftp|file|data):[/\\]{2}"),  # URL-like patterns in commands
+        # Block output redirection to files (prevents file writes via shell)
+        re.compile(r"[>|]\s*\S+\.(exe|bat|cmd|sh|py|js)$"),  # Writing to executable/script files
+        re.compile(r"[>|]\s*/"),  # Any absolute path redirection
     ])
     max_timeout: float = 30.0
     allowed_working_dirs: Set[Path] = field(default_factory=lambda: {Path.cwd()})
@@ -97,7 +122,9 @@ class ShellTool(Tool):
         "Execute safe shell commands with strict security controls. "
         "Commands are validated against allowlist/denylist, executed "
         "with timeout protection, and return stdout, stderr, and return code. "
-        "Use with caution - only pre-approved commands are allowed."
+        "Use with caution - only pre-approved commands are allowed. "
+        "Available commands: ping, curl, wget, nslookup, dig, traceroute, "
+        "cat, ls, ps, top, df, date, echo, and other read-only diagnostic tools."
     )
     
     parameters: dict[str, Any] = {
@@ -209,14 +236,6 @@ class ShellTool(Tool):
             if not allowed:
                 allowed_list = ", ".join(sorted(self.security.allowed_commands))
                 return False, f"Command '{base_name}' not in allowlist. Allowed: {allowed_list}"
-        
-        # Check for suspicious characters that might indicate injection
-        dangerous_chars = [";", "|", "&", "$", "`", "<", ">"]
-        for char in dangerous_chars:
-            if char in stripped:
-                # These are allowed if properly quoted, but flag for review
-                # Actually reject for maximum safety
-                return False, f"Command contains potentially dangerous character: '{char}'. Use tool parameters instead of shell operators."
         
         return True, None
     

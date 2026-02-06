@@ -1,79 +1,97 @@
 """
 Telegram channel implementation for LollmsBot.
 
-This module provides the TelegramChannel class for integrating with the
-Telegram messaging platform using the python-telegram-bot library.
+Uses shared Agent for all business logic.
 """
 
 import logging
 from typing import Any, Awaitable, Callable, List, Optional, Set
 
-from telegram import Update
-from telegram.ext import (
-    Application,
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+try:
+    from telegram import Update
+    from telegram.ext import (
+        Application,
+        ApplicationBuilder,
+        CommandHandler,
+        ContextTypes,
+        MessageHandler,
+        filters,
+    )
+    TELEGRAM_AVAILABLE = True
+except ImportError as e:
+    TELEGRAM_AVAILABLE = False
+    TELEGRAM_IMPORT_ERROR = str(e)
+    # Create dummy classes for type checking
+    class Update: pass
+    class Application: pass
+    class ApplicationBuilder: pass
+    class CommandHandler: pass
+    class ContextTypes:
+        DEFAULT_TYPE = Any
+    class MessageHandler: pass
+    class filters:
+        TEXT = None
+        COMMAND = None
 
-from lollmsbot.channels import Channel
-from lollmsbot.agent import Agent
+from lollmsbot.agent import Agent, PermissionLevel
 
 
 logger = logging.getLogger(__name__)
 
 
-class TelegramChannel(Channel):
-    """Telegram messaging channel implementation.
+class TelegramChannel:
+    """Telegram messaging channel using shared Agent.
     
-    Provides integration with Telegram Bot API using python-telegram-bot
-    library with async support. Handles message polling and sending.
-    
-    Attributes:
-        bot_token: Telegram bot authentication token.
-        allowed_chat_ids: Optional set of allowed chat IDs for security.
-        application: The python-telegram-bot Application instance.
+    All business logic is delegated to the Agent. This class handles
+    only Telegram-specific protocol concerns.
     """
-    
+
     def __init__(
         self,
+        agent: Agent,
         bot_token: str,
-        allowed_chat_ids: Optional[List[int]] = None,
-        agent: Optional[Agent] = None,
-    ) -> None:
-        """Initialize the Telegram channel.
+        allowed_users: Optional[List[int]] = None,
+        blocked_users: Optional[List[int]] = None,
+    ):
+        if not TELEGRAM_AVAILABLE:
+            raise ImportError(
+                f"Telegram support requires 'python-telegram-bot'. "
+                f"Install with: pip install 'python-telegram-bot>=20.0' "
+                f"Original error: {TELEGRAM_IMPORT_ERROR}"
+            )
         
-        Args:
-            bot_token: Telegram bot token from @BotFather.
-            allowed_chat_ids: Optional list of allowed chat IDs.
-                              If provided, only these chats can interact.
-            agent: Optional Agent instance for message processing.
-        """
-        super().__init__(name="telegram", agent=agent)
-        
-        self.bot_token: str = bot_token
-        self.allowed_chat_ids: Optional[Set[int]] = (
-            set(allowed_chat_ids) if allowed_chat_ids else None
-        )
+        self.agent = agent
+        self.bot_token = bot_token
+        self.allowed_users: Optional[Set[int]] = set(allowed_users) if allowed_users else None
+        self.blocked_users: Set[int] = set(blocked_users) if blocked_users else set()
         self.application: Optional[Application] = None
-        self._message_callback: Optional[
-            Callable[[str, str], Awaitable[None]]
-        ] = None
-    
-    async def start(self) -> None:
-        """Start the Telegram bot and begin polling for messages.
+        self._is_running = False
+
+    def _can_interact(self, user_id: int) -> tuple[bool, str]:
+        """Check if user can interact with bot."""
+        if user_id in self.blocked_users:
+            return False, "user blocked"
         
-        Initializes the Application, sets up handlers, and starts
-        the polling loop to receive updates from Telegram.
-        """
+        if self.allowed_users is not None:
+            if user_id not in self.allowed_users:
+                return False, "not in allowed users"
+        
+        return True, ""
+
+    def _get_user_id(self, tg_user_id: int) -> str:
+        """Generate consistent user ID for Agent."""
+        return f"telegram:{tg_user_id}"
+
+    async def start(self) -> None:
+        """Start the Telegram bot."""
+        if not TELEGRAM_AVAILABLE:
+            raise ImportError("python-telegram-bot is not installed")
+        
         if self._is_running:
             logger.warning("Telegram channel is already running")
             return
         
         try:
-            # Build application with bot token
             self.application = (
                 ApplicationBuilder()
                 .token(self.bot_token)
@@ -85,11 +103,14 @@ class TelegramChannel(Channel):
                 CommandHandler("start", self._handle_start_command)
             )
             self.application.add_handler(
+                CommandHandler("help", self._handle_help_command)
+            )
+            self.application.add_handler(
                 MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_message)
             )
             self.application.add_error_handler(self._handle_error)
             
-            # Start polling
+            # Start
             await self.application.initialize()
             await self.application.start()
             await self.application.updater.start_polling(drop_pending_updates=True)
@@ -101,14 +122,10 @@ class TelegramChannel(Channel):
             logger.error(f"Failed to start Telegram channel: {exc}")
             self._is_running = False
             raise
-    
+
     async def stop(self) -> None:
-        """Stop the Telegram bot and clean up resources.
-        
-        Gracefully shuts down the polling loop and releases resources.
-        """
+        """Stop the Telegram bot."""
         if not self._is_running:
-            logger.warning("Telegram channel is not running")
             return
         
         try:
@@ -124,152 +141,132 @@ class TelegramChannel(Channel):
         except Exception as exc:
             logger.error(f"Error stopping Telegram channel: {exc}")
             raise
-    
-    async def send_message(self, to: str, content: str) -> bool:
-        """Send a message to a specific Telegram chat.
-        
-        Args:
-            to: Telegram chat ID (as string).
-            content: Message text to send.
-            
-        Returns:
-            True if message was sent successfully, False otherwise.
-        """
-        if not self.application or not self._is_running:
-            logger.error("Cannot send message: Telegram channel is not running")
-            return False
-        
-        try:
-            chat_id = int(to)
-            await self.application.bot.send_message(
-                chat_id=chat_id,
-                text=content,
-                parse_mode=None,  # Plain text to avoid parsing errors
-            )
-            logger.debug(f"Message sent to chat {chat_id}")
-            return True
-            
-        except ValueError:
-            logger.error(f"Invalid chat ID: {to}")
-            return False
-            
-        except Exception as exc:
-            logger.error(f"Failed to send message to {to}: {exc}")
-            return False
-    
-    def on_message(self, callback: Callable[[str, str], Awaitable[None]]) -> None:
-        """Register a callback for incoming messages.
-        
-        Args:
-            callback: Async function to call when a message is received.
-                     Receives (sender_id: str, message: str) parameters.
-        """
-        self._message_callback = callback
-        logger.debug("Message callback registered")
-    
+
     async def _handle_start_command(
         self,
         update: Update,
         context: ContextTypes.DEFAULT_TYPE,
     ) -> None:
-        """Handle the /start command from users.
-        
-        Args:
-            update: Telegram update object.
-            context: Callback context.
-        """
+        """Handle /start command."""
         if not update.effective_chat or not update.message:
             return
         
+        user_id = update.effective_user.id if update.effective_user else 0
+        
+        # Check permissions
+        can_interact, reason = self._can_interact(user_id)
+        if not can_interact:
+            await update.message.reply_text("⛔ You don't have permission to use this bot.")
+            return
+        
+        # Get or create user permissions in agent
+        agent_user_id = self._get_user_id(user_id)
+        
         welcome_text = (
-            "👋 Hello! I'm a LollmsBot agent.\n\n"
-            "Send me any message and I'll process it through my AI backend."
+            f"👋 Hello! I'm {self.agent.name}.\n\n"
+            f"Send me any message and I'll respond using my AI backend.\n\n"
+            f"Your ID: `{user_id}`\n"
+            f"Use /help for more information."
         )
         
-        await update.message.reply_text(welcome_text)
-        logger.info(f"Start command from chat {update.effective_chat.id}")
-    
+        await update.message.reply_text(welcome_text, parse_mode="Markdown")
+
+    async def _handle_help_command(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """Handle /help command."""
+        help_text = (
+            f"*{self.agent.name} - Available Commands*\n\n"
+            "/start - Start the bot\n"
+            "/help - Show this help message\n\n"
+            "Just send any message to chat with me!"
+        )
+        await update.message.reply_text(help_text, parse_mode="Markdown")
+
     async def _handle_message(
         self,
         update: Update,
         context: ContextTypes.DEFAULT_TYPE,
     ) -> None:
-        """Handle incoming text messages from Telegram.
-        
-        Wraps Telegram updates into standardized format and routes
-        to the registered callback or agent.
-        
-        Args:
-            update: Telegram update object.
-            context: Callback context.
-        """
+        """Handle incoming text messages."""
         if not update.effective_chat or not update.message or not update.message.text:
             return
         
+        user_id = update.effective_user.id if update.effective_user else 0
         chat_id = update.effective_chat.id
-        sender_id = str(chat_id)
+        
+        # Check permissions
+        can_interact, reason = self._can_interact(user_id)
+        if not can_interact:
+            logger.warning(f"Message from unauthorized user {user_id}: {reason}")
+            await update.message.reply_text("⛔ Access denied.")
+            return
+        
+        # Build context
+        agent_user_id = self._get_user_id(user_id)
+        context_data = {
+            "channel": "telegram",
+            "telegram_user_id": user_id,
+            "telegram_username": update.effective_user.username if update.effective_user else None,
+            "telegram_chat_id": chat_id,
+            "is_dm": update.effective_chat.type == "private",
+            "chat_type": update.effective_chat.type,
+        }
+        
         message_text = update.message.text
         
-        # Check allowed chat IDs if configured
-        if self.allowed_chat_ids is not None:
-            if chat_id not in self.allowed_chat_ids:
-                logger.warning(f"Message from unauthorized chat {chat_id} rejected")
-                await update.message.reply_text(
-                    "⛔ You are not authorized to use this bot."
-                )
-                return
-        
-        logger.info(f"Received message from chat {chat_id}: {message_text[:50]}...")
+        logger.info(f"Processing message from Telegram user {user_id}: {message_text[:50]}...")
         
         try:
-            if self._message_callback is not None:
-                # Use registered callback
-                await self._message_callback(sender_id, message_text)
-            elif self.agent is not None:
-                # Use agent directly
-                response = await self.agent.run(message_text)
-                await self.send_message(sender_id, response)
-            else:
-                # No handler configured
-                await update.message.reply_text(
-                    "⚠️ Bot is not fully configured. No message handler available."
-                )
-                
+            # Use Agent for processing
+            result = await self.agent.chat(
+                user_id=agent_user_id,
+                message=message_text,
+                context=context_data,
+            )
+            
+            if result.get("permission_denied"):
+                await update.message.reply_text("⛔ You don't have permission to use this bot.")
+                return
+            
+            if not result.get("success"):
+                error_msg = result.get("error", "Unknown error")
+                await update.message.reply_text(f"❌ Error: {error_msg[:400]}")
+                return
+            
+            response = result.get("response", "No response")
+            # Telegram has 4096 char limit
+            if len(response) > 4000:
+                response = response[:4000] + "\n... (truncated)"
+            
+            await update.message.reply_text(response)
+            
         except Exception as exc:
-            logger.error(f"Error processing message from {chat_id}: {exc}")
+            logger.error(f"Error processing Telegram message: {exc}")
             try:
-                await update.message.reply_text(
-                    "❌ Sorry, an error occurred while processing your message."
-                )
+                await update.message.reply_text("❌ An error occurred. Please try again.")
             except Exception:
-                pass  # Ignore errors in error handling
-    
+                pass
+
     async def _handle_error(
         self,
         update: Optional[Update],
         context: ContextTypes.DEFAULT_TYPE,
     ) -> None:
-        """Handle errors in the telegram bot.
-        
-        Args:
-            update: The update that caused the error, if available.
-            context: The callback context containing error information.
-        """
+        """Handle errors."""
         logger.error(f"Telegram bot error: {context.error}")
         
         if update and update.effective_message:
             try:
                 await update.effective_message.reply_text(
-                    "❌ An unexpected error occurred. Please try again later."
+                    "❌ An unexpected error occurred."
                 )
             except Exception:
-                pass  # Ignore errors in error handler
-    
+                pass
+
     def __repr__(self) -> str:
         status = "running" if self._is_running else "stopped"
-        restricted = (
-            f", restricted={len(self.allowed_chat_ids)} chats"
-            if self.allowed_chat_ids
-            else ""
-        )
+        restricted = f", restricted={len(self.allowed_users)} users" if self.allowed_users else ""
         return f"TelegramChannel({status}{restricted})"

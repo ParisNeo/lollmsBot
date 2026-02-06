@@ -17,10 +17,10 @@ Example:
 from lollmsbot.agent import Tool, ToolResult, ToolError
 
 # Import all tool classes
-from lollmsbot.tools.filesystem_tool import FilesystemTool
-from lollmsbot.tools.http_tool import HttpTool
-from lollmsbot.tools.calendar_tool import CalendarTool
-from lollmsbot.tools.shell_tool import ShellTool
+from lollmsbot.tools.filesystem import FilesystemTool
+from lollmsbot.tools.http import HttpTool
+from lollmsbot.tools.calendar import CalendarTool
+from lollmsbot.tools.shell import ShellTool
 
 
 class ToolRegistry:

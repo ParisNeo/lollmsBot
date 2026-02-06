@@ -8,11 +8,12 @@ directory traversal attacks.
 
 import asyncio
 import json
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, List, Set
+from typing import Any, List, Set, Dict
 
-from lollmsbot.agent import Tool, ToolResult, ToolError
+from lollmsbot.agent import Tool, ToolResult
 
 
 @dataclass
@@ -41,7 +42,9 @@ class FilesystemTool(Tool):
     description: str = (
         "Perform safe filesystem operations including reading files, "
         "writing files, listing directories, and checking file existence. "
-        "All operations are restricted to allowed directories."
+        "All operations are restricted to allowed directories. "
+        "Can create HTML, CSS, JavaScript, and other files. "
+        "Supports creating zip archives of multiple files."
     )
     
     parameters: dict[str, Any] = {
@@ -49,7 +52,7 @@ class FilesystemTool(Tool):
         "properties": {
             "operation": {
                 "type": "string",
-                "enum": ["read_file", "write_file", "list_dir", "exists"],
+                "enum": ["read_file", "write_file", "list_dir", "exists", "create_html_app", "create_zip"],
                 "description": "The filesystem operation to perform",
             },
             "path": {
@@ -60,8 +63,31 @@ class FilesystemTool(Tool):
                 "type": "string",
                 "description": "Content to write (required for write_file operation)",
             },
+            "filename": {
+                "type": "string",
+                "description": "Filename for the HTML app (required for create_html_app)",
+            },
+            "html_content": {
+                "type": "string",
+                "description": "HTML content for the app (required for create_html_app)",
+            },
+            "files": {
+                "type": "array",
+                "description": "List of file dicts with 'path' and 'content' for batch operations (create_zip)",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "content": {"type": "string"},
+                    }
+                }
+            },
+            "zip_name": {
+                "type": "string",
+                "description": "Name for the zip file (required for create_zip)",
+            },
         },
-        "required": ["operation", "path"],
+        "required": ["operation"],
     }
     
     def __init__(
@@ -86,6 +112,16 @@ class FilesystemTool(Tool):
         else:
             # Default to current working directory
             self.allowed_directories.add(Path.cwd().resolve())
+        
+        # Add a shared output directory for generated files
+        self.output_dir = Path.home() / ".lollmsbot" / "output"
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.allowed_directories.add(self.output_dir.resolve())
+        
+        # Create subdirectory for games/apps
+        self.apps_dir = self.output_dir / "apps"
+        self.apps_dir.mkdir(parents=True, exist_ok=True)
+        self.allowed_directories.add(self.apps_dir.resolve())
     
     def _validate_path(self, path: str) -> PathValidationResult:
         """Validate that a path is within allowed directories.
@@ -206,7 +242,7 @@ class FilesystemTool(Tool):
             content: Content to write to the file.
             
         Returns:
-            ToolResult indicating success or failure.
+            ToolResult indicating success or failure, with file info for delivery.
         """
         validation = self._validate_path(path)
         if not validation.is_valid:
@@ -238,10 +274,16 @@ class FilesystemTool(Tool):
                 ),
             )
             
+            # Return file info for potential delivery
             return ToolResult(
                 success=True,
                 output=f"Successfully wrote {len(content)} characters to {path}",
                 error=None,
+                files_to_send=[{
+                    "path": str(resolved_path),
+                    "filename": resolved_path.name,
+                    "description": f"Generated file: {resolved_path.name} ({len(content)} chars)",
+                }],
             )
             
         except PermissionError as exc:
@@ -255,6 +297,130 @@ class FilesystemTool(Tool):
                 success=False,
                 output=None,
                 error=f"Error writing file '{path}': {str(exc)}",
+            )
+    
+    async def create_html_app(self, filename: str, html_content: str) -> ToolResult:
+        """Create a complete HTML application file.
+        
+        Convenience method for creating HTML files with proper structure.
+        
+        Args:
+            filename: Name for the HTML file (should end in .html).
+            html_content: The HTML content to write.
+            
+        Returns:
+            ToolResult with file info for delivery.
+        """
+        # Ensure .html extension
+        if not filename.endswith(".html"):
+            filename += ".html"
+        
+        # Use apps directory for generated apps
+        output_path = self.apps_dir / filename
+        
+        # Wrap in proper HTML structure if not already present
+        if not html_content.strip().startswith("<!DOCTYPE"):
+            full_html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{filename.replace('.html', '').replace('_', ' ').title()}</title>
+    <style>
+        body {{
+            font-family: system-ui, -apple-system, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #1a1a2e;
+            color: #eee;
+        }}
+        canvas {{
+            display: block;
+            margin: 20px auto;
+            background: #16213e;
+            border-radius: 8px;
+        }}
+        .game-container {{
+            text-align: center;
+        }}
+        button {{
+            background: #0f3460;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 4px;
+            cursor: pointer;
+            margin: 5px;
+        }}
+        button:hover {{
+            background: #e94560;
+        }}
+    </style>
+</head>
+<body>
+    <div class="game-container">
+        {html_content}
+    </div>
+</body>
+</html>"""
+        else:
+            full_html = html_content
+        
+        return await self.write_file(str(output_path), full_html)
+    
+    async def create_zip(self, zip_name: str, files: List[Dict[str, str]]) -> ToolResult:
+        """Create a zip archive containing multiple files.
+        
+        Args:
+            zip_name: Name for the zip file (should end in .zip).
+            files: List of dicts with 'path' and 'content' keys.
+            
+        Returns:
+            ToolResult with zip file info for delivery.
+        """
+        # Ensure .zip extension
+        if not zip_name.endswith(".zip"):
+            zip_name += ".zip"
+        
+        zip_path = self.output_dir / zip_name
+        
+        try:
+            loop = asyncio.get_event_loop()
+            
+            def create_zip():
+                with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                    for file_info in files:
+                        file_path = file_info.get("path", "")
+                        content = file_info.get("content", "")
+                        
+                        # Write to zip with just the filename (no full path)
+                        arcname = Path(file_path).name
+                        zf.writestr(arcname, content)
+                
+                return zip_path
+            
+            await loop.run_in_executor(None, create_zip)
+            
+            # Add to allowed directories for reading
+            self.allowed_directories.add(self.output_dir.resolve())
+            
+            return ToolResult(
+                success=True,
+                output=f"Created zip archive with {len(files)} files: {zip_name}",
+                error=None,
+                files_to_send=[{
+                    "path": str(zip_path),
+                    "filename": zip_name,
+                    "description": f"Archive containing {len(files)} files",
+                }],
+            )
+            
+        except Exception as exc:
+            return ToolResult(
+                success=False,
+                output=None,
+                error=f"Error creating zip: {str(exc)}",
             )
     
     async def list_dir(self, path: str) -> ToolResult:
@@ -404,15 +570,16 @@ class FilesystemTool(Tool):
         
         Args:
             **params: Parameters must include:
-                - operation: One of 'read_file', 'write_file', 'list_dir', 'exists'
-                - path: Path for the operation
+                - operation: One of 'read_file', 'write_file', 'list_dir', 'exists', 'create_html_app', 'create_zip'
+                - path: Path for the operation (not needed for create_html_app, create_zip)
                 - content: Required for 'write_file' operation
+                - filename: Required for 'create_html_app'
+                - html_content: Required for 'create_html_app'
+                - files: Required for 'create_zip'
+                - zip_name: Required for 'create_zip'
                 
         Returns:
             ToolResult from the executed operation.
-            
-        Raises:
-            ToolError: If the operation is unknown or parameters are invalid.
         """
         operation = params.get("operation")
         path = params.get("path")
@@ -424,6 +591,42 @@ class FilesystemTool(Tool):
                 error="Missing required parameter: 'operation'",
             )
         
+        # Special cases that don't need path
+        if operation == "create_html_app":
+            filename = params.get("filename")
+            html_content = params.get("html_content")
+            if not filename:
+                return ToolResult(
+                    success=False,
+                    output=None,
+                    error="Missing required parameter: 'filename' for create_html_app",
+                )
+            if html_content is None:
+                return ToolResult(
+                    success=False,
+                    output=None,
+                    error="Missing required parameter: 'html_content' for create_html_app",
+                )
+            return await self.create_html_app(filename, html_content)
+        
+        if operation == "create_zip":
+            zip_name = params.get("zip_name")
+            files = params.get("files", [])
+            if not zip_name:
+                return ToolResult(
+                    success=False,
+                    output=None,
+                    error="Missing required parameter: 'zip_name' for create_zip",
+                )
+            if not files:
+                return ToolResult(
+                    success=False,
+                    output=None,
+                    error="Missing required parameter: 'files' for create_zip",
+                )
+            return await self.create_zip(zip_name, files)
+        
+        # All other operations need path
         if not path:
             return ToolResult(
                 success=False,
@@ -456,5 +659,5 @@ class FilesystemTool(Tool):
                 success=False,
                 output=None,
                 error=f"Unknown operation: '{operation}'. "
-                      f"Valid operations are: read_file, write_file, list_dir, exists",
+                      f"Valid operations are: read_file, write_file, list_dir, exists, create_html_app, create_zip",
             )

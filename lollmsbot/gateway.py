@@ -1,22 +1,117 @@
 #!/usr/bin/env python
 """
-lollmsBot Gateway - .env Source of Truth
+lollmsBot Gateway - Central Agent Architecture with File Delivery
 """
 import asyncio
 import json
 import os
-from typing import AsyncGenerator, Dict, List, Optional, Any
+import secrets
+import hashlib
+import hmac
+from typing import Any, Dict, List, Optional, Set
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, status, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse, JSONResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from rich.console import Console
+
+from lollmsbot.config import BotConfig, LollmsSettings
+from lollmsbot.agent import Agent, PermissionLevel
+# Import tools for registration
+from lollmsbot.tools.filesystem import FilesystemTool
+from lollmsbot.tools.http import HttpTool
+from lollmsbot.tools.calendar import CalendarTool
+from lollmsbot.tools.shell import ShellTool
 
 console = Console()
 app = FastAPI(title="lollmsBot API")
 
-# === LOAD WIZARD CONFIG FIRST, THEN FALLBACK TO .env ===
+# UI instance (optional)
+_ui_instance: Optional[Any] = None
+_ui_enabled: bool = False
+
+# HTTP API channel (optional)
+_http_api: Optional[Any] = None
+
+# ========== SHARED AGENT INSTANCE ==========
+_agent: Optional[Agent] = None
+
+def get_agent() -> Agent:
+    """Get or create the shared Agent instance with tools registered."""
+    global _agent
+    if _agent is None:
+        config = BotConfig.from_env()
+        _agent = Agent(
+            config=config,
+            name="LollmsBot",
+            default_permissions=PermissionLevel.BASIC,
+        )
+        
+        # Register default tools - THIS IS KEY FOR FILE GENERATION!
+        async def register_tools():
+            try:
+                await _agent.register_tool(FilesystemTool())
+                console.print("[green]  • FilesystemTool registered[/]")
+            except Exception as e:
+                console.print(f"[yellow]  • FilesystemTool failed: {e}[/]")
+            
+            try:
+                await _agent.register_tool(HttpTool())
+                console.print("[green]  • HttpTool registered[/]")
+            except Exception as e:
+                console.print(f"[yellow]  • HttpTool failed: {e}[/]")
+            
+            try:
+                await _agent.register_tool(CalendarTool())
+                console.print("[green]  • CalendarTool registered[/]")
+            except Exception as e:
+                console.print(f"[yellow]  • CalendarTool failed: {e}[/]")
+            
+            # Shell tool - more dangerous, only register if explicitly enabled
+            if os.getenv("LOLLMSBOT_ENABLE_SHELL", "").lower() in ("true", "1", "yes"):
+                try:
+                    await _agent.register_tool(ShellTool())
+                    console.print("[green]  • ShellTool registered[/]")
+                except Exception as e:
+                    console.print(f"[yellow]  • ShellTool failed: {e}[/]")
+            else:
+                console.print("[dim]  • ShellTool disabled (set LOLLMSBOT_ENABLE_SHELL=true to enable)[/]")
+        
+        # Run tool registration synchronously during init
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                asyncio.create_task(register_tools())
+            else:
+                loop.run_until_complete(register_tools())
+        except RuntimeError:
+            pass
+        
+        console.print(f"[green]✅ Agent initialized: {_agent}[/]")
+    return _agent
+
+# ========== SHARED LOLLMS CLIENT ==========
+_lollms_client: Optional[Any] = None
+
+def get_lollms_client():
+    """Get or create shared LoLLMS client."""
+    global _lollms_client
+    if _lollms_client is None:
+        try:
+            from lollmsbot.lollms_client import build_lollms_client
+            _lollms_client = build_lollms_client()
+            console.print("[green]✅ LoLLMS client initialized[/]")
+        except Exception as e:
+            console.print(f"[yellow]⚠️  LoLLMS client unavailable: {e}[/]")
+            _lollms_client = None
+    return _lollms_client
+
+# ========== CONFIGURATION ==========
+
 def _load_wizard_config() -> Dict[str, Any]:
     """Load config from wizard's config.json if it exists."""
     wizard_path = Path.home() / ".lollmsbot" / "config.json"
@@ -31,169 +126,416 @@ _WIZARD_CONFIG = _load_wizard_config()
 
 def _get_config(service: str, key: str, env_name: str, default: Any = None) -> Any:
     """Get config value: wizard config > env var > default."""
-    # Check wizard config first
     if service in _WIZARD_CONFIG and key in _WIZARD_CONFIG[service]:
         return _WIZARD_CONFIG[service][key]
-    # Fall back to environment
     return os.getenv(env_name, default)
 
-# === CONFIG CONSTANTS ===
-HOST = _get_config("lollmsbot", "host", "LOLLMSBOT_HOST", "0.0.0.0")
+# Security settings
+DEFAULT_HOST = "127.0.0.1"
+HOST = _get_config("lollmsbot", "host", "LOLLMSBOT_HOST", DEFAULT_HOST)
 PORT = int(_get_config("lollmsbot", "port", "LOLLMSBOT_PORT", "8800"))
-# Use localhost for internal gateway URL (Discord needs to reach the gateway)
-GATEWAY_URL = f"http://127.0.0.1:{PORT}"
+API_KEY = _get_config("lollmsbot", "api_key", "LOLLMSBOT_API_KEY", None)
+
+if HOST not in ("127.0.0.1", "localhost", "::1") and not API_KEY:
+    API_KEY = secrets.token_urlsafe(32)
+    console.print(f"[bold yellow]⚠️  Auto-generated API key: {API_KEY}[/]")
+
+_security = HTTPBearer(auto_error=False)
+
+# Channel tokens
 DISCORD_TOKEN = _get_config("discord", "bot_token", "DISCORD_BOT_TOKEN", None)
+DISCORD_ALLOWED_USERS = _get_config("discord", "allowed_users", "DISCORD_ALLOWED_USERS", None)
+DISCORD_ALLOWED_GUILDS = _get_config("discord", "allowed_guilds", "DISCORD_ALLOWED_GUILDS", None)
+DISCORD_BLOCKED_USERS = _get_config("discord", "blocked_users", "DISCORD_BLOCKED_USERS", None)
+DISCORD_REQUIRE_MENTION_GUILD = _get_config("discord", "require_mention_guild", "DISCORD_REQUIRE_MENTION_GUILD", "true")
+DISCORD_REQUIRE_MENTION_DM = _get_config("discord", "require_mention_dm", "DISCORD_REQUIRE_MENTION_DM", "false")
 TELEGRAM_TOKEN = _get_config("telegram", "bot_token", "TELEGRAM_BOT_TOKEN", None)
 
-# Track active channels for status reporting
 _active_channels: Dict[str, Any] = {}
 _channel_tasks: List[asyncio.Task] = []
 
-# === MODELS ===
+# ========== SECURITY ==========
+
+def _verify_api_key(credentials: Optional[HTTPAuthorizationCredentials]) -> bool:
+    """Verify API key."""
+    if API_KEY is None:
+        return True
+    if credentials is None:
+        return False
+    provided = credentials.credentials.encode('utf-8')
+    expected = API_KEY.encode('utf-8')
+    return hmac.compare_digest(provided, expected)
+
+async def require_auth(request: Request, credentials: Optional[HTTPAuthorizationCredentials] = Depends(_security)):
+    """Require authentication for external access."""
+    client_host = request.client.host if request.client else "unknown"
+    
+    # Always allow localhost
+    if client_host in ("127.0.0.1", "::1", "localhost"):
+        return
+    
+    if API_KEY is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="External access not permitted. Gateway is in local-only mode.",
+        )
+    
+    if not _verify_api_key(credentials):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing API key.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+# ========== MODELS ==========
+
 class Health(BaseModel):
     status: str = "ok"
     url: str = f"http://{HOST}:{PORT}"
-    discord: str = "active" if DISCORD_TOKEN else "disabled"
-    telegram: str = "active" if TELEGRAM_TOKEN else "disabled"
-
-class ChannelInfo(BaseModel):
-    name: str
-    type: str
-    status: str
-    details: Dict[str, Any] = {}
-
-class ChannelsResponse(BaseModel):
-    channels: List[ChannelInfo]
-    count: int
 
 class ChatReq(BaseModel):
     message: str
+    user_id: Optional[str] = "anonymous"
 
 class ChatResp(BaseModel):
-    reply: str
+    success: bool
+    response: str
+    error: Optional[str] = None
+    tools_used: List[str] = []
+    files_generated: int = 0
+    file_downloads: List[Dict[str, Any]] = []
 
-# === ROUTES ===
+class PermissionReq(BaseModel):
+    admin_user_id: str
+    target_user_id: str
+    level: str  # "NONE", "BASIC", "TOOLS", "ADMIN"
+    allowed_tools: Optional[List[str]] = None
+    denied_tools: Optional[List[str]] = None
+
+# ========== CORS ==========
+
+_cors_origins = ["http://localhost", "http://127.0.0.1"]
+if HOST not in ("127.0.0.1", "localhost", "::1"):
+    _cors_origins = []
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
+
+# ========== ROUTES ==========
+
 @app.get("/")
 async def root():
+    agent = get_agent()
+    lollms_ok = get_lollms_client() is not None
+    
+    # Check channels
+    channels_status = {
+        "discord": "enabled" if DISCORD_TOKEN else "disabled",
+        "telegram": "enabled" if TELEGRAM_TOKEN else "disabled",
+    }
+    if "discord" in _active_channels:
+        channels_status["discord"] = "active"
+    if "telegram" in _active_channels:
+        channels_status["telegram"] = "active"
+    
     return {
         "api": f"http://{HOST}:{PORT}",
         "docs": "/docs",
         "health": "/health",
-        "channels": "/channels",
+        "chat": "/chat",
+        "agent": {
+            "name": agent.name,
+            "state": agent.state.name,
+            "tools": list(agent.tools.keys()),
+        },
+        "lollms": {
+            "connected": lollms_ok,
+            "host": LollmsSettings.from_env().host_address,
+        },
+        "security": {
+            "host": HOST,
+            "local_only": HOST in ("127.0.0.1", "localhost", "::1"),
+            "auth_required": API_KEY is not None,
+        },
+        "channels": channels_status,
+        "features": {
+            "file_delivery": True,
+            "web_ui": _ui_enabled,
+        }
     }
 
 @app.get("/health", response_model=Health)
 async def health():
-    from .config import LollmsSettings
-    settings = LollmsSettings.from_env()
+    agent = get_agent()
+    lollms_client = get_lollms_client()
+    lollms_ok = lollms_client is not None
     
-    lollms_ok = True
-    try:
-        from .lollms_client import build_lollms_client
-        client = build_lollms_client(settings)
-        getattr(client, "list_models", lambda: None)()
-    except:
-        lollms_ok = False
+    discord_status = "active" if "discord" in _active_channels else "disabled"
+    telegram_status = "active" if "telegram" in _active_channels else "disabled"
     
-    # Check Discord status
-    discord_status = "disabled"
-    if DISCORD_TOKEN:
-        discord_ch = _active_channels.get("discord")
-        if discord_ch and getattr(discord_ch, "is_running", False):
-            discord_status = "connected" if discord_ch.is_running else "connecting"
-        else:
-            discord_status = "error"
-    
-    # Check Telegram status
-    telegram_status = "disabled"
-    if TELEGRAM_TOKEN:
-        telegram_ch = _active_channels.get("telegram")
-        if telegram_ch and getattr(telegram_ch, "_is_running", False):
-            telegram_status = "active"
-        else:
-            telegram_status = "error"
+    # Count pending files across channels
+    pending_files = 0
+    if _http_api:
+        pending_files += len(_http_api._pending_files) if hasattr(_http_api, '_pending_files') else 0
     
     return {
         "status": "ok",
         "url": f"http://{HOST}:{PORT}",
         "discord": discord_status,
         "telegram": telegram_status,
-        "lollms": lollms_ok,
+        "lollms": {
+            "connected": lollms_ok,
+            "host": LollmsSettings.from_env().host_address,
+        },
+        "agent": agent.state.name,
+        "tools": list(agent.tools.keys()),
+        "security": {
+            "mode": "local" if HOST in ("127.0.0.1", "localhost", "::1") else "network",
+            "auth_enabled": API_KEY is not None,
+        },
+        "features": {
+            "pending_files": pending_files,
+            "file_delivery_enabled": True,
+        }
     }
 
-@app.get("/channels", response_model=ChannelsResponse)
-async def list_channels():
-    """List all active channels and their status."""
-    channels = []
-    
-    for name, channel in _active_channels.items():
-        info = ChannelInfo(
-            name=name,
-            type=channel.__class__.__name__,
-            status="running" if getattr(channel, "_is_running", False) else "stopped",
-            details={
-                "repr": repr(channel),
-            }
-        )
-        
-        # Add channel-specific details
-        if hasattr(channel, "bot") and hasattr(channel.bot, "user"):
-            if channel.bot.user:
-                info.details["bot_name"] = str(channel.bot.user)
-                info.details["bot_id"] = channel.bot.user.id
-                info.details["guilds"] = len(channel.bot.guilds)
-        
-        channels.append(info)
-    
-    return ChannelsResponse(channels=channels, count=len(channels))
-
-@app.post("/chat", response_model=ChatResp)
+@app.post("/chat", response_model=ChatResp, dependencies=[Depends(require_auth)])
 async def chat(req: ChatReq):
-    from .config import LollmsSettings
-    from .lollms_client import build_lollms_client
+    """Process a chat message through the Agent with file delivery support."""
+    agent = get_agent()
     
-    settings = LollmsSettings.from_env()
-    lc = build_lollms_client(settings)
-    reply = lc.generate_text(req.message)
+    result = await agent.chat(
+        user_id=req.user_id or "anonymous",
+        message=req.message,
+        context={"channel": "gateway_http", "source": "api"},
+    )
     
-    return ChatResp(reply=str(reply))
+    # Build file download info if files were generated
+    file_downloads = []
+    files_generated = result.get("files_to_send", [])
+    
+    # If we have an HTTP API channel, it may have registered the files
+    if _http_api and hasattr(_http_api, '_pending_files'):
+        for file_info in files_generated:
+            file_path = file_info.get("path")
+            # Find matching registered file
+            for file_id, delivery in _http_api._pending_files.items():
+                if delivery.original_path == file_path:
+                    file_downloads.append({
+                        "filename": delivery.filename,
+                        "download_url": f"/files/download/{file_id}",
+                        "description": delivery.description,
+                        "expires_in_seconds": int(_http_api._file_ttl_seconds - (time.time() - delivery.created_at)),
+                    })
+                    break
+    
+    # Also check if files can be served directly
+    if not file_downloads and files_generated:
+        # Create direct download URLs for known output directory
+        for file_info in files_generated:
+            file_path = file_info.get("path", "")
+            filename = file_info.get("filename") or Path(file_path).name
+            # Add basic file info even without HTTP API channel
+            file_downloads.append({
+                "filename": filename,
+                "path": file_path,
+                "description": file_info.get("description", "Generated file"),
+                "note": "File saved to server filesystem, download via direct access if enabled",
+            })
+    
+    return ChatResp(
+        success=result.get("success", False),
+        response=result.get("response", ""),
+        error=result.get("error"),
+        tools_used=result.get("tools_used", []),
+        files_generated=len(files_generated),
+        file_downloads=file_downloads,
+    )
 
-# === LIFESPAN ===
+@app.post("/admin/permission", dependencies=[Depends(require_auth)])
+async def set_permission(req: PermissionReq):
+    """Admin endpoint to set user permissions."""
+    agent = get_agent()
+    
+    # This would need to be implemented in the Agent class
+    # For now, return a placeholder
+    return {
+        "success": False,
+        "error": "Admin permission management not yet implemented in this version",
+    }
+
+# ========== FILE DOWNLOAD ENDPOINTS ==========
+
+@app.get("/files/download/{file_id}")
+async def download_file(file_id: str):
+    """Download a generated file by ID (proxies to HTTP API channel if available)."""
+    if _http_api and hasattr(_http_api, '_pending_files'):
+        if file_id in _http_api._pending_files:
+            delivery = _http_api._pending_files[file_id]
+            from fastapi.responses import FileResponse
+            return FileResponse(
+                path=delivery.original_path,
+                filename=delivery.filename,
+                media_type=delivery.content_type or "application/octet-stream",
+            )
+    
+    raise HTTPException(status_code=404, detail="File not found")
+
+@app.get("/files/list")
+async def list_files():
+    """List pending files for download."""
+    files = []
+    if _http_api and hasattr(_http_api, '_pending_files'):
+        for file_id, delivery in _http_api._pending_files.items():
+            files.append({
+                "file_id": file_id,
+                "filename": delivery.filename,
+                "description": delivery.description,
+                "expires_in_seconds": int(_http_api._file_ttl_seconds - (time.time() - delivery.created_at)),
+            })
+    
+    return {"files": files, "count": len(files)}
+
+# ========== UI ENABLE ==========
+
+def enable_ui(host: str = "127.0.0.1", port: int = 8080) -> None:
+    """Enable the web UI."""
+    global _ui_enabled, _ui_instance
+    
+    try:
+        from lollmsbot.ui.app import WebUI
+        agent = get_agent()
+        _ui_instance = WebUI(agent=agent, verbose=False)
+        
+        # Mount UI at /ui
+        app.mount("/ui", _ui_instance.app, name="ui")
+        _ui_enabled = True
+        
+        @app.get("/ui")
+        async def ui_redirect():
+            return RedirectResponse(url="/ui/")
+        
+        console.print(f"[green]✅ Web UI mounted at /ui[/]")
+        
+    except Exception as e:
+        console.print(f"[yellow]⚠️  Could not enable UI: {e}[/]")
+        import traceback
+        traceback.print_exc()
+
+# ========== HTTP API ENABLE ==========
+
+def enable_http_api(host: str = "0.0.0.0", port: int = 8800) -> None:
+    """Enable standalone HTTP API channel (for advanced file delivery)."""
+    global _http_api
+    
+    # The main gateway already provides HTTP API, but this enables the full
+    # HttpApiChannel with advanced file delivery if needed separately
+    console.print(f"[dim]HTTP API available at main gateway endpoints[/]")
+
+# ========== LIFESPAN ==========
+
 @asynccontextmanager
-async def lifespan(app_: FastAPI) -> AsyncGenerator[None, None]:
-    # Show which config sources are being used
-    wizard_loaded = bool(_WIZARD_CONFIG)
-    if wizard_loaded:
-        console.print(f"[dim]📄 Loaded wizard config from ~/.lollmsbot/config.json[/]")
+async def lifespan(app_: FastAPI):
+    # Show security info
+    is_local = HOST in ("127.0.0.1", "localhost", "::1")
+    
+    if is_local:
+        console.print(f"[bold green]🔒 SECURITY: Local-only mode[/]")
+    else:
+        console.print(f"[bold red]🌐 SECURITY: Public interface {HOST}[/]")
+        if API_KEY:
+            console.print(f"[bold green]🔐 API key authentication ENABLED[/]")
+    
+    # Initialize shared Agent and LoLLMS client
+    agent = get_agent()
+    lollms_client = get_lollms_client()
+    
+    # Ensure tools are registered
+    async def ensure_tools():
+        if len(agent.tools) == 0:
+            try:
+                await agent.register_tool(FilesystemTool())
+                console.print("[green]  • FilesystemTool registered[/]")
+            except Exception as e:
+                if "already registered" not in str(e):
+                    console.print(f"[yellow]  • FilesystemTool: {e}[/]")
+            
+            try:
+                await agent.register_tool(HttpTool())
+                console.print("[green]  • HttpTool registered[/]")
+            except Exception as e:
+                if "already registered" not in str(e):
+                    console.print(f"[yellow]  • HttpTool: {e}[/]")
+            
+            try:
+                await agent.register_tool(CalendarTool())
+                console.print("[green]  • CalendarTool registered[/]")
+            except Exception as e:
+                if "already registered" not in str(e):
+                    console.print(f"[yellow]  • CalendarTool: {e}[/]")
+    
+    await ensure_tools()
     
     console.print(f"[green]🚀 Gateway starting on http://{HOST}:{PORT}[/]")
+    console.print(f"[dim]  • Chat endpoint: POST /chat[/]")
+    console.print(f"[dim]  • File downloads: GET /files/download/<file_id>[/]")
     
-    # Track active channels
+    # Auto-enable UI
+    if os.getenv("LOLLMSBOT_ENABLE_UI", "").lower() in ("true", "1", "yes"):
+        enable_ui()
+    
     global _active_channels, _channel_tasks
     
-    # Discord (from wizard or .env)
+    # Discord with full agent capabilities
     if DISCORD_TOKEN:
         try:
-            from .channels.discord import DiscordChannel
-            console.print("[cyan]🤖 Initializing Discord channel...[/]")
+            from lollmsbot.channels.discord import DiscordChannel
+            
+            def parse_id_list(val: Optional[str]) -> Optional[Set[int]]:
+                if not val:
+                    return None
+                try:
+                    return set(int(x.strip()) for x in val.split(","))
+                except ValueError:
+                    return None
+            
+            allowed_users = parse_id_list(DISCORD_ALLOWED_USERS)
+            allowed_guilds = parse_id_list(DISCORD_ALLOWED_GUILDS)
+            blocked_users = parse_id_list(DISCORD_BLOCKED_USERS)
+            
+            require_mention_guild = DISCORD_REQUIRE_MENTION_GUILD.lower() in ("true", "1", "yes")
+            require_mention_dm = DISCORD_REQUIRE_MENTION_DM.lower() in ("true", "1", "yes")
             
             channel = DiscordChannel(
+                agent=agent,
                 bot_token=DISCORD_TOKEN,
-                gateway_url=GATEWAY_URL,  # Use localhost URL for internal access
+                allowed_users=allowed_users,
+                allowed_guilds=allowed_guilds,
+                blocked_users=blocked_users,
+                require_mention_in_guild=require_mention_guild,
+                require_mention_in_dm=require_mention_dm,
             )
             _active_channels["discord"] = channel
             
-            # Start in background task
             task = asyncio.create_task(channel.start())
             _channel_tasks.append(task)
             
-            # Wait a bit for connection (non-blocking for other channels)
             async def wait_discord():
-                ready = await channel.wait_for_ready(timeout=10.0)
+                ready = await channel.wait_for_ready(timeout=15.0)
                 if ready:
-                    console.print("[green]✅ Discord connected and ready[/]")
+                    console.print("[bold green]✅ Discord connected with FULL AGENT capabilities![/]")
+                    console.print("[dim]   File delivery enabled: Users receive generated files via DM[/]")
+                    if allowed_users:
+                        console.print(f"[dim]   Allowed users: {len(allowed_users)}[/]")
+                    if blocked_users:
+                        console.print(f"[dim]   Blocked users: {len(blocked_users)}[/]")
                 else:
-                    console.print("[yellow]⚠️  Discord still connecting (may need more time)[/]")
+                    console.print("[yellow]⚠️  Discord still connecting...[/]")
             
             asyncio.create_task(wait_discord())
             
@@ -202,15 +544,17 @@ async def lifespan(app_: FastAPI) -> AsyncGenerator[None, None]:
             import traceback
             traceback.print_exc()
     else:
-        console.print("[dim]ℹ️  Discord disabled (set DISCORD_BOT_TOKEN in wizard or .env)[/]")
+        console.print("[dim]ℹ️  Discord disabled (no DISCORD_BOT_TOKEN)[/]")
     
-    # Telegram (from wizard or .env)
+    # Telegram
     if TELEGRAM_TOKEN:
         try:
-            from .channels.telegram import TelegramChannel
-            console.print("[cyan]📱 Initializing Telegram channel...[/]")
+            from lollmsbot.channels.telegram import TelegramChannel
             
-            channel = TelegramChannel(bot_token=TELEGRAM_TOKEN)
+            channel = TelegramChannel(
+                agent=agent,
+                bot_token=TELEGRAM_TOKEN,
+            )
             _active_channels["telegram"] = channel
             
             task = asyncio.create_task(channel.start())
@@ -219,26 +563,21 @@ async def lifespan(app_: FastAPI) -> AsyncGenerator[None, None]:
             
         except Exception as e:
             console.print(f"[red]❌ Telegram failed: {e}[/]")
-            import traceback
-            traceback.print_exc()
     else:
-        console.print("[dim]ℹ️  Telegram disabled (set TELEGRAM_BOT_TOKEN in wizard or .env)[/]")
-    
-    # HTTP API channel (always enabled for gateway communication)
-    try:
-        from .channels.http_api import HttpApiChannel
-        console.print("[cyan]🌐 HTTP API channel available at /webhook[/]")
-    except ImportError:
-        pass  # Optional dependency
+        console.print("[dim]ℹ️  Telegram disabled (no TELEGRAM_BOT_TOKEN)[/]")
     
     # Summary
-    active_count = len([c for c in _active_channels.values() if getattr(c, "_is_running", False)])
-    console.print(f"[bold green]📊 Active channels: {len(_active_channels)} initialized ({active_count} running)[/]")
+    console.print(f"[bold green]📊 Active channels: {len(_active_channels)}[/]")
+    console.print(f"[bold green]🤖 Agent: {agent.name} ({len(agent.tools)} tools)[/]")
+    if lollms_client:
+        console.print(f"[bold green]🔗 LoLLMS: Connected ({LollmsSettings.from_env().host_address})[/]")
+    else:
+        console.print(f"[yellow]⚠️  LoLLMS: Not connected - tools will work but chat uses fallback mode[/]")
     
     yield
     
     # Cleanup
-    console.print("[yellow]🛑 Shutting down channels...[/]")
+    console.print("[yellow]🛑 Shutting down...[/]")
     
     for name, channel in _active_channels.items():
         try:
@@ -249,7 +588,6 @@ async def lifespan(app_: FastAPI) -> AsyncGenerator[None, None]:
     
     _active_channels.clear()
     
-    # Cancel any pending tasks
     for task in _channel_tasks:
         if not task.done():
             task.cancel()

@@ -1,2 +1,7 @@
 Solve agent alignment using the Ethos module by the Agent Forge team
 add simple front ends
+
+
+Let's add a simple local ui to interact with  this agent with good interface), add what's app integration, enhance the installation process to allow more security and better integration, add heart beat system to allow the agent to come to life and do things without me calling it explicitely, it can setup cron jobs, all in order to acheive a user defined objective. We need to be 
+
+The agent must have memory, use two layers memory, one is available directly containing important information, one that is stored for repl interactions when needed. At the end of each step, the agent reorganizes the available memory in order to make it contain most important and useful information for next interaction, it can offset information towards the repl data, or load from repl to active memory. it always stores few previous interactions (recent ones), and if they get useless, they get structured and sent to the repl memory with a summarized version in the active memory and easy access to the full memory. also in the active memory we always have an idea of two layers of structure of the repl memory s that the agent knows what he can load etc... Structure all this and update the code

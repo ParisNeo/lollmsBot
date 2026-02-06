@@ -79,12 +79,12 @@ class LollmsSettings:
 @dataclass
 class GatewaySettings:
     """Gateway server settings."""
-    host: str = field(default="0.0.0.0")
+    host: str = field(default="localhost")
     port: int = field(default=8800)
 
     @classmethod
     def from_env(cls) -> "GatewaySettings":
         return cls(
-            host=os.getenv("LOLLMSBOT_HOST", "0.0.0.0"),
+            host=os.getenv("LOLLMSBOT_HOST", "localhost"),
             port=int(os.getenv("LOLLMSBOT_PORT", "8800")),
         )
