@@ -78,6 +78,7 @@ class RLMMemoryManager:
         
         # Initialization flag
         self._initialized = False
+        self._initialization_lock: asyncio.Lock = asyncio.Lock()
     
     # ========== Event Callbacks ==========
     
@@ -108,20 +109,25 @@ class RLMMemoryManager:
     # ========== Initialization ==========
     
     async def initialize(self) -> None:
-        """Initialize the memory system."""
+        """Initialize the memory system - thread-safe."""
         if self._initialized:
             return
         
-        # Initialize database
-        await self._db.initialize()
-        
-        # Seed self-knowledge if empty
-        await self._seed_self_knowledge()
-        
-        # Load high-importance memories into RCB
-        await self._initialize_rcb()
-        
-        self._initialized = True
+        async with self._initialization_lock:
+            if self._initialized:
+                return
+            
+            # Initialize database
+            await self._db.initialize()
+            
+            # Seed self-knowledge if empty
+            await self._seed_self_knowledge()
+            
+            # Load high-importance memories into RCB
+            await self._initialize_rcb()
+            
+            self._initialized = True
+            logger.info(f"RLM Memory Manager initialized successfully")
     
     async def _seed_self_knowledge(self) -> None:
         """Seed initial self-knowledge if database is empty."""
@@ -154,23 +160,21 @@ class RLMMemoryManager:
                 content=content,
                 importance=importance,
             )
-        
-        # Also store as chunks for consistency
-        for fact_id, content, importance in identity_facts:
+            
+            # Also store as chunks for consistency with error handling
             chunk_id = f"self_{fact_id}_{uuid.uuid4().hex[:8]}"
-            chunk = MemoryChunk.create(
-                chunk_id=chunk_id,
-                chunk_type=MemoryChunkType.SELF_KNOWLEDGE,
-                content=content,
-                memory_importance=importance,
-                tags=["self_knowledge", "identity", "seeded"],
-                summary=content[:100],
-                load_hints=[fact_id, "identity", "self", "soul", "memory", "architecture"],
-                source="initialization",
-            )
-            success = await self._store_chunk_to_db(chunk)
-            if not success:
-                logger.warning(f"Failed to store self-knowledge chunk {chunk_id}, but continuing")
+            try:
+                await self.store_in_ems(
+                    content=content,
+                    chunk_type=MemoryChunkType.SELF_KNOWLEDGE,
+                    importance=importance,
+                    tags=["self_knowledge", "identity", "seeded"],
+                    summary=f"Self-knowledge: {content[:100]}",
+                    load_hints=[fact_id, "identity", "self", "soul", "memory", "architecture"],
+                    source="initialization",
+                )
+            except Exception as e:
+                logger.warning(f"Failed to store self-knowledge chunk {chunk_id}, but continuing: {e}")
     
     async def _initialize_rcb(self) -> None:
         """Initialize RCB with high-importance memories and system context."""
@@ -236,7 +240,14 @@ The actual content will be provided in your context automatically."""
         
         Returns:
             chunk_id: Unique identifier for this chunk
+            
+        Raises:
+            RuntimeError: If storage fails after all retries
         """
+        # Ensure initialized
+        if not self._initialized:
+            await self.initialize()
+        
         # Sanitize content for prompt injection
         sanitized_content, detections = self._sanitizer.sanitize(content)
         
@@ -266,14 +277,16 @@ The actual content will be provided in your context automatically."""
             # Force a valid blob
             chunk.content_compressed = b"[forced_fallback]"
         
-        # Store in database with retry logic
+        # Store in database with retry logic - CRITICAL FIX: Check result!
         max_retries = 3
         last_error = None
+        success = False
+        
         for attempt in range(max_retries):
             success = await self._store_chunk_to_db(chunk)
             if success:
                 logger.debug(f"Successfully stored chunk {chunk_id} on attempt {attempt + 1}")
-                return chunk_id
+                break
             
             # If failed, wait and retry with schema refresh
             if attempt < max_retries - 1:
@@ -283,14 +296,29 @@ The actual content will be provided in your context automatically."""
                 if not self._initialized:
                     await self._db.initialize()
         
-        # All retries exhausted - provide helpful error message
-        error_msg = (
-            f"Failed to store chunk {chunk_id} after {max_retries} attempts. "
-            f"This is likely due to a database schema mismatch. "
-            f"Please delete the database file and restart: {self._db.db_path}"
-        )
-        logger.error(error_msg)
-        raise RuntimeError(error_msg)
+        if not success:
+            # All retries exhausted - provide helpful error message
+            error_msg = (
+                f"Failed to store chunk {chunk_id} after {max_retries} attempts. "
+                f"This is likely due to a database schema mismatch or connection issue. "
+                f"Please check the database file: {self._db.db_path}"
+            )
+            logger.error(error_msg)
+            raise RuntimeError(error_msg)
+        
+        # CRITICAL FIX: Verify the chunk was actually stored by reading it back
+        verification = await self._db.get_chunk(chunk_id)
+        if verification is None:
+            error_msg = (
+                f"Storage verification failed for chunk {chunk_id}. "
+                f"The chunk was reported as stored but cannot be retrieved. "
+                f"This may indicate a database transaction issue."
+            )
+            logger.error(error_msg)
+            raise RuntimeError(error_msg)
+        
+        logger.info(f"Successfully stored and verified chunk {chunk_id} of type {chunk_type.name} with importance {importance}")
+        return chunk_id
     
     async def _store_chunk_to_db(self, chunk: MemoryChunk) -> bool:
         """Store a chunk in the database."""

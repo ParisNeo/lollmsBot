@@ -100,7 +100,6 @@ class PromptBuilder:
         
         # Add important memory context if available
         # Note: If Soul was used, important_facts are already included in its prompt
-        # This is for the fallback case where no Soul is available
         memory_context = ""
         if important_facts and (not base_prompt or "important_facts" not in base_prompt.lower()):
             creator_info = important_facts.get("creator_identity", {})
@@ -113,12 +112,27 @@ class PromptBuilder:
                     "Honor their trust and vision."
                 )
         
+        # HTTP tool specific instructions
+        http_instructions = ""
+        if "http" in tools:
+            http_instructions = """
+SPECIAL INSTRUCTIONS FOR HTTP TOOL:
+When you need to fetch content from a URL (web pages, APIs, documents):
+- The http tool will automatically extract readable text from HTML pages
+- Use [[TOOL:http|{"method": "get", "url": "https://example.com/page"}]]
+- The FULL content will be returned to you in the tool result
+- You MUST read and process this actual content in your response
+- DO NOT make up or hallucinate content - only respond based on what the tool returns
+- For long content, the tool may truncate with [TRUNCATED] marker - acknowledge this
+"""
+        
         parts = [
             base_prompt,
             memory_context,
             "",
             "AVAILABLE TOOLS (USE THESE EXACT NAMES):",
             tool_list,
+            http_instructions,
             "",
             "TOOL USAGE INSTRUCTIONS:",
             "When you need to use a tool, output EXACTLY this format:",

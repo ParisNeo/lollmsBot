@@ -33,9 +33,12 @@ class IdentityDetector:
             r"you can call me .+ i (?:made|built|developed|wrote)",
         ],
         "personal_identity": [
-            r"my name is ([^.]{2,50})[.!]",
-            r"call me ([^.]{2,30})[.!,]",
-            r"i'm ([^.]{2,50}) and i",
+            # FIXED: More flexible pattern that accepts comma, "and", or end of string as delimiters
+            r"my name is ([^,.!]{2,50}?)(?:\s*,|\s+and|\s*\)|[.!]|$)",
+            r"call me ([^,.!]{2,30}?)(?:\s*,|\s+and|[.!]|$)",
+            r"i'm ([^,.!]{2,50}?) and i",
+            # Additional patterns for various formats
+            r"i am ([^,.!]{2,50}?)(?:\s*,|\s+and|[.!]|$)",
         ],
         "relationship_revelation": [
             r"(?:son|daughter|father|mother|brother|sister|wife|husband|partner) of",
@@ -93,23 +96,46 @@ class IdentityDetector:
     ) -> None:
         """Extract specific facts based on category."""
         if category == "creator_identity":
-            # Try to extract name
+            # Try to extract name from the match or search for name patterns
+            name_groups = match.groups()
+            if name_groups and name_groups[0]:
+                result.extracted_facts["creator_name"] = name_groups[0].strip()
+            
+            # Also try general name extraction
             name_match = re.search(
-                r"(?:my name is|i am|i'm) ([^.]{2,50}?)(?: and|\.|!)",
+                r"(?:my name is|i am|i'm) ([^,.]{2,50}?)(?:\s*,|\s+and|\s+call|\s+people|[.!]|$)",
                 message_lower,
             )
             if name_match:
                 result.extracted_facts["creator_name"] = name_match.group(1).strip()
-                # Check for known alias
-                result.extracted_facts["creator_alias"] = (
-                    "ParisNeo" if "parisneo" in message_lower else None
-                )
+            
+            # Check for known alias
+            result.extracted_facts["creator_alias"] = (
+                "ParisNeo" if "parisneo" in message_lower else None
+            )
         
         elif category == "personal_identity":
             # Extract the name they want to be called
             name_groups = match.groups()
-            if name_groups:
+            if name_groups and name_groups[0]:
                 result.extracted_facts["preferred_name"] = name_groups[0].strip()
+            
+            # Also extract pseudonym/alias if mentioned
+            pseudonym_match = re.search(
+                r"(?:pseudonym|alias|nickname|also known as|aka)\s*(?:is|as)?\s*['\"]?([^,.]{2,50}?)(?:['\"]\s*|[,.]|$)",
+                message_lower,
+            )
+            if pseudonym_match:
+                result.extracted_facts["pseudonym"] = pseudonym_match.group(1).strip()
+            # Check for "pseudonyme" (French spelling)
+            elif "pseudonyme" in message_lower:
+                # Try to find word after "pseudonyme is" or similar
+                pseudo_match = re.search(
+                    r"pseudonyme\s*(?:is|est)?\s*['\"]?([^,.]{2,50}?)(?:['\"]\s*|[,.]|$)",
+                    message_lower,
+                )
+                if pseudo_match:
+                    result.extracted_facts["pseudonym"] = pseudo_match.group(1).strip()
     
     def is_informational_query(self, message: str) -> bool:
         """Check if the message is asking about capabilities/tools (no tools needed)."""

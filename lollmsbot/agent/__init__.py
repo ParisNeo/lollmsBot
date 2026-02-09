@@ -163,7 +163,7 @@ class Agent:
             "cyan", "🖥️"
         )
         
-        # Initialize RLM Memory System (will include environment in self-knowledge)
+        # Initialize RLM Memory System FIRST (before tools that need it)
         await self._ensure_memory()
         
         # Store environment facts as self-knowledge
@@ -326,6 +326,12 @@ class Agent:
         async with self._tool_lock:
             if tool.name in self._tools:
                 raise ValueError(f"Tool '{tool.name}' already registered")
+            
+            # SPECIAL HANDLING: Wire RLM memory to HTTP tool
+            if tool.name == "http" and hasattr(tool, 'set_rlm_memory'):
+                tool.set_rlm_memory(self._memory)
+                self._logger.log(f"🔗 Connected RLM memory to HTTP tool", "cyan", "🔗")
+            
             self._tools[tool.name] = tool
             self._logger.log(
                 f"🔧 Tool registered: {tool.name} (risk={tool.risk_level})",
@@ -556,16 +562,56 @@ class Agent:
                 f"🔍 Identity detected: {', '.join(identity_detection.categories)}",
                 "gold", "🧠"
             )
-            # Store in EMS with high importance
-            await memory.store_in_ems(
-                content=json.dumps(identity_detection.extracted_facts),
-                chunk_type=MemoryChunkType.FACT,
-                importance=identity_detection.importance_boost,
-                tags=identity_detection.categories + ["identity", "auto_detected"],
-                summary=f"Identity info from {user_id}: {list(identity_detection.extracted_facts.keys())}",
-                load_hints=list(identity_detection.extracted_facts.keys()),
-                source=f"identity_detection:{user_id}",
+            # LOG: About to store identity information
+            self._logger.log(
+                f"💾 STORING TO RLM EMS: Identity info from {user_id} - "
+                f"categories: {identity_detection.categories}, "
+                f"facts: {list(identity_detection.extracted_facts.keys())}, "
+                f"importance: {identity_detection.importance_boost}",
+                "cyan", "📝"
             )
+            # Store in EMS with high importance
+            try:
+                # Build a human-readable summary with actual values, not just keys
+                facts_summary = []
+                for key, value in identity_detection.extracted_facts.items():
+                    if value:  # Only include non-empty values
+                        facts_summary.append(f"{key}='{value}'")
+                
+                summary_text = ", ".join(facts_summary) if facts_summary else "identity information recorded"
+                
+                chunk_id = await memory.store_in_ems(
+                    content=json.dumps(identity_detection.extracted_facts),
+                    chunk_type=MemoryChunkType.FACT,
+                    importance=identity_detection.importance_boost,
+                    tags=identity_detection.categories + ["identity", "auto_detected", f"user_{user_id}"],
+                    summary=f"Identity info from {user_id}: {summary_text}",
+                    load_hints=list(identity_detection.extracted_facts.keys()) + list(identity_detection.extracted_facts.values())[:5],
+                    source=f"identity_detection:{user_id}",
+                )
+                # LOG: Successfully stored
+                self._logger.log(
+                    f"✅ RLM EMS STORAGE SUCCESS: chunk_id={chunk_id}, "
+                    f"importance={identity_detection.importance_boost}, "
+                    f"tags={identity_detection.categories + ['identity', 'auto_detected']}",
+                    "green", "🧠"
+                )
+                # Also notify via memory event callback if set
+                if self._memory_event_callback:
+                    await self._memory_event_callback("identity_stored", {
+                        "chunk_id": chunk_id,
+                        "user_id": user_id,
+                        "categories": identity_detection.categories,
+                        "importance": identity_detection.importance_boost,
+                        "facts_keys": list(identity_detection.extracted_facts.keys()),
+                    })
+            except Exception as e:
+                # LOG: Failed to store
+                self._logger.log(
+                    f"❌ RLM EMS STORAGE FAILED: {str(e)}",
+                    "red", "🧠"
+                )
+                # Continue processing even if storage fails
         
         # Check for informational query (no tools needed)
         if self._identity_detector.is_informational_query(message):
@@ -585,7 +631,7 @@ class Agent:
             user_id=user_id,
         )
         
-        # Get LLM response
+        # Get LLM response - with full RLM context
         client = self._ensure_lollms_client()
         response, extracted_tools, extracted_files = await self._get_llm_response(
             client, system_prompt, user_id, message, is_file_request, memory
@@ -594,14 +640,31 @@ class Agent:
         tools_used.extend(extracted_tools)
         files_to_send.extend(extracted_files)
         
-        # Store conversation in EMS (long-term memory)
-        await memory.store_conversation_turn(
-            user_id=user_id,
-            user_message=message,
-            agent_response=response,
-            tools_used=tools_used,
-            importance=2.0 if identity_detection.categories else 1.0,
+        # LOG: Storing conversation in EMS
+        self._logger.log(
+            f"💾 STORING TO RLM EMS: Conversation turn from {user_id}, "
+            f"tools_used: {tools_used}, importance: {2.0 if identity_detection.categories else 1.0}",
+            "cyan", "📝"
         )
+        
+        # Store conversation in EMS (long-term memory)
+        try:
+            conv_chunk_id = await memory.store_conversation_turn(
+                user_id=user_id,
+                user_message=message,
+                agent_response=response,
+                tools_used=tools_used,
+                importance=2.0 if identity_detection.categories else 1.0,
+            )
+            self._logger.log(
+                f"✅ RLM EMS CONVERSATION STORED: chunk_id={conv_chunk_id}",
+                "green", "🧠"
+            )
+        except Exception as e:
+            self._logger.log(
+                f"❌ RLM EMS CONVERSATION STORAGE FAILED: {str(e)}",
+                "red", "🧠"
+            )
         
         # Deliver files
         await self._deliver_files(user_id, files_to_send)
@@ -638,38 +701,66 @@ class Agent:
         else:
             base_prompt = f"You are {self.name}, an AI assistant with RLM (Recursive Language Model) memory."
         
-        # Add RLM memory interface explanation
+        # Add RLM memory interface explanation - with web content specifics
         rlm_explanation = """
 ## Your Memory System (RLM Architecture)
 
 You have a **double-memory structure** following MIT CSAIL's Recursive Language Model research:
 
 1. **External Memory Store (EMS)**: All your long-term memories are stored here as compressed, 
-   sanitized chunks with importance-weighted retention.
+   sanitized chunks with importance-weighted retention. This includes:
+   - Conversation history
+   - Important facts about users
+   - Web content you have fetched
+   - Self-knowledge about your own systems
 
 2. **REPL Context Buffer (RCB)**: What you see below - your working memory with loadable handles.
 
 ### How to Use Your Memory
 
-The RCB shows memory handles like: [[MEMORY:abc123|{"type": "SELF_KNOWLEDGE", "summary": "...", "load": "..."}]]
+The RCB shows memory handles like: [[MEMORY:abc123|{"type": "SELF_KNOWLEDGE", "summary": "..."}]]
 
-To "load" a memory into your context, you conceptually use: load_memory("chunk_id")
-The system will automatically retrieve and include relevant content.
+To access full content of a memory, reference its handle in your reasoning. The system 
+automatically retrieves the full content when you need it.
 
-### Available Memory Commands (conceptual)
-- `load_memory(chunk_id)` - Load specific memory into working context
-- `search_memory("query")` - Search for relevant memories
-- `store_fact("content")` - Save new information (happens automatically)
+### WEB CONTENT - Special Handling
 
-You do NOT need to output these commands - they describe how your memory system works.
-The actual memory content is managed by your implementation.
+When you use the HTTP tool to fetch a URL:
+- The full content is stored as a WEB_CONTENT chunk in EMS
+- You receive a memory handle like [[MEMORY:web_abc123]]
+- The chunk is automatically loaded into your RCB
+- YOU MUST read and process this actual content - never hallucinate
+
+CRITICAL: When a user asks you to summarize web content:
+1. Use the HTTP tool to fetch it
+2. The content becomes available via memory handle
+3. ACTUALLY READ the content through the handle
+4. Provide a real summary based on what was fetched
+5. NEVER make up a generic description
 """
         
         # Get formatted RCB (working memory) from memory manager
-        rcb_content = memory.format_rcb_for_prompt(max_chars=6000)
+        rcb_content = memory.format_rcb_for_prompt(max_chars=8000)  # Increased for web content
         
-        # Add tool documentation
+        # Add tool documentation with HTTP-specific instructions
         tool_list = self._prompt_builder._format_tool_list(tools)
+        
+        # HTTP-specific instructions - emphasizing RLM integration
+        http_instructions = ""
+        if "http" in tools:
+            http_instructions = """
+### HTTP TOOL - RLM-Integrated Usage
+
+When you need to fetch content from a URL:
+1. Call [[TOOL:http|{"method": "get", "url": "THE_URL"}]]
+2. The tool stores content in RLM memory and returns a memory handle
+3. The handle is automatically loaded into your RCB below
+4. YOU MUST reference this handle to access the content
+5. Provide accurate responses based on the ACTUAL fetched content
+
+The HTTP tool does NOT return raw text - it returns a memory handle.
+The content is in your RLM system. Use it via the memory handles in your RCB.
+"""
         
         # Add environment context if available
         env_context = ""
@@ -690,11 +781,66 @@ You are running on:
             if env.host_bindings:
                 env_context += f"- **Network Access**: {', '.join(env.host_bindings)}\n"
         
+        # Search for user-specific identity memories and load them
+        user_memories = []
+        try:
+            # FIXED: Search with just user_id tag, not "user_id identity" - the tag is stored as f"user_{user_id}" not "user_{user_id} identity"
+            # Use user_id directly to match the tag pattern
+            identity_results = await memory.search_ems(
+                query=user_id,  # FIXED: Changed from f"user_{user_id} identity" to just user_id
+                chunk_types=[MemoryChunkType.FACT],
+                min_importance=2.0,
+                limit=5,
+            )
+            for chunk, score in identity_results:
+                # Only process identity-related chunks
+                tags = chunk.tags or []
+                if "identity" not in tags and "creator_identity" not in tags:
+                    continue
+                    
+                content = chunk.decompress_content()
+                try:
+                    facts = json.loads(content)
+                    # Format facts nicely for display
+                    fact_lines = []
+                    for k, v in facts.items():
+                        if v:  # Only show non-empty values
+                            fact_lines.append(f"{k}: {v}")
+                    if fact_lines:
+                        user_memories.append(f"User identity - {', '.join(fact_lines)}")
+                except:
+                    # If not valid JSON, show summary
+                    user_memories.append(f"User memory: {chunk.summary or content[:100]}")
+            
+            # Also search for any memories tagged with this user more broadly
+            user_conversation_results = await memory.search_ems(
+                query=user_id,
+                chunk_types=[MemoryChunkType.CONVERSATION, MemoryChunkType.FACT],
+                min_importance=1.0,
+                limit=3,
+            )
+            for chunk, score in user_conversation_results:
+                if chunk.chunk_type == MemoryChunkType.CONVERSATION:
+                    # Don't load full conversation content, just note it exists
+                    user_memories.append(f"Previous conversation on {chunk.created_at.strftime('%Y-%m-%d') if hasattr(chunk, 'created_at') and chunk.created_at else 'earlier'}")
+        except Exception as e:
+            self._logger.log(f"Error loading user memories: {e}", "yellow")
+        
+        user_context = ""
+        if user_memories:
+            user_context = """
+## Information About This User
+
+"""
+            for mem in user_memories:
+                user_context += f"- {mem}\n"
+        
         # Combine all parts
         parts = [
             base_prompt,
             rlm_explanation,
             env_context,
+            user_context,
             "",
             "=" * 60,
             "YOUR CURRENT WORKING MEMORY (RCB)",
@@ -705,6 +851,7 @@ You are running on:
             "AVAILABLE TOOLS",
             "=" * 60,
             tool_list,
+            http_instructions,
         ]
         
         if is_file_request:
@@ -810,7 +957,7 @@ You are running on:
         is_file_request: bool,
         memory: RLMMemoryManager,
     ) -> tuple[str, List[str], List[Dict[str, Any]]]:
-        """Get response from LLM, with RLM memory-aware fallback."""
+        """Get response from LLM, with RLM memory-aware processing."""
         if not client:
             # Fallback: try direct tool execution
             return await self._try_direct_execution(message, user_id)
@@ -818,7 +965,7 @@ You are running on:
         # Build conversation context with recent EMS conversations loaded into RCB
         # Search for recent conversations with this user
         recent_convs = await memory.search_ems(
-            query=f"user_{user_id} conversation",
+            query=user_id,
             chunk_types=[MemoryChunkType.CONVERSATION],
             limit=3,
         )
@@ -827,13 +974,37 @@ You are running on:
         for chunk, _ in recent_convs:
             await memory.load_from_ems(chunk.chunk_id, add_to_rcb=True)
         
-        # Refresh system prompt with updated RCB
-        updated_prompt = system_prompt  # Already includes RCB which now has recent convos
+        # Also search for and load any high-importance facts about this user
+        # FIXED: Use user_id directly to match tags properly
+        user_facts = await memory.search_ems(
+            query=user_id,
+            chunk_types=[MemoryChunkType.FACT],
+            min_importance=2.0,
+            limit=3,
+        )
+        for chunk, _ in user_facts:
+            # Only load identity-related facts
+            tags = chunk.tags or []
+            if "identity" in tags or "creator_identity" in tags:
+                await memory.load_from_ems(chunk.chunk_id, add_to_rcb=True)
         
-        # Build final prompt
-        prompt = f"{updated_prompt}\n\nUser: {message}\nAssistant:"
+        # Refresh system prompt with updated RCB (now includes loaded memories)
+        # We need to rebuild the prompt to include the updated RCB
+        # Actually, let's rebuild to get fresh RCB
+        soul = self._ensure_soul()
+        fresh_prompt = await self._build_rlm_system_prompt(
+            memory=memory,
+            tools=self._tools,
+            context={"channel": "chat"},  # Simplified context
+            soul=soul,
+            is_file_request=is_file_request,
+            user_id=user_id,
+        )
         
-        self._logger.log_llm_call(len(prompt), updated_prompt[:500])
+        # Build final prompt with conversation
+        prompt = f"{fresh_prompt}\n\nUser: {message}\nAssistant:"
+        
+        self._logger.log_llm_call(len(prompt), fresh_prompt[:500])
         
         # Call LLM
         llm_response = client.generate_text(
@@ -848,9 +1019,31 @@ You are running on:
         
         # Parse and execute tools
         if self._tool_parser:
-            return await self._tool_parser.parse_and_execute(llm_response, user_id, None)
+            result = await self._tool_parser.parse_and_execute(llm_response, user_id, None)
+            
+            final_response, tools_used, files_generated = result
+            
+            # Strip any [[MEMORY:...]] references from the response - they shouldn't be visible to user
+            final_response = self._strip_memory_handles(final_response)
+            
+            # NO MORE SECOND PASS - RLM handles this naturally!
+            # The HTTP tool stores content in RLM, and the RCB shows the handle.
+            # If the LLM didn't properly use the content, that's a prompt engineering issue,
+            # not a workflow issue. The RLM architecture is designed to make content
+            # available via the RCB in the next turn if needed.
+            
+            return final_response, tools_used, files_generated
         
-        return llm_response.strip(), [], []
+        # Strip memory handles from raw response too
+        clean_response = self._strip_memory_handles(llm_response.strip())
+        return clean_response, [], []
+    
+    def _strip_memory_handles(self, text: str) -> str:
+        """Remove [[MEMORY:...]] references from response text."""
+        import re
+        # Pattern matches [[MEMORY:chunk_id|{metadata}]] or [[MEMORY:chunk_id]]
+        pattern = r'\[\[MEMORY:[^\]]+\]\]'
+        return re.sub(pattern, '', text).strip()
     
     async def _try_direct_execution(
         self,

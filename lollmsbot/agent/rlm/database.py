@@ -54,11 +54,18 @@ class RLMDatabase:
         # Check if we need to delete old/corrupted database
         await self._check_and_fix_schema()
         
-        # Connect to database
-        self._connection = await aiosqlite.connect(str(self.db_path))
+        # Connect to database with proper settings for durability
+        self._connection = await aiosqlite.connect(
+            str(self.db_path),
+            timeout=30.0,  # Wait up to 30 seconds for locks
+        )
         
         # Enable foreign keys
         await self._connection.execute("PRAGMA foreign_keys = ON")
+        
+        # CRITICAL FIX: Enable WAL mode for better concurrency and durability
+        await self._connection.execute("PRAGMA journal_mode = WAL")
+        await self._connection.execute("PRAGMA synchronous = NORMAL")
         
         # Apply migrations first (before creating schema, to handle existing tables)
         await self._apply_migrations()
@@ -66,6 +73,7 @@ class RLMDatabase:
         # Create schema (for new databases or missing tables/indexes)
         await self._create_schema()
         
+        # CRITICAL FIX: Ensure transaction is committed
         await self._connection.commit()
         logger.info(f"RLM Database initialized at {self.db_path}")
     
@@ -230,87 +238,6 @@ class RLMDatabase:
         except sqlite3.OperationalError:
             pass
     
-    async def _migrate_content_to_content_compressed(self) -> None:
-        """Migrate old table with 'content' column to new schema with 'content_compressed'."""
-        try:
-            # Rename old table
-            await self._connection.execute("ALTER TABLE memory_chunks RENAME TO memory_chunks_old")
-            
-            # Create new table with correct schema
-            await self._connection.execute("""
-                CREATE TABLE memory_chunks (
-                    chunk_id TEXT PRIMARY KEY,
-                    chunk_type TEXT NOT NULL,
-                    content_compressed BLOB NOT NULL,
-                    content_hash TEXT NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_accessed TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    access_count INTEGER DEFAULT 0,
-                    memory_importance REAL DEFAULT 1.0,
-                    compression_ratio REAL DEFAULT 1.0,
-                    tags TEXT,
-                    summary TEXT,
-                    load_hints TEXT,
-                    source TEXT,
-                    archived INTEGER DEFAULT 0
-                )
-            """)
-            
-            # Migrate data - compress the old content
-            async with self._connection.execute("SELECT * FROM memory_chunks_old") as cursor:
-                rows = await cursor.fetchall()
-                for row in rows:
-                    # row structure: chunk_id, chunk_type, content, ...
-                    chunk_id = row[0]
-                    chunk_type = row[1]
-                    old_content = row[2] if row[2] else ""
-                    
-                    # Compress the content
-                    import hashlib
-                    content_bytes = old_content.encode('utf-8') if isinstance(old_content, str) else old_content
-                    if not content_bytes:
-                        content_bytes = b"[empty]"
-                    compressed = zlib.compress(content_bytes, level=6)
-                    content_hash = hashlib.sha256(content_bytes).hexdigest()[:16]
-                    
-                    # Insert into new table
-                    await self._connection.execute(
-                        """
-                        INSERT INTO memory_chunks (
-                            chunk_id, chunk_type, content_compressed, content_hash,
-                            created_at, last_accessed, access_count, memory_importance,
-                            compression_ratio, tags, summary, load_hints, source, archived
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            chunk_id, chunk_type, compressed, content_hash,
-                            row[3] if len(row) > 3 else datetime.now().isoformat(),
-                            row[4] if len(row) > 4 else datetime.now().isoformat(),
-                            row[5] if len(row) > 5 else 0,
-                            row[6] if len(row) > 6 else 1.0,
-                            len(content_bytes) / len(compressed) if compressed else 1.0,
-                            row[8] if len(row) > 8 else None,
-                            row[9] if len(row) > 9 else None,
-                            row[10] if len(row) > 10 else None,
-                            row[11] if len(row) > 11 else None,
-                            row[12] if len(row) > 12 else 0,
-                        )
-                    )
-            
-            # Drop old table
-            await self._connection.execute("DROP TABLE memory_chunks_old")
-            await self._connection.commit()
-            logger.info(f"Successfully migrated {len(rows)} chunks to new schema")
-            
-        except Exception as e:
-            logger.error(f"Migration failed: {e}")
-            # Try to recover by restoring old table name
-            try:
-                await self._connection.execute("ALTER TABLE memory_chunks_old RENAME TO memory_chunks")
-            except:
-                pass
-            raise
-    
     async def store_chunk(
         self,
         chunk_id: str,
@@ -324,7 +251,12 @@ class RLMDatabase:
         load_hints: Optional[List[str]] = None,
         source: Optional[str] = None,
     ) -> bool:
-        """Store a new memory chunk."""
+        """
+        Store a new memory chunk.
+        
+        Returns:
+            True if storage succeeded, False otherwise
+        """
         try:
             # Ensure connection is established
             if self._connection is None:
@@ -344,29 +276,58 @@ class RLMDatabase:
             # Log what we're about to store
             logger.debug(f"Storing chunk {chunk_id}: type={chunk_type}, compressed_size={len(content_compressed)}, hash={content_hash}")
             
-            await self._connection.execute(
-                """
-                INSERT INTO memory_chunks (
-                    chunk_id, chunk_type, content_compressed, content_hash,
-                    memory_importance, compression_ratio, tags, summary, load_hints, source
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    chunk_id,
-                    chunk_type,
-                    content_compressed,
-                    content_hash,
-                    memory_importance,
-                    compression_ratio,
-                    json.dumps(tags) if tags else None,
-                    summary,
-                    json.dumps(load_hints) if load_hints else None,
-                    source,
-                )
-            )
-            await self._connection.commit()
-            logger.debug(f"Successfully stored chunk {chunk_id} of type {chunk_type}")
-            return True
+            # CRITICAL FIX: Use explicit transaction with proper error handling
+            try:
+                async with self._connection.execute(
+                    """
+                    INSERT INTO memory_chunks (
+                        chunk_id, chunk_type, content_compressed, content_hash,
+                        memory_importance, compression_ratio, tags, summary, load_hints, source
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        chunk_id,
+                        chunk_type,
+                        content_compressed,
+                        content_hash,
+                        memory_importance,
+                        compression_ratio,
+                        json.dumps(tags) if tags else None,
+                        summary,
+                        json.dumps(load_hints) if load_hints else None,
+                        source,
+                    )
+                ) as cursor:
+                    # Check if row was actually inserted
+                    if cursor.rowcount != 1:
+                        logger.error(f"Insert affected {cursor.rowcount} rows, expected 1")
+                        await self._connection.rollback()
+                        return False
+                
+                # CRITICAL FIX: Explicit commit to ensure durability
+                await self._connection.commit()
+                
+                # Verify by checking the row exists
+                async with self._connection.execute(
+                    "SELECT chunk_id FROM memory_chunks WHERE chunk_id = ?",
+                    (chunk_id,)
+                ) as verify_cursor:
+                    row = await verify_cursor.fetchone()
+                    if row is None:
+                        logger.error(f"Verification failed: chunk {chunk_id} not found after commit")
+                        return False
+                
+                logger.debug(f"Successfully stored and verified chunk {chunk_id} of type {chunk_type}")
+                return True
+                
+            except Exception as insert_error:
+                logger.error(f"Insert operation failed for chunk {chunk_id}: {insert_error}")
+                try:
+                    await self._connection.rollback()
+                except:
+                    pass
+                raise  # Re-raise to be caught by outer handler
+                
         except sqlite3.IntegrityError as e:
             # Duplicate key or constraint violation
             logger.error(f"Integrity error storing chunk {chunk_id}: {e}")
@@ -388,40 +349,49 @@ class RLMDatabase:
             return False
         except Exception as e:
             logger.error(f"Unexpected error storing chunk {chunk_id}: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
             return False
     
     async def get_chunk(self, chunk_id: str) -> Optional[Dict[str, Any]]:
         """Retrieve a chunk by ID."""
-        async with self._connection.execute(
-            "SELECT * FROM memory_chunks WHERE chunk_id = ? AND (archived IS NULL OR archived = 0)",
-            (chunk_id,)
-        ) as cursor:
-            row = await cursor.fetchone()
-            if row:
-                return self._row_to_dict(cursor, row)
+        try:
+            async with self._connection.execute(
+                "SELECT * FROM memory_chunks WHERE chunk_id = ? AND (archived IS NULL OR archived = 0)",
+                (chunk_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    return self._row_to_dict(cursor, row)
+                return None
+        except Exception as e:
+            logger.error(f"Error retrieving chunk {chunk_id}: {e}")
             return None
     
     async def update_access(self, chunk_id: str, access_type: str = "read") -> None:
         """Update access statistics for a chunk."""
         now = datetime.now().isoformat()
         
-        # Update chunk stats
-        await self._connection.execute(
-            """
-            UPDATE memory_chunks 
-            SET last_accessed = ?, access_count = access_count + 1
-            WHERE chunk_id = ?
-            """,
-            (now, chunk_id)
-        )
-        
-        # Log access
-        await self._connection.execute(
-            "INSERT INTO access_log (chunk_id, access_type, accessed_at) VALUES (?, ?, ?)",
-            (chunk_id, access_type, now)
-        )
-        
-        await self._connection.commit()
+        try:
+            # Update chunk stats
+            await self._connection.execute(
+                """
+                UPDATE memory_chunks 
+                SET last_accessed = ?, access_count = access_count + 1
+                WHERE chunk_id = ?
+                """,
+                (now, chunk_id)
+            )
+            
+            # Log access
+            await self._connection.execute(
+                "INSERT INTO access_log (chunk_id, access_type, accessed_at) VALUES (?, ?, ?)",
+                (chunk_id, access_type, now)
+            )
+            
+            await self._connection.commit()
+        except Exception as e:
+            logger.error(f"Error updating access for chunk {chunk_id}: {e}")
     
     async def search_chunks(
         self,
@@ -465,12 +435,15 @@ class RLMDatabase:
         params.append(limit)
         
         results = []
-        async with self._connection.execute(sql, params) as cursor:
-            async for row in cursor:
-                chunk_dict = self._row_to_dict(cursor, row)
-                # Simple relevance scoring
-                score = chunk_dict.get("memory_importance", 1.0)
-                results.append((chunk_dict, score))
+        try:
+            async with self._connection.execute(sql, params) as cursor:
+                async for row in cursor:
+                    chunk_dict = self._row_to_dict(cursor, row)
+                    # Simple relevance scoring
+                    score = chunk_dict.get("memory_importance", 1.0)
+                    results.append((chunk_dict, score))
+        except Exception as e:
+            logger.error(f"Error searching chunks: {e}")
         
         return results
     
@@ -481,32 +454,40 @@ class RLMDatabase:
         limit: int = 100,
     ) -> List[Dict[str, Any]]:
         """Get chunks within an importance range."""
-        async with self._connection.execute(
-            """
-            SELECT * FROM memory_chunks 
-            WHERE memory_importance >= ? AND memory_importance <= ? AND (archived IS NULL OR archived = 0)
-            ORDER BY memory_importance DESC
-            LIMIT ?
-            """,
-            (min_importance, max_importance, limit)
-        ) as cursor:
-            rows = await cursor.fetchall()
-            return [self._row_to_dict(cursor, row) for row in rows]
+        try:
+            async with self._connection.execute(
+                """
+                SELECT * FROM memory_chunks 
+                WHERE memory_importance >= ? AND memory_importance <= ? AND (archived IS NULL OR archived = 0)
+                ORDER BY memory_importance DESC
+                LIMIT ?
+                """,
+                (min_importance, max_importance, limit)
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return [self._row_to_dict(cursor, row) for row in rows]
+        except Exception as e:
+            logger.error(f"Error getting chunks by importance: {e}")
+            return []
     
     async def archive_low_importance_chunks(self, threshold: float = 0.5) -> int:
         """Archive chunks below importance threshold (forgetting curve)."""
-        await self._connection.execute(
-            "UPDATE memory_chunks SET archived = 1 WHERE memory_importance < ?",
-            (threshold,)
-        )
-        await self._connection.commit()
-        
-        # Return count of archived chunks
-        async with self._connection.execute(
-            "SELECT changes()"
-        ) as cursor:
-            row = await cursor.fetchone()
-            return row[0] if row else 0
+        try:
+            await self._connection.execute(
+                "UPDATE memory_chunks SET archived = 1 WHERE memory_importance < ?",
+                (threshold,)
+            )
+            await self._connection.commit()
+            
+            # Return count of archived chunks
+            async with self._connection.execute(
+                "SELECT changes()"
+            ) as cursor:
+                row = await cursor.fetchone()
+                return row[0] if row else 0
+        except Exception as e:
+            logger.error(f"Error archiving chunks: {e}")
+            return 0
     
     async def delete_chunk(self, chunk_id: str) -> bool:
         """Permanently delete a chunk."""
@@ -517,39 +498,45 @@ class RLMDatabase:
             )
             await self._connection.commit()
             return True
-        except Exception:
+        except Exception as e:
+            logger.error(f"Error deleting chunk {chunk_id}: {e}")
             return False
     
     async def get_stats(self) -> Dict[str, Any]:
         """Get database statistics."""
         stats = {}
         
-        # Count chunks
-        async with self._connection.execute(
-            "SELECT COUNT(*) FROM memory_chunks WHERE archived IS NULL OR archived = 0"
-        ) as cursor:
-            row = await cursor.fetchone()
-            stats["active_chunks"] = row[0] if row else 0
-        
-        async with self._connection.execute(
-            "SELECT COUNT(*) FROM memory_chunks WHERE archived = 1"
-        ) as cursor:
-            row = await cursor.fetchone()
-            stats["archived_chunks"] = row[0] if row else 0
-        
-        # Average importance
-        async with self._connection.execute(
-            "SELECT AVG(memory_importance) FROM memory_chunks WHERE archived IS NULL OR archived = 0"
-        ) as cursor:
-            row = await cursor.fetchone()
-            stats["avg_importance"] = row[0] if row and row[0] else 0.0
-        
-        # Total accesses
-        async with self._connection.execute(
-            "SELECT SUM(access_count) FROM memory_chunks"
-        ) as cursor:
-            row = await cursor.fetchone()
-            stats["total_accesses"] = row[0] if row and row[0] else 0
+        try:
+            # Count chunks
+            async with self._connection.execute(
+                "SELECT COUNT(*) FROM memory_chunks WHERE archived IS NULL OR archived = 0"
+            ) as cursor:
+                row = await cursor.fetchone()
+                stats["active_chunks"] = row[0] if row else 0
+            
+            async with self._connection.execute(
+                "SELECT COUNT(*) FROM memory_chunks WHERE archived = 1"
+            ) as cursor:
+                row = await cursor.fetchone()
+                stats["archived_chunks"] = row[0] if row else 0
+            
+            # Average importance
+            async with self._connection.execute(
+                "SELECT AVG(memory_importance) FROM memory_chunks WHERE archived IS NULL OR archived = 0"
+            ) as cursor:
+                row = await cursor.fetchone()
+                stats["avg_importance"] = row[0] if row and row[0] else 0.0
+            
+            # Total accesses
+            async with self._connection.execute(
+                "SELECT SUM(access_count) FROM memory_chunks"
+            ) as cursor:
+                row = await cursor.fetchone()
+                stats["total_accesses"] = row[0] if row and row[0] else 0
+                
+        except Exception as e:
+            logger.error(f"Error getting stats: {e}")
+            stats["error"] = str(e)
         
         return stats
     
@@ -586,24 +573,31 @@ class RLMDatabase:
     
     async def get_self_knowledge(self, category: Optional[str] = None) -> List[Dict[str, Any]]:
         """Retrieve self-knowledge entries."""
-        if category:
-            async with self._connection.execute(
-                "SELECT * FROM self_knowledge WHERE category = ? ORDER BY importance DESC",
-                (category,)
-            ) as cursor:
-                rows = await cursor.fetchall()
-                return [self._row_to_dict(cursor, row) for row in rows]
-        else:
-            async with self._connection.execute(
-                "SELECT * FROM self_knowledge ORDER BY importance DESC"
-            ) as cursor:
-                rows = await cursor.fetchall()
-                return [self._row_to_dict(cursor, row) for row in rows]
+        try:
+            if category:
+                async with self._connection.execute(
+                    "SELECT * FROM self_knowledge WHERE category = ? ORDER BY importance DESC",
+                    (category,)
+                ) as cursor:
+                    rows = await cursor.fetchall()
+                    return [self._row_to_dict(cursor, row) for row in rows]
+            else:
+                async with self._connection.execute(
+                    "SELECT * FROM self_knowledge ORDER BY importance DESC"
+                ) as cursor:
+                    rows = await cursor.fetchall()
+                    return [self._row_to_dict(cursor, row) for row in rows]
+        except Exception as e:
+            logger.error(f"Error getting self-knowledge: {e}")
+            return []
     
     async def clear_rcb(self) -> None:
         """Clear all RCB entries."""
-        await self._connection.execute("DELETE FROM rcb_state")
-        await self._connection.commit()
+        try:
+            await self._connection.execute("DELETE FROM rcb_state")
+            await self._connection.commit()
+        except Exception as e:
+            logger.error(f"Error clearing RCB: {e}")
     
     async def store_rcb_entry(
         self,
@@ -613,28 +607,36 @@ class RLMDatabase:
         display_order: int = 0,
     ) -> int:
         """Store an RCB entry. Returns entry_id."""
-        cursor = await self._connection.execute(
-            """
-            INSERT INTO rcb_state (entry_type, content, chunk_id, display_order)
-            VALUES (?, ?, ?, ?)
-            """,
-            (entry_type, content, chunk_id, display_order)
-        )
-        await self._connection.commit()
-        return cursor.lastrowid
+        try:
+            cursor = await self._connection.execute(
+                """
+                INSERT INTO rcb_state (entry_type, content, chunk_id, display_order)
+                VALUES (?, ?, ?, ?)
+                """,
+                (entry_type, content, chunk_id, display_order)
+            )
+            await self._connection.commit()
+            return cursor.lastrowid
+        except Exception as e:
+            logger.error(f"Error storing RCB entry: {e}")
+            return -1
     
     async def get_rcb_entries(self, limit: int = 10) -> List[Dict[str, Any]]:
         """Get current RCB entries ordered by display_order."""
-        async with self._connection.execute(
-            """
-            SELECT * FROM rcb_state 
-            ORDER BY display_order ASC, loaded_at DESC
-            LIMIT ?
-            """,
-            (limit,)
-        ) as cursor:
-            rows = await cursor.fetchall()
-            return [self._row_to_dict(cursor, row) for row in rows]
+        try:
+            async with self._connection.execute(
+                """
+                SELECT * FROM rcb_state 
+                ORDER BY display_order ASC, loaded_at DESC
+                LIMIT ?
+                """,
+                (limit,)
+            ) as cursor:
+                rows = await cursor.fetchall()
+                return [self._row_to_dict(cursor, row) for row in rows]
+        except Exception as e:
+            logger.error(f"Error getting RCB entries: {e}")
+            return []
     
     async def remove_rcb_entry(self, entry_id: int) -> bool:
         """Remove an RCB entry."""
@@ -645,7 +647,8 @@ class RLMDatabase:
             )
             await self._connection.commit()
             return True
-        except Exception:
+        except Exception as e:
+            logger.error(f"Error removing RCB entry {entry_id}: {e}")
             return False
     
     def _row_to_dict(
@@ -670,5 +673,10 @@ class RLMDatabase:
     async def close(self) -> None:
         """Close database connection."""
         if self._connection:
+            try:
+                # Ensure any pending transactions are committed or rolled back
+                await self._connection.commit()
+            except:
+                pass
             await self._connection.close()
             self._connection = None

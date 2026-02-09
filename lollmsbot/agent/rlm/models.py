@@ -21,6 +21,7 @@ class MemoryChunkType(Enum):
     SKILL_EXECUTION = auto()     # Record of skill usage
     USER_PREFERENCE = auto()     # User-specific preferences
     WORKING_MEMORY = auto()      # Temporary working state
+    WEB_CONTENT = auto()         # Content fetched from URLs (web pages, APIs, documents)
 
 
 @dataclass
