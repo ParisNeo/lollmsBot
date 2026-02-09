@@ -1,7 +1,7 @@
 [project]
 name = "lollmsbot"
-version = "0.0.1"
-description = "LoLLMS-based personal AI assistant (Clawdbot-style)"
+version = "0.0.2"
+description = "LoLLMS-based personal AI assistant"
 authors = [{ name = "Your Name" }]
 requires-python = ">=3.10"
 dependencies = [
@@ -17,7 +17,8 @@ dependencies = [
     "slack-sdk>=3.30.0",     # Slack[web:slack-sdk]
     "openai", # for lollms
     "PyNaCl",
-    "jinja2"
+    "jinja2",
+    "aiosqlite"
 ]
 
 [project.optional-dependencies]

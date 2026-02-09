@@ -21,7 +21,6 @@ class DiscordUserSession:
     user_id: str
     history: List[Dict[str, str]] = field(default_factory=list)
     max_history: int = 10
-    personality: Optional[str] = None
     
     def add_exchange(self, user_msg: str, bot_response: str):
         """Add a conversation exchange to history."""
@@ -37,9 +36,6 @@ class DiscordUserSession:
             return current_message
         
         context_parts = []
-        # Add personality if set
-        if self.personality:
-            context_parts.append(f"[System: You are {self.personality}]")
         
         # Add recent history
         for entry in self.history[-6:]:  # Last 3 exchanges
@@ -172,6 +168,94 @@ class DiscordChannel:
                 pass
         return None
 
+    def _markdown_to_discord(self, text: str) -> str:
+        """Convert standard markdown to Discord markdown.
+        
+        Discord uses:
+        *italic* or _italic_ -> ** for bold?? No wait, let me check:
+        Actually Discord: **bold**, *italic*, __underline__, ~~strikethrough~~
+        
+        Standard markdown: **bold**, *italic*, _italic_
+        
+        So we need to convert:
+        - **text** -> **text** (same)
+        - *text* or _text_ -> *text* (same for italic)
+        - But we need to handle the table format and other Discord-specific formatting
+        """
+        import re
+        
+        # Handle code blocks first (preserve them)
+        # Discord uses ``` for code blocks, same as markdown
+        
+        # Convert table-like structures to Discord-friendly format
+        # The | column | column | format should be converted
+        
+        # Replace markdown headers with bold (Discord doesn't have headers)
+        text = re.sub(r'^#{1,6}\s+(.+)$', r'**\1**', text, flags=re.MULTILINE)
+        
+        # Handle bullet points - Discord supports - and * for bullets
+        # Just keep as is
+        
+        # Handle the table syntax - convert to code block or simple format
+        lines = text.split('\n')
+        result_lines = []
+        in_table = False
+        table_lines = []
+        
+        for line in lines:
+            # Check if this is a table row
+            if '|' in line and not line.strip().startswith('```'):
+                if not in_table:
+                    in_table = True
+                    table_lines = []
+                table_lines.append(line)
+            else:
+                if in_table:
+                    # Process accumulated table
+                    result_lines.extend(self._convert_table_to_discord(table_lines))
+                    in_table = False
+                    table_lines = []
+                result_lines.append(line)
+        
+        # Handle remaining table
+        if in_table and table_lines:
+            result_lines.extend(self._convert_table_to_discord(table_lines))
+        
+        return '\n'.join(result_lines)
+    
+    def _convert_table_to_discord(self, table_lines: List[str]) -> List[str]:
+        """Convert markdown table to Discord-friendly format."""
+        if not table_lines:
+            return []
+        
+        # Simple approach: convert to a code block for alignment
+        # Or convert to bold headers with bullet points
+        
+        # Check if it's a simple 2-column comparison table
+        if len(table_lines) >= 3 and all('|' in line for line in table_lines):
+            # Parse the table
+            rows = []
+            for line in table_lines:
+                cells = [cell.strip() for cell in line.split('|') if cell.strip()]
+                if cells:
+                    rows.append(cells)
+            
+            # Skip separator row (contains ---)
+            rows = [r for r in rows if not all('-' in c for c in r)]
+            
+            if len(rows) >= 2:
+                # Format as bold headers with values
+                result = []
+                headers = rows[0]
+                for row in rows[1:]:
+                    for i, (header, value) in enumerate(zip(headers, row)):
+                        result.append(f"**{header}:** {value}")
+                    result.append("")  # Empty line between rows
+                return result
+        
+        # Fallback: return as code block
+        return ['```'] + table_lines + ['```']
+
     async def _deliver_files(self, user_id: str, files: List[Dict[str, Any]]) -> bool:
         """Deliver files to a Discord user via DM.
         
@@ -266,6 +350,7 @@ class DiscordChannel:
         async with message.channel.typing():
             try:
                 # Use the shared Agent for processing
+                # The Agent's Soul configuration will be used automatically
                 result = await self.agent.chat(
                     user_id=user_id,
                     message=clean_content,
@@ -291,12 +376,15 @@ class DiscordChannel:
                 # Get response
                 response = result.get("response", "No response")
                 
+                # Convert markdown to Discord format
+                discord_response = self._markdown_to_discord(response)
+                
                 # Get files info
                 files_to_send = result.get("files_to_send", [])
                 tools_used = result.get("tools_used", [])
                 
                 # Build response with file info
-                final_response = response
+                final_response = discord_response
                 
                 # If files were generated, mention them
                 if files_to_send:

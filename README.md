@@ -2,61 +2,145 @@
 [![Apache 2.0](https://img.shields.io/github/license/ParisNeo/lollmsBot?color=blue)](https://www.apache.org/licenses/LICENSE-2.0)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white)](https://www.python.org/downloads/)
 [![Docker](https://img.shields.io/badge/Docker-%231721F5.svg?&logo=docker&logoColor=white)](https://hub.docker.com/r/parisneo/lollmsbot)
-[![LoLLMS](https://img.shields.io/badge/Backend-LoLLMS-brightgreen)](https://lollms.com)
+[![Status](https://img.shields.io/badge/Status-Alpha-orange)](https://github.com/ParisNeo/lollmsBot)
 
-> **The Sovereign AI Assistant**  
-> _Agentic • Multi-Backend • Self-Healing • Production-Ready_
+> **Your Personal AI Agent**  
+> _Built by ParisNeo. For you. Evolves with you._
 
-<p align="center">
-  <img src="https://img.shields.io/github/stars/ParisNeo/lollmsBot" alt="Stars">
-  <img src="https://img.shields.io/github/forks/ParisNeo/lollmsBot" alt="Forks">
-  <img src="https://img.shields.io/github/issues/ParisNeo/lollmsBot" alt="Issues">
-  <img src="https://img.shields.io/github/last-commit/ParisNeo/lollmsBot" alt="Last Commit">
-</p>
-
-## 🎯 What is lollmsBot?
-
-**lollmsBot** is a **sovereign, agentic AI assistant** that you fully own and control. Unlike cloud-based assistants that lock you into proprietary ecosystems, lollmsBot runs on **your hardware**, connects to **your choice of AI models**, and evolves **according to your values**.
-
-### The "Clawdbot" Philosophy
-
-Inspired by [Clawd.bot](https://clawd.bot)'s architecture, lollmsBot treats AI not as a service but as a **personal companion** with:
-- **Identity** (Soul) — A coherent personality that persists across sessions
-- **Conscience** (Guardian) — Ethics and security that cannot be bypassed
-- **Memory** — Compressed, consolidated, with natural forgetting curves
-- **Skills** — Learned capabilities that grow from experience
-- **Autonomy** — Self-maintenance, healing, and evolution
+⚠️ **Alpha Software**: This is actively developed software. Core features are functional; advanced features like automated skill learning are partially implemented.
 
 ---
 
-## 🌟 What Makes It Special?
+## 🎯 Why I Built This
 
-| Feature | Why It Matters |
-|--------|---------------|
-| **🧬 7-Pillar Architecture** | Soul, Guardian, Heartbeat, Memory, Skills, Tools, Identity — a complete cognitive framework |
-| **🔌 17+ LLM Backends** | Freedom to use OpenAI, Claude, Ollama, vLLM, Groq, Gemini, or any OpenAI-compatible API |
-| **🤖 True Agentic AI** | Plans, executes tools, composes skills, learns from results — not just text generation |
-| **🛡️ Guardian Security** | Prompt injection detection, quarantine mode, ethics enforcement, audit trails |
-| **💓 Self-Healing** | Heartbeat monitors health, compresses memory, audits security, auto-fixes drift |
-| **📚 Skill System** | Reusable, versioned, composable capabilities with dependency management |
-| **🎮 File Generation** | Creates HTML games, Python scripts, data exports — with download delivery |
-| **💬 Multi-Channel** | Discord, Telegram, Web UI, HTTP API — same brain, different faces |
+Most AI assistants are **stateless services** — you prompt them, they respond, and the context disappears. They don't *know* you, and they don't *work for* you over time.
+
+**I wanted an agent that is actually mine:**
+- It **remembers** my workflows, preferences, and context across sessions  
+- It **runs locally** on my machine (the controller layer), even when using remote AI models via API
+- It **evolves exclusively for me** — not optimized for engagement metrics or ad revenue
+- It has **extensible tools** for file operations, web requests, calendar management, and safe shell commands
+
+### The Security Lesson
+
+Shared skill repositories can be vulnerable to malicious code injection. **This bot never downloads executable skills from the internet.** Instead, it provides a framework for locally-defined capabilities with full auditability.
 
 ---
 
-## 🚀 Quick Start (3 Minutes)
+## ⏰ Why Now?
 
-### Option 1: Native Python
+I didn't build a lollms agent until now because I know there is no chance in hell I could build such a thing and guarantee it doesn't get used for nefarious objectives. Even with the best-aligned models and the best possible prompt engineering, this tool—if hacked—can be used for really bad stuff.
 
+But since **OpenClaw** was released, and basically those who want to harm already have a tool to do so, I want this tool to be on the safe side for those who need the OpenClaw-style automation with **minimized risk**.
+
+I don't promise 100% risk-free operation, but at least it was built with a **security-first structure**. People must accept an ethical charter after installation. I know laws only obligate those who believe in them, but as I say: this is like a car. I've built it to move people from place A to place B. Using it for bad is the responsibility of the one using it.
+
+**My commitment:**
+- Guardian layer runs **before** any tool execution, not after
+- **No external code execution** — skills are local and auditable
+- **Full audit trail** — every action is logged with integrity hashes
+- **Self-quarantine capability** — system can shut itself down if compromise is detected
+
+---
+
+## 🧬 Architecture: Your Agent, Your Data
+
+### Flexible Backends (API or Local)
+
+| Setup | Best For | Requirements |
+|-------|----------|--------------|
+| **API Mode** (OpenAI, Anthropic, OpenRouter, etc.) | High-quality reasoning on any hardware | API key + internet |
+| **Local Mode** (Ollama, vLLM, Llama.cpp) | Privacy-sensitive work, offline use | Gaming PC or server with GPU recommended |
+
+**Note**: High-quality local AI requires significant GPU resources (24GB+ VRAM for frontier models). The value is ensuring that *even when using commercial AI services*, your agent's memory, skills, and objectives remain **locally controlled**.
+
+### The 7 Pillars
+
+#### 1. 🧬 Soul — Persistent Identity
+Configure personality in `~/.lollmsbot/soul.md`:
+- Name, origin story, purpose
+- Personality traits with intensity levels
+- Core values with priorities
+- Communication style preferences
+- Expertise domains and limitations
+
+#### 2. 🛡️ Guardian — Prompt Injection Defense
+Security layer with:
+- **Semantic analysis** of incoming text for injection patterns
+- **Sandbox enforcement** for tool boundaries
+- **Permission gates** for sensitive operations
+- **Self-quarantine** on critical threats
+
+#### 3. 💓 Heartbeat — Self-Maintenance Framework
+Pluggable maintenance system (30min default interval):
+- **Diagnostic**: Health checks, connectivity tests
+- **Memory**: Compression and retention management
+- **Security**: Audit log review
+- **Skill**: Library maintenance
+- **Optimization**: Cache cleaning
+
+#### 4. 🧠 Memory — Your Context, Not Theirs
+- Conversations stored **locally** (SQLite via `aiosqlite`)
+- **Forgetting curve** applied to rarely accessed memories
+- **Consolidation**: Framework for merging related memories
+- **Exportable**: You own your data
+
+#### 5. 📚 Skills — Reusable Capabilities
+Capability system with:
+- **Built-in skills**: File organizer, research synthesizer, meeting prep, code review
+- **Skill registry**: Versioning, dependency tracking, search
+- **Execution engine**: Logging, error handling, nested skill calls
+- **Learning framework**: *Partially implemented* — infrastructure for creating skills from descriptions/demonstrations
+
+#### 6. 🔧 Tools — Controlled Capabilities
+
+| Tool | Function | Safety |
+|------|----------|--------|
+| `filesystem` | Read/write files, create HTML apps | Path validation, allowed directories only |
+| `http` | Web requests (GET/POST/PUT/DELETE) | URL validation, timeout, retry logic, no local IPs |
+| `calendar` | Event management with ICS support | Timezone-aware |
+| `shell` | Command execution | Explicit allowlist, no shell injection, timeout protection |
+
+#### 7. 🆔 Identity — Multi-Channel Presence
+Same brain, different interfaces:
+- **Web UI**: Real-time chat with WebSocket, tool visualization, file downloads
+- **Discord**: Full bot integration with user allowlisting, file delivery via DM
+- **Telegram**: Bot integration with permission controls
+- **HTTP API**: REST endpoints with file download support
+
+---
+
+## 🚀 Quick Start
+
+### Option 1: One-Command Install (Fastest)
 ```bash
-# Clone and install
+pip install lollmsbot
+lollmsbot wizard  # Interactive setup
+```
+
+Requires Python 3.10+.
+
+### Option 2: Docker (Recommended for isolation)
+```bash
+git clone https://github.com/ParisNeo/lollmsBot
+cd lollmsBot
+cp .env.example .env
+
+# Edit .env to add your API keys or local LLM endpoint
+docker-compose up -d
+```
+
+**Security default**: lollmsBot binds to `127.0.0.1` (localhost only). Remote access requires explicit configuration.
+
+### Option 3: Development Install
+```bash
 git clone https://github.com/ParisNeo/lollmsBot
 cd lollmsBot
 
 # Windows
 .\install.bat
 .venv\Scripts\activate
-lollmsbot wizard  # Interactive setup
+lollmsbot wizard
 
 # Linux/macOS
 ./install.sh
@@ -64,485 +148,112 @@ source .venv/bin/activate
 lollmsbot wizard
 ```
 
-### Option 2: Docker (Recommended)
+---
 
-```bash
-# Clone and start
-git clone https://github.com/ParisNeo/lollmsBot
-cd lollmsBot
-cp .env.example .env
+## 🔒 Security Model
 
-# Edit .env with your settings, then:
-docker-compose up -d
+### The "No External Skills" Guarantee
+- **Never downloads** executable skills from the internet
+- **All capabilities** are locally defined and auditable
+- **Sandboxed execution** with tool boundaries
 
-# lollmsBot: http://localhost:8800
-# LoLLMS UI: http://localhost:9642 (if using bundled stack)
+### Prompt Injection Defense
+All text processed by the agent passes through the Guardian layer before execution.
+
+### Data Sovereignty
+- API keys stored in local `.env` file, never in chat logs
+- Conversation history remains local even when using remote AI models
+
+---
+
+## 🎮 Usage Examples
+
+### Example 1: Create an HTML Game
+
+```
+You: Create a snake game in HTML
+
+lollmsBot: 🔧 Using filesystem tool to create snake_game.html...
+
+📁 I've created: snake_game.html
 ```
 
-### Option 3: One-Line Test
+### Example 2: Check Calendar
 
-```bash
-# With Python 3.10+ and pip
-pip install git+https://github.com/ParisNeo/lollmsBot.git
-lollmsbot gateway --ui
+```
+You: What meetings do I have this week?
+
+lollmsBot: [Uses calendar tool to list events]
+```
+
+### Example 3: Web Request
+
+```
+You: What's the weather at api.weather.gov?
+
+lollmsBot: [Uses HTTP tool with safe URL validation]
 ```
 
 ---
 
-## 🎮 Interactive Examples
+## ⚠️ Alpha Status & Roadmap
 
-### Example 1: Create an HTML Game (No Coding Required!)
+**Current State (Alpha)**:
+- Core agent loop with tool integration: **stable**
+- Multi-channel support (Discord, Telegram, Web, HTTP): **functional**
+- Guardian security layer: **operational, undergoing hardening**
+- Skill execution engine: **functional**
+- **Auto-skill generation**: *framework present, learning algorithms incomplete*
+- **Advanced memory consolidation**: *architecture present, implementation partial*
 
-```
-You: Create a snake game in HTML5
-
-lollmsBot: 🎮 I'll build you a complete Snake game!
-
-[tool:filesystem] Creating snake_game.html...
-✅ Game created: 4.2KB, 400×400 canvas, keyboard controls
-
-📎 File ready for download: snake_game.html
-   Open it in any browser to play!
-```
-
-The game includes:
-- Smooth animation with `requestAnimationFrame`
-- Score tracking and high score persistence
-- Mobile-friendly touch controls
-- Retro styling with modern CSS
-
-### Example 2: Multi-Step Research & Report
-
-```
-You: Research Python async patterns and create a summary document
-
-lollmsBot: 📊 Planning research workflow...
-
-[skill:synthesize_research] Breaking into sub-questions...
-[tool:http] Querying: "Python asyncio best practices 2024"
-[tool:http] Querying: "asyncio vs trio performance"
-[tool:filesystem] Creating research_summary.md...
-
-✅ Research complete:
-   - 12 sources evaluated
-   - 3 patterns identified
-   - 1 conflict resolved (exception handling)
-   - Document: research_summary.md (8.4KB)
-```
-
-### Example 3: Calendar Management with Natural Language
-
-```
-You: Schedule a team standup every Tuesday at 10am for the next month
-
-lollmsBot: 📅 Creating recurring events...
-
-[tool:calendar] Adding 4 events:
-   • 2024-01-09 10:00-10:30 "Team Standup"
-   • 2024-01-16 10:00-10:30 "Team Standup"
-   • 2024-01-23 10:00-10:30 "Team Standup"
-   • 2024-01-30 10:00-10:30 "Team Standup"
-
-✅ Events created. Export to your calendar?
-   [Download .ics file] [View in browser]
-```
-
-### Example 4: Skill Composition (Meta-Capability)
-
-```
-You: Learn how to research topics and create briefing documents
-
-lollmsBot: 🧠 Creating composite skill: research_and_brief
-
-[skill:learn_skill] Analyzing workflow pattern...
-   - Input: topic, audience, depth
-   - Step 1: [skill:synthesize_research] gather info
-   - Step 2: [skill:prepare_meeting] structure for audience
-   - Step 3: [tool:filesystem] generate document
-
-✅ New skill 'research_and_brief' created!
-   Confidence: 87% (validated with 3 examples)
-   Use it: "Create a briefing on quantum computing for executives"
-```
+**Known Limitations**:
+- Complex multi-step planning (5+ steps) is experimental
+- Skill abstraction from natural language requires refinement
+- Some heartbeat maintenance tasks are framework-only
 
 ---
 
-## 🧬 The 7 Pillars Explained
+## 🔧 Configuration
 
-### 1. 🧬 Soul — Persistent Identity
-
-Your bot has a **configurable personality** stored in `~/.lollmsbot/soul.md`:
-
-```yaml
-name: "Claude-Assist"  # Not Claude, but inspired by clarity
-traits:
-  - curiosity: strong      # Asks clarifying questions
-  - pragmatism: strong     # Prioritizes working solutions
-  - security: strong       # Warns about risks
-values:
-  - "Never compromise user privacy" (priority: 10)
-  - "Be honest about limitations" (priority: 9)
-communication:
-  formality: casual
-  verbosity: concise
-  humor: witty
-  emoji_usage: moderate
-```
-
-**Why this matters**: Unlike stateless APIs, your bot **remembers who it is** across conversations, channels, and restarts.
-
-### 2. 🛡️ Guardian — Unbypassable Security
-
-The Guardian operates as a **reflexive security layer** that intercepts all operations:
-
-| Threat | Detection | Response |
-|--------|-----------|----------|
-| Prompt injection | Regex + entropy analysis + structural checks | Block + quarantine if confidence >95% |
-| Data exfiltration | PII patterns in outputs | Challenge user before sending |
-| Unauthorized tool use | Permission gates per user/tool | Deny with audit log |
-| Ethics violation | Rule matching against ethics.md | Block + alert |
-
-**Quarantine Mode**: If critical threats are detected, the bot **self-isolates** — all non-essential operations halt until admin review.
-
-### 3. 💓 Heartbeat — Autonomous Self-Care
-
-Every 30 minutes (configurable), the Heartbeat runs:
-
-```python
-MaintenanceTasks = {
-    DIAGNOSTIC:    "Check LoLLMS connectivity, disk space, Guardian status",
-    MEMORY:        "Compress old conversations, apply forgetting curve, consolidate narratives",
-    SECURITY:      "Review audit logs, check permission drift, verify file integrity",
-    SKILL:         "Update skill docs, check LollmsHub for updates, prune unused",
-    UPDATE:        "Check for security patches, apply if auto-heal enabled",
-    OPTIMIZATION:  "Clean temp files, clear caches, balance load",
-    HEALING:       "Detect behavioral drift, re-center Soul traits if needed",
-}
-```
-
-**Example healing action**: If the bot detects it's becoming too verbose (drift from `verbosity: concise`), it auto-adjusts or asks for confirmation.
-
-### 4. 🧠 Memory — Semantic Compression
-
-Not just "store and retrieve" — **intelligent memory management**:
-
-- **Compression**: Full conversations → "memory pearls" (summaries + key moments)
-- **Forgetting Curve**: Ebbinghaus-inspired decay: `R = e^(-t/S)` where S = memory strength
-- **Consolidation**: Scattered mentions of "the Python project" → unified project narrative
-- **Strengthening**: Frequently accessed memories gain importance
-
-### 5. 📚 Skills — Learned Capabilities
-
-Skills are **reusable, versioned, composable workflows**:
-
-```python
-# Example: Built-in 'organize_files' skill
-Skill(
-    name="organize_files",
-    complexity=SkillComplexity.SIMPLE,
-    parameters=[
-        SkillParameter("source_dir", "string", required=True),
-        SkillParameter("method", "enum", ["date", "type", "custom"]),
-    ],
-    dependencies=[
-        SkillDependency("tool", "filesystem"),
-    ],
-    implementation={
-        "execution_plan": [
-            {"step": "analyze", "description": "Categorize all files"},
-            {"step": "preview", "description": "Show planned moves (if dry_run)"},
-            {"step": "organize", "description": "Execute file operations"},
-            {"step": "verify", "description": "Confirm success, report stats"},
-        ]
-    }
-)
-```
-
-**Learning modes**:
-- **From description**: "Create a skill that summarizes GitHub repos"
-- **From demonstration**: Watch user steps, abstract into reusable workflow
-- **From examples**: Input/output pairs → inferred transformation
-- **By composition**: `research_and_brief = research_skill + meeting_prep_skill`
-
-### 6. 🔧 Tools — Low-Level Capabilities
-
-| Tool | Capabilities | Safety Features |
-|------|-----------| ---------------|
-| `filesystem` | Read, write, list, create HTML apps, ZIP archives | Path validation, allowed directories, no traversal |
-| `http` | GET/POST/PUT/DELETE, JSON/text auto-parse, retries | URL scheme whitelist, timeout, max size, no local IPs |
-| `calendar` | Create events, list by range, export/import ICS | Timezone-aware, validation |
-| `shell` | Execute approved commands | Explicit allowlist, denylist patterns, no shell=True, timeout |
-
-### 7. 🆔 Identity — Multi-Channel Presence
-
-Same **Soul**, different **faces**:
-
-| Channel | Unique Features | Use Case |
-|---------|---------------|----------|
-| **Web UI** | Real-time tool visualization, file downloads, mobile-responsive | Primary interaction |
-| **Discord** | Slash commands, file delivery via DM, server/guild restrictions | Community bots |
-| **Telegram** | BotFather integration, user ID allowlisting | Personal assistant |
-| **HTTP API** | Webhook support, programmatic access, file download URLs | Integrations |
-
----
-
-## 📋 Configuration Guide
-
-### Step 1: Choose Your AI Backend (17+ Options)
-
+### API Mode (Recommended for Most Users)
 ```bash
-lollmsbot wizard
-# → Select "🔗 AI Backend"
+# .env configuration
+LOLLMS_BINDING_NAME=openrouter  # or openai, anthropic, groq, etc.
+LOLLMS_API_KEY=sk-or-v1-...
+LOLLMS_MODEL_NAME=anthropic/claude-3.5-sonnet
 ```
 
-| Category | Backends | Best For |
-|----------|----------|----------|
-| **Remote APIs** | OpenAI, Claude, Gemini, Groq, Mistral, Perplexity | Quality, speed, no hardware |
-| **Local Server** | Ollama, vLLM, Llama.cpp, OpenWebUI | Privacy, cost, customization |
-| **Local Direct** | Transformers, TensorRT | Maximum control, no server overhead |
-
-Example configurations:
-
+### Local Mode (For Privacy-Critical Work)
 ```bash
-# OpenAI (cloud)
-LOLLMS_BINDING_NAME=openai
-LOLLMS_HOST_ADDRESS=https://api.openai.com/v1
-LOLLMS_API_KEY=sk-...
-LOLLMS_MODEL_NAME=gpt-4o-mini
-
-# Ollama (local)
+# Requires Ollama or similar running locally
 LOLLMS_BINDING_NAME=ollama
 LOLLMS_HOST_ADDRESS=http://localhost:11434
-LOLLMS_MODEL_NAME=llama3.2
-
-# Claude (cloud)
-LOLLMS_BINDING_NAME=claude
-LOLLMS_HOST_ADDRESS=https://api.anthropic.com
-LOLLMS_API_KEY=sk-ant-...
-LOLLMS_MODEL_NAME=claude-3-5-sonnet-20241022
+LOLLMS_MODEL_NAME=llama3.2:70b
 ```
 
-### Step 2: Configure Channels
-
+### Security Hardening
 ```bash
-# Discord
-DISCORD_BOT_TOKEN=MTIz...
-DISCORD_ALLOWED_USERS=123456789,987654321  # Optional: restrict to specific users
-DISCORD_ALLOWED_GUILDS=111111111,222222222 # Optional: restrict to specific servers
-DISCORD_REQUIRE_MENTION_GUILD=true         # Only respond when @mentioned in servers
+# Default: localhost only
+LOLLMSBOT_HOST=127.0.0.1
 
-# Telegram
-TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
-TELEGRAM_ALLOWED_USERS=123456789           # Optional: whitelist
-```
-
-### Step 3: Tune the 7 Pillars
-
-```bash
-lollmsbot wizard
-# → Soul: Define personality, values, expertise
-# → Heartbeat: Set maintenance interval, enable self-healing
-# → Memory: Configure compression thresholds, retention
-# → Skills: Browse, test, compose new capabilities
-```
-
----
-
-## 🔒 Security Architecture
-
-### Default: Local-Only (Safest)
-
-```bash
-LOLLMSBOT_HOST=127.0.0.1  # Only localhost can connect
-LOLLMSBOT_API_KEY=          # Not needed for localhost
-```
-
-### Exposed with API Key (Advanced)
-
-```bash
-# 1. Generate strong key
-python -c "import secrets; print(secrets.token_urlsafe(32))"
-# → sB8xKj9mLp3Qr7Tv5WxYz2AbCdEfGh4J
-
-# 2. Configure
+# Optional: expose with API key (advanced users only)
 LOLLMSBOT_HOST=0.0.0.0
-LOLLMSBOT_API_KEY=sB8xKj9mLp3Qr7Tv5WxYz2AbCdEfGh4J
-
-# 3. All requests must include:
-curl -H "Authorization: Bearer sB8xKj9mLp3Qr7Tv5WxYz2AbCdEfGh4J" \
-     http://your-server:8800/chat \
-     -d '{"message": "Hello"}'
-```
-
-### Guardian Ethics
-
-Create `~/.lollmsbot/ethics.md`:
-
-```markdown
-## Privacy-First
-- **Statement**: Never share user data with third parties
-- **Enforcement**: strict
-- **Exceptions**: None
-
-## Transparency
-- **Statement**: Always disclose when using external APIs
-- **Enforcement**: strict
-
-## User Autonomy
-- **Statement**: Present options, don't make decisions for users
-- **Enforcement**: advisory
+LOLLMSBOT_API_KEY=your-strong-generated-key
 ```
 
 ---
 
-## 🛠️ Development & Extension
+## 🤝 Collaboration
 
-### Creating Custom Tools
+This is a **solo project** — building in public. 
 
-```python
-from lollmsbot.agent import Tool, ToolResult
+Contributions appreciated in:
+- **Security Hardening**: Additional prompt injection vectors, sandbox testing
+- **Skill Generation**: Improving abstraction from natural language descriptions
+- **Documentation**: Tutorials for non-technical users
+- **UI/UX**: Web interface improvements
 
-class MyTool(Tool):
-    name = "my_tool"
-    description = "Does something useful"
-    parameters = {
-        "type": "object",
-        "properties": {
-            "input": {"type": "string"}
-        },
-        "required": ["input"]
-    }
-    
-    async def execute(self, **params) -> ToolResult:
-        result = await self.do_something(params["input"])
-        return ToolResult(success=True, output=result)
-```
-
-Register in `gateway.py`:
-```python
-from my_module import MyTool
-await agent.register_tool(MyTool())
-```
-
-### Creating Custom Skills
-
-```python
-from lollmsbot.skills import Skill, SkillMetadata, SkillParameter
-
-skill = Skill(
-    metadata=SkillMetadata(
-        name="analyze_csv",
-        description="Statistical analysis of CSV files",
-        parameters=[
-            SkillParameter("file_path", "string", required=True),
-            SkillParameter("analysis_type", "enum", ["summary", "correlation", "trends"]),
-        ],
-        dependencies=[SkillDependency("tool", "filesystem")],
-    ),
-    implementation={
-        "execution_plan": [
-            {"step": "load", "description": "Read and parse CSV"},
-            {"step": "analyze", "description": "Compute statistics"},
-            {"step": "visualize", "description": "Generate charts if requested"},
-        ]
-    },
-    implementation_type="composite"
-)
-
-registry.register(skill)
-```
-
----
-
-## 📊 API Reference
-
-### REST Endpoints
-
-| Endpoint | Method | Auth | Description |
-|----------|--------|------|-------------|
-| `/health` | GET | None | System status, channels, agent state |
-| `/chat` | POST | Bearer* | Send message, get response with tool traces |
-| `/files/download/{id}` | GET | None | Download generated file (time-limited) |
-| `/files/list` | GET | Bearer* | List pending downloads |
-| `/ws/chat` | WebSocket | None** | Real-time bidirectional chat |
-
-\* Required if `LOLLMSBOT_HOST != 127.0.0.1`  
-\** Session-based via WebSocket protocol
-
-### Example API Call
-
-```bash
-curl -X POST http://localhost:8800/chat \
-  -H "Content-Type: application/json" \
-  -d '{
-    "user_id": "developer_001",
-    "message": "Create a Python script that fetches weather data"
-  }'
-```
-
-Response:
-```json
-{
-  "success": true,
-  "response": "I've created a weather fetcher script for you...",
-  "tools_used": ["filesystem"],
-  "files_generated": 1,
-  "file_downloads": [
-    {
-      "filename": "weather_fetcher.py",
-      "download_url": "/files/download/a1b2c3d4e5f6",
-      "expires_in_seconds": 3599
-    }
-  ]
-}
-```
-
----
-
-## 🐳 Docker Deployment
-
-### Single Container (Local)
-
-```bash
-docker run -p 127.0.0.1:8800:8800 \
-  -v $(pwd)/.env:/app/.env:ro \
-  -v lollmsbot-data:/app/data \
-  ghcr.io/parisneo/lollmsbot:latest
-```
-
-### Full Stack (with LoLLMS)
-
-```yaml
-# docker-compose.yml
-version: '3.8'
-services:
-  lollmsbot:
-    build: .
-    ports: ["8800:8800"]
-    environment:
-      - LOLLMS_HOST_ADDRESS=http://lollms:9600
-      - DISCORD_BOT_TOKEN=${DISCORD_TOKEN}
-  
-  lollms:
-    image: ghcr.io/parisneo/lollms-webui:latest
-    ports: ["9642:9600"]
-    volumes:
-      - lollms-models:/app/models
-```
-
----
-
-## 🤝 Contributing
-
-We welcome contributions! Areas of interest:
-
-- **New Backends**: Add support for emerging LLM APIs
-- **Skill Library**: Share useful skills with the community
-- **Channel Adapters**: Slack, Matrix, IRC, etc.
-- **Tool Integrations**: Databases, cloud APIs, hardware control
-- **Localization**: Multi-language Soul configurations
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for how to submit issues or PRs.
 
 ---
 
@@ -550,30 +261,51 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 Apache 2.0 — See [LICENSE](LICENSE)
 
-```
-Copyright 2026 ParisNeo
+---
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-```
+## 📊 Implementation Status
+
+This table tracks what's implemented vs. planned. Updated as development progresses.
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| **Core Architecture** |||
+| Agent message loop | ✅ Stable | Full tool integration, async processing |
+| LoLLMS client integration | ✅ Stable | Multiple binding support via lollms-client |
+| Permission system | ✅ Stable | User-level permissions, tool allow/deny lists |
+| **The 7 Pillars** |||
+| 🧬 Soul (Identity) | ✅ Implemented | Personality, traits, values, communication style |
+| 🛡️ Guardian (Security) | ⚠️ Partial | Pattern-based injection detection; ML-enhanced detection planned |
+| 💓 Heartbeat (Self-maintenance) | ⚠️ Partial | Framework complete; some tasks are placeholders |
+| 🧠 Memory (Persistence) | ✅ Implemented | SQLite storage, conversation history |
+| Memory compression/consolidation | 🔲 Planned | Architecture present, algorithms incomplete |
+| 📚 Skills (Capabilities) | ⚠️ Partial | Registry, execution, built-in skills work; auto-learning framework only |
+| 🔧 Tools | ✅ Implemented | Filesystem, HTTP, Calendar, Shell with safety controls |
+| 🆔 Identity (Multi-channel) | ✅ Implemented | Web UI, Discord, Telegram, HTTP API |
+| **Channels** |||
+| Web UI | ✅ Stable | WebSocket chat, file downloads, tool visualization |
+| Discord | ✅ Stable | Full bot with DM file delivery, user allowlisting |
+| Telegram | ✅ Stable | Bot with permission controls |
+| HTTP API | ✅ Stable | REST endpoints, file downloads |
+| Slack | 🔲 Planned | Dependencies present, implementation pending |
+| **Security Features** |||
+| Prompt injection detection | ⚠️ Basic | Regex patterns; semantic ML analysis planned |
+| Tool sandboxing | ✅ Implemented | Path validation, command allowlist |
+| Self-quarantine | ✅ Implemented | Guardian can disable operations on threats |
+| Audit logging | ✅ Implemented | Security events logged with integrity hashes |
+| **Advanced Features** |||
+| Skill auto-generation | 🔲 Planned | Framework exists; natural language→skill incomplete |
+| Memory forgetting curve | 🔲 Planned | Ebbinghaus-inspired retention not yet active |
+| Self-healing | 🔲 Planned | Auto-fix framework present, healing logic incomplete |
+| Self-update | 🔲 Planned | Conceptual; would require external update mechanism |
+| **Integrations** |||
+| Discord voice | 🔲 Planned | Library supports it, no voice handling code yet |
+| File encryption at rest | 🔲 Planned | Security model describes it, not implemented |
+| **Legend:** ✅ Implemented & Stable | ⚠️ Partial / In Progress | 🔲 Planned / Not Started |
+
+*Last updated: 2026-02-08*
 
 ---
 
-## 🙏 Acknowledgments
-
-- **[LoLLMS](https://lollms.com)** — The flexible AI backend that makes multi-binding possible
-- **[Clawd.bot](https://clawd.bot)** — Architectural inspiration for agentic AI design
-- **[FastAPI](https://fastapi.tiangolo.com)** — The modern web framework powering our gateway
-- **[Rich](https://rich.readthedocs.io)** — Beautiful terminal interfaces
-- **[Questionary](https://questionary.readthedocs.io)** — Interactive CLI wizardry
-
----
-
-## 🌟 Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=ParisNeo/lollmsBot&type=Timeline)](https://star-history.com/#ParisNeo/lollmsBot&Timeline)
-
----
-
-**Made with ❤️ by [ParisNeo](https://github.com/ParisNeo)**  
-*Empowering sovereign AI for everyone*
+**Built by ParisNeo**  
+*For the individual, in the spirit of open collaboration.*

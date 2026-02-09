@@ -19,6 +19,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import re
 import secrets
 import time
@@ -194,8 +195,21 @@ class PromptInjectionDetector:
         """Calculate Shannon entropy of text."""
         if not text:
             return 0.0
-        probs = [text.count(c) / len(text) for c in set(text)]
-        return -sum(p * (p.bit_length() - 1) for p in probs if p > 0)
+        
+        # Calculate probability of each character
+        length = len(text)
+        char_counts = {}
+        for c in text:
+            char_counts[c] = char_counts.get(c, 0) + 1
+        
+        # Shannon entropy: H = -Σ(p * log2(p))
+        entropy = 0.0
+        for count in char_counts.values():
+            p = count / length
+            if p > 0:  # Avoid log(0)
+                entropy -= p * math.log2(p)
+        
+        return entropy
     
     def sanitize(self, text: str) -> str:
         """Apply conservative sanitization to potentially dangerous input."""

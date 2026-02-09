@@ -39,59 +39,36 @@ _http_api: Optional[Any] = None
 
 # ========== SHARED AGENT INSTANCE ==========
 _agent: Optional[Agent] = None
+_agent_lock: asyncio.Lock = asyncio.Lock()
 
-def get_agent() -> Agent:
+async def get_agent() -> Agent:
     """Get or create the shared Agent instance with tools registered."""
     global _agent
     if _agent is None:
-        config = BotConfig.from_env()
-        _agent = Agent(
-            config=config,
-            name="LollmsBot",
-            default_permissions=PermissionLevel.BASIC,
-        )
-        
-        # Register default tools - THIS IS KEY FOR FILE GENERATION!
-        async def register_tools():
-            try:
-                await _agent.register_tool(FilesystemTool())
-                console.print("[green]  • FilesystemTool registered[/]")
-            except Exception as e:
-                console.print(f"[yellow]  • FilesystemTool failed: {e}[/]")
-            
-            try:
-                await _agent.register_tool(HttpTool())
-                console.print("[green]  • HttpTool registered[/]")
-            except Exception as e:
-                console.print(f"[yellow]  • HttpTool failed: {e}[/]")
-            
-            try:
-                await _agent.register_tool(CalendarTool())
-                console.print("[green]  • CalendarTool registered[/]")
-            except Exception as e:
-                console.print(f"[yellow]  • CalendarTool failed: {e}[/]")
-            
-            # Shell tool - more dangerous, only register if explicitly enabled
-            if os.getenv("LOLLMSBOT_ENABLE_SHELL", "").lower() in ("true", "1", "yes"):
-                try:
-                    await _agent.register_tool(ShellTool())
-                    console.print("[green]  • ShellTool registered[/]")
-                except Exception as e:
-                    console.print(f"[yellow]  • ShellTool failed: {e}[/]")
-            else:
-                console.print("[dim]  • ShellTool disabled (set LOLLMSBOT_ENABLE_SHELL=true to enable)[/]")
-        
-        # Run tool registration synchronously during init
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                asyncio.create_task(register_tools())
-            else:
-                loop.run_until_complete(register_tools())
-        except RuntimeError:
-            pass
-        
-        console.print(f"[green]✅ Agent initialized: {_agent}[/]")
+        async with _agent_lock:
+            if _agent is None:
+                config = BotConfig.from_env()
+                _agent = Agent(
+                    config=config,
+                    name="LollmsBot",
+                    default_permissions=PermissionLevel.BASIC,
+                )
+                # Initialize async resources with environment detection
+                # Determine gateway mode from configuration
+                gateway_mode = "standalone"
+                host_bindings = [f"{HOST}:{PORT}"]
+                
+                if DISCORD_TOKEN:
+                    gateway_mode = "discord"
+                elif TELEGRAM_TOKEN:
+                    gateway_mode = "telegram"
+                
+                await _agent.initialize(
+                    gateway_mode=gateway_mode,
+                    host_bindings=host_bindings
+                )
+                console.print(f"[green]✅ Agent initialized: {_agent.name}[/]")
+                console.print(f"[dim]   Environment: {_agent._environment_detector.get_summary() if _agent.environment_info else 'unknown'}[/]")
     return _agent
 
 # ========== SHARED LOLLMS CLIENT ==========
@@ -230,7 +207,7 @@ app.add_middleware(
 
 @app.get("/")
 async def root():
-    agent = get_agent()
+    agent = await get_agent()
     lollms_ok = get_lollms_client() is not None
     
     # Check channels
@@ -242,6 +219,18 @@ async def root():
         channels_status["discord"] = "active"
     if "telegram" in _active_channels:
         channels_status["telegram"] = "active"
+    
+    # Environment info
+    env_info = {}
+    if agent.environment_info:
+        env = agent.environment_info
+        env_info = {
+            "platform": env.os_system,
+            "release": env.os_release,
+            "python": env.python_version,
+            "container": "docker" if env.in_docker else "wsl" if env.in_wsl else "none",
+            "virtualenv": env.in_virtualenv,
+        }
     
     return {
         "api": f"http://{HOST}:{PORT}",
@@ -266,12 +255,14 @@ async def root():
         "features": {
             "file_delivery": True,
             "web_ui": _ui_enabled,
-        }
+            "environment_awareness": True,
+        },
+        "environment": env_info,
     }
 
 @app.get("/health", response_model=Health)
 async def health():
-    agent = get_agent()
+    agent = await get_agent()
     lollms_client = get_lollms_client()
     lollms_ok = lollms_client is not None
     
@@ -282,6 +273,16 @@ async def health():
     pending_files = 0
     if _http_api:
         pending_files += len(_http_api._pending_files) if hasattr(_http_api, '_pending_files') else 0
+    
+    # Environment summary
+    env_summary = "unknown"
+    if agent.environment_info:
+        env = agent.environment_info
+        env_summary = f"{env.os_system} {env.os_release}, Python {env.python_version}"
+        if env.in_docker:
+            env_summary += " (Docker)"
+        elif env.in_wsl:
+            env_summary += " (WSL)"
     
     return {
         "status": "ok",
@@ -301,13 +302,15 @@ async def health():
         "features": {
             "pending_files": pending_files,
             "file_delivery_enabled": True,
-        }
+            "environment_awareness": True,
+        },
+        "environment": env_summary,
     }
 
 @app.post("/chat", response_model=ChatResp, dependencies=[Depends(require_auth)])
 async def chat(req: ChatReq):
     """Process a chat message through the Agent with file delivery support."""
-    agent = get_agent()
+    agent = await get_agent()
     
     result = await agent.chat(
         user_id=req.user_id or "anonymous",
@@ -360,7 +363,7 @@ async def chat(req: ChatReq):
 @app.post("/admin/permission", dependencies=[Depends(require_auth)])
 async def set_permission(req: PermissionReq):
     """Admin endpoint to set user permissions."""
-    agent = get_agent()
+    agent = await get_agent()
     
     # This would need to be implemented in the Agent class
     # For now, return a placeholder
@@ -409,18 +412,9 @@ def enable_ui(host: str = "127.0.0.1", port: int = 8080) -> None:
     
     try:
         from lollmsbot.ui.app import WebUI
-        agent = get_agent()
-        _ui_instance = WebUI(agent=agent, verbose=False)
-        
-        # Mount UI at /ui
-        app.mount("/ui", _ui_instance.app, name="ui")
+        # Need async initialization, so just mark for lifespan to handle
         _ui_enabled = True
-        
-        @app.get("/ui")
-        async def ui_redirect():
-            return RedirectResponse(url="/ui/")
-        
-        console.print(f"[green]✅ Web UI mounted at /ui[/]")
+        console.print(f"[green]✅ Web UI will be mounted at /ui[/]")
         
     except Exception as e:
         console.print(f"[yellow]⚠️  Could not enable UI: {e}[/]")
@@ -451,35 +445,58 @@ async def lifespan(app_: FastAPI):
         if API_KEY:
             console.print(f"[bold green]🔐 API key authentication ENABLED[/]")
     
-    # Initialize shared Agent and LoLLMS client
-    agent = get_agent()
+    # Initialize shared Agent (this triggers async initialization with env detection)
+    agent = await get_agent()
     lollms_client = get_lollms_client()
     
-    # Ensure tools are registered
-    async def ensure_tools():
-        if len(agent.tools) == 0:
+    # Register tools (single source of truth for tool registration)
+    async def register_tools():
+        tools_registered = []
+        tools_failed = []
+        
+        tools_to_register = [
+            ("filesystem", FilesystemTool()),
+            ("http", HttpTool()),
+            ("calendar", CalendarTool()),
+        ]
+        
+        # Shell tool - more dangerous, only register if explicitly enabled
+        if os.getenv("LOLLMSBOT_ENABLE_SHELL", "").lower() in ("true", "1", "yes"):
+            tools_to_register.append(("shell", ShellTool()))
+        
+        for name, tool in tools_to_register:
             try:
-                await agent.register_tool(FilesystemTool())
-                console.print("[green]  • FilesystemTool registered[/]")
+                # Check if already registered to avoid errors
+                if name not in agent.tools:
+                    await agent.register_tool(tool)
+                    tools_registered.append(name)
+                    console.print(f"[green]  • {tool.__class__.__name__} registered[/]")
+                else:
+                    console.print(f"[dim]  • {tool.__class__.__name__} already registered[/]")
             except Exception as e:
-                if "already registered" not in str(e):
-                    console.print(f"[yellow]  • FilesystemTool: {e}[/]")
-            
-            try:
-                await agent.register_tool(HttpTool())
-                console.print("[green]  • HttpTool registered[/]")
-            except Exception as e:
-                if "already registered" not in str(e):
-                    console.print(f"[yellow]  • HttpTool: {e}[/]")
-            
-            try:
-                await agent.register_tool(CalendarTool())
-                console.print("[green]  • CalendarTool registered[/]")
-            except Exception as e:
-                if "already registered" not in str(e):
-                    console.print(f"[yellow]  • CalendarTool: {e}[/]")
+                tools_failed.append((name, str(e)))
+                if "already registered" not in str(e).lower():
+                    console.print(f"[yellow]  • {tool.__class__.__name__} failed: {e}[/]")
+        
+        # Log summary
+        if tools_registered:
+            console.print(f"[dim]  Registered: {', '.join(tools_registered)}[/]")
+        if tools_failed and not all("already registered" in str(e).lower() for _, e in tools_failed):
+            console.print(f"[yellow]  Some tools failed to register[/]")
     
-    await ensure_tools()
+    # Register tools during startup
+    await register_tools()
+    
+    # Show environment info
+    if agent.environment_info:
+        env = agent.environment_info
+        console.print(f"[dim]  Platform: {env.os_system} {env.os_release}[/]")
+        if env.in_docker:
+            console.print(f"[dim]  Container: Docker ({env.container_id[:12] if env.container_id else 'unknown'})[/]")
+        elif env.in_wsl:
+            console.print(f"[dim]  Container: WSL[/]")
+        if env.in_virtualenv:
+            console.print(f"[dim]  Virtualenv: {env.virtualenv_path}[/]")
     
     console.print(f"[green]🚀 Gateway starting on http://{HOST}:{PORT}[/]")
     console.print(f"[dim]  • Chat endpoint: POST /chat[/]")
@@ -489,7 +506,7 @@ async def lifespan(app_: FastAPI):
     if os.getenv("LOLLMSBOT_ENABLE_UI", "").lower() in ("true", "1", "yes"):
         enable_ui()
     
-    global _active_channels, _channel_tasks
+    global _active_channels, _channel_tasks, _agent
     
     # Discord with full agent capabilities
     if DISCORD_TOKEN:
@@ -597,6 +614,12 @@ async def lifespan(app_: FastAPI):
                 pass
     
     _channel_tasks.clear()
+    
+    # Close agent resources
+    if _agent:
+        await _agent.close()
+        _agent = None
+    
     console.print("[green]👋 Gateway shutdown complete[/]")
 
 app.router.lifespan_context = lifespan

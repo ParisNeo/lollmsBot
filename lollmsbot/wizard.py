@@ -8,6 +8,7 @@ Now includes:
 - Heartbeat settings (self-maintenance frequency, tasks)
 - Memory monitoring (compression, retention, optimization)
 - Skills management (browse, test, create, configure)
+- Ethical Charter acceptance
 """
 from __future__ import annotations
 
@@ -25,6 +26,7 @@ try:
     from rich.table import Table
     from rich.text import Text
     from rich.tree import Tree
+    from rich.markdown import Markdown
     import questionary
     from questionary import Choice
 except ImportError:
@@ -266,11 +268,97 @@ AVAILABLE_BINDINGS: Dict[str, BindingInfo] = {
 }
 
 
+# Ethical Charter that users must accept
+ETHICAL_CHARTER = """
+# lollmsBot Ethical Charter
+
+## Preamble
+
+lollmsBot is a powerful tool designed to automate tasks and extend your capabilities 
+through AI. With this power comes responsibility. This charter exists to ensure every 
+user understands both the potential and the boundaries of ethical use.
+
+## Core Principles
+
+### 1. **Do No Harm**
+I will not use lollmsBot to:
+- Cause physical, emotional, or financial harm to individuals
+- Harass, intimidate, or discriminate against any person or group
+- Create, distribute, or deploy malware, exploits, or destructive software
+- Engage in unauthorized access to systems or data (hacking)
+- Automate attacks, spam, or denial-of-service actions
+
+### 2. **Respect Privacy**
+I will:
+- Only process data I have legitimate rights to access
+- Respect data protection laws and individual privacy rights
+- Not use lollmsBot for unauthorized surveillance or data harvesting
+- Protect sensitive information with appropriate security measures
+
+### 3. **Transparency**
+I will:
+- Be honest about AI-generated content when required by context or law
+- Not use lollmsBot to deceive, defraud, or manipulate others
+- Disclose automation when it could materially affect others' decisions
+- Take responsibility for actions performed through this tool
+
+### 4. **Legal Compliance**
+I will:
+- Use lollmsBot in compliance with all applicable laws and regulations
+- Respect intellectual property rights and licensing terms
+- Not automate illegal activities, regardless of enforcement likelihood
+- Understand that laws vary by jurisdiction and act accordingly
+
+### 5. **Accountability**
+I understand that:
+- lollmsBot is like a car—built for legitimate transportation, but misuse is my responsibility
+- Security features protect against accidental harm, not intentional abuse
+- I am the final arbiter of ethical judgment for my specific use case
+- This charter doesn't cover every scenario—I must use my conscience
+
+## Security-First Design Acknowledgment
+
+lollmsBot was built with security as a core architectural principle:
+
+- **No External Code Execution**: Skills are local and auditable, never downloaded from the internet
+- **Guardian Layer**: All inputs pass through security screening before any action
+- **Sandboxed Tools**: Each tool operates within strict boundaries
+- **Audit Trail**: Every action is logged with integrity verification
+- **Self-Quarantine**: System can disable itself if compromise is detected
+
+These protections exist to minimize **accidental** harm and **unauthorized** use. 
+They cannot prevent deliberate misuse by someone with full system access.
+
+## Why This Matters
+
+The release of tools like OpenClaw demonstrates that those who want to cause harm 
+already have means to do so. lollmsBot exists to provide the **same automation power** 
+to those with legitimate needs—researchers, developers, system administrators, 
+and power users—while embedding ethical guardrails into its very architecture.
+
+By accepting this charter, you join a community that believes powerful tools should 
+be available to responsible actors, not locked away while bad actors operate freely.
+
+## Acceptance
+
+**By continuing with lollmsBot setup, you affirm that:**
+
+1. You have read and understood this charter
+2. You commit to using lollmsBot ethically and legally
+3. You accept responsibility for actions performed with this tool
+4. You understand that no software can guarantee 100% safety—human judgment is essential
+
+*If you cannot accept these terms, please exit the wizard now. lollmsBot is not 
+for everyone, and that's by design.*
+"""
+
+
 class Wizard:
     """Interactive setup wizard for lollmsBot services - Full 7 Pillars Edition."""
 
     def __init__(self):
         self.config_path = Path.home() / ".lollmsbot" / "config.json"
+        self.ethics_path = Path.home() / ".lollmsbot" / "ethics_accepted"
         self.config_path.parent.mkdir(exist_ok=True)
         self.config: Dict[str, Dict[str, Any]] = self._load_config()
         
@@ -289,6 +377,66 @@ class Wizard:
 
     def _save_config(self) -> None:
         self.config_path.write_text(json.dumps(self.config, indent=2))
+
+    def _show_ethical_charter(self) -> bool:
+        """Display and require acceptance of ethical charter. Returns True if accepted."""
+        console.clear()
+        
+        # Display charter with nice formatting
+        charter_panel = Panel(
+            Markdown(ETHICAL_CHARTER),
+            title="[bold red]⚖️ Ethical Charter[/bold red]",
+            border_style="red",
+            padding=(1, 2)
+        )
+        console.print(charter_panel)
+        console.print()
+        
+        # Check if already accepted
+        if self.ethics_path.exists():
+            accepted_hash = self.ethics_path.read_text().strip()
+            current_hash = hashlib.sha256(ETHICAL_CHARTER.encode()).hexdigest()[:16]
+            
+            if accepted_hash == current_hash:
+                console.print("[green]✅ Ethical charter previously accepted (version matches)[/]")
+                return True
+            else:
+                console.print("[yellow]⚠️ Ethical charter has been updated since your last acceptance[/]")
+        
+        # Require explicit acceptance
+        console.print("[bold]You must accept the ethical charter to proceed with lollmsBot setup.[/]")
+        console.print()
+        
+        accepted = questionary.confirm(
+            "I have read and agree to the Ethical Charter above. "
+            "I commit to using lollmsBot responsibly and ethically.",
+            default=False
+        ).ask()
+        
+        if not accepted:
+            console.print()
+            console.print(Panel(
+                "[bold]Setup cannot continue without ethical charter acceptance.[/]\n\n"
+                "lollmsBot is designed for users who take responsibility for their actions. "
+                "If this doesn't align with your intentions, please exit now.\n\n"
+                "The wizard will close in 5 seconds...",
+                title="[bold red]❌ Acceptance Required[/bold red]",
+                border_style="red"
+            ))
+            import time
+            time.sleep(5)
+            return False
+        
+        # Record acceptance with hash of charter content
+        charter_hash = hashlib.sha256(ETHICAL_CHARTER.encode()).hexdigest()[:16]
+        self.ethics_path.write_text(charter_hash)
+        
+        console.print()
+        console.print("[bold green]✅ Ethical charter accepted. Thank you for committing to responsible use.[/]")
+        console.print()
+        questionary.press_any_key_to_continue().ask()
+        
+        return True
 
     def run_wizard(self) -> None:
         """Main wizard loop - Full Edition with all 7 Pillars."""
@@ -311,6 +459,11 @@ class Wizard:
 
         # Show current status
         self._show_status_tree()
+
+        # Present and require ethical charter acceptance
+        if not self._show_ethical_charter():
+            console.print("\n[yellow]👋 Exiting without configuration.[/]")
+            return
 
         while True:
             action = questionary.select(
@@ -1328,7 +1481,7 @@ class Wizard:
         lollms_config = self.config.get("lollms", {})
         if lollms_config:
             status, details = self._test_single("lollms", lollms_config)
-            # Show binding name in details
+            # Show model and binding info
             binding_name = lollms_config.get("binding_name", "unknown")
             details = f"{binding_name}: {details}"
             table.add_row("AI Backend", status, details)
