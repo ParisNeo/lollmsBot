@@ -8,11 +8,17 @@ PUT, and DELETE operations with safe URL validation.
 CRITICAL: All fetched content is stored in RLM memory (EMS) and accessed
 via memory handles in the REPL Context Buffer (RCB). This ensures the
 LLM can access large web content through RLM's recursive loading.
+
+DEDUPLICATION: The HTTP tool now prevents duplicate fetches by checking
+if content from a URL was recently fetched (within dedup_window_seconds).
+If found, returns the existing memory handle instead of re-fetching.
 """
 
 import asyncio
+import hashlib
 import json
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 from urllib.parse import urlparse
@@ -44,6 +50,9 @@ class HttpTool(Tool):
     2. Loading summaries/handles into RCB (limited working memory)
     3. Letting the LLM request full content via memory handles if needed
     
+    DEDUPLICATION: Prevents duplicate fetches by checking for recent content
+    from the same URL before making network requests.
+    
     Attributes:
         name: Unique identifier for the tool.
         description: Human-readable description of what the tool does.
@@ -53,6 +62,7 @@ class HttpTool(Tool):
         allowed_schemes: Set of allowed URL schemes for security.
         max_response_size: Maximum response size in bytes.
         rlm_memory: Reference to RLMMemoryManager for storing fetched content.
+        dedup_window_seconds: Time window for considering a fetch as duplicate.
     """
     
     name: str = "http"
@@ -61,7 +71,9 @@ class HttpTool(Tool):
         "and web services. All fetched content is automatically stored "
         "in RLM memory and accessible via memory handles. For web pages, "
         "readable text is extracted and stored. Returns a memory handle "
-        "that can be used to access the content."
+        "that can be used to access the content. "
+        "Automatically prevents duplicate fetches of the same URL within "
+        "a configurable time window."
     )
     
     parameters: dict[str, Any] = {
@@ -98,6 +110,11 @@ class HttpTool(Tool):
                 "description": "Memory importance for RLM storage (1-10, default 7)",
                 "default": 7.0,
             },
+            "force_refresh": {
+                "type": "boolean",
+                "description": "Force re-fetch even if cached (default false)",
+                "default": False,
+            },
         },
         "required": ["method", "url"],
     }
@@ -109,6 +126,7 @@ class HttpTool(Tool):
         allowed_schemes: Optional[set[str]] = None,
         max_response_size: int = 50 * 1024 * 1024,  # 50 MB
         rlm_memory: Optional[Any] = None,  # RLMMemoryManager
+        dedup_window_seconds: float = 3600.0,  # 1 hour default
     ) -> None:
         """Initialize the HttpTool.
         
@@ -118,12 +136,18 @@ class HttpTool(Tool):
             allowed_schemes: Set of allowed URL schemes. Defaults to http, https.
             max_response_size: Maximum response size in bytes.
             rlm_memory: RLM memory manager for storing fetched content.
+            dedup_window_seconds: Time window for duplicate detection (default 1 hour).
         """
         self.default_timeout: float = default_timeout
         self.retry_config: RetryConfig = retry_config or RetryConfig()
         self.allowed_schemes: set[str] = allowed_schemes or {"http", "https"}
         self.max_response_size: int = max_response_size
         self._rlm_memory = rlm_memory  # Will be set by agent after registration
+        self.dedup_window_seconds: float = dedup_window_seconds
+        
+        # Track recent fetches for deduplication: {normalized_url: (timestamp, chunk_id)}
+        self._recent_fetches: Dict[str, tuple[float, str]] = {}
+        self._fetch_lock: asyncio.Lock = asyncio.Lock()
         
         # Create session with connection pooling
         self._session: Optional[aiohttp.ClientSession] = None
@@ -157,6 +181,108 @@ class HttpTool(Tool):
                 )
             return self._session
     
+    def _normalize_url(self, url: str) -> str:
+        """Normalize URL for deduplication comparison.
+        
+        Removes common variations that don't change content:
+        - Trailing slashes
+        - Default ports
+        - Case differences in scheme/host
+        """
+        try:
+            parsed = urlparse(url)
+            # Normalize scheme and host to lowercase
+            scheme = parsed.scheme.lower()
+            netloc = parsed.netloc.lower()
+            
+            # Remove default ports
+            if scheme == "http" and netloc.endswith(":80"):
+                netloc = netloc[:-3]
+            elif scheme == "https" and netloc.endswith(":443"):
+                netloc = netloc[:-4]
+            
+            # Reconstruct normalized URL
+            normalized = f"{scheme}://{netloc}{parsed.path}"
+            if parsed.query:
+                # Sort query parameters for consistency
+                query_params = sorted(parsed.query.split("&"))
+                normalized += "?" + "&".join(query_params)
+            
+            # Remove trailing slash except for root
+            if normalized.endswith("/") and len(normalized) > len(f"{scheme}://{netloc}/"):
+                normalized = normalized[:-1]
+            
+            return normalized
+            
+        except Exception:
+            # If parsing fails, return original lowercased
+            return url.lower()
+    
+    def _check_recent_fetch(self, url: str) -> Optional[str]:
+        """Check if we have a recent fetch for this URL.
+        
+        Args:
+            url: The URL to check.
+            
+        Returns:
+            chunk_id if recent fetch exists and is within dedup window, else None.
+        """
+        normalized = self._normalize_url(url)
+        
+        if normalized in self._recent_fetches:
+            timestamp, chunk_id = self._recent_fetches[normalized]
+            age_seconds = time.time() - timestamp
+            
+            if age_seconds < self.dedup_window_seconds:
+                return chunk_id
+            else:
+                # Expired, remove from cache
+                del self._recent_fetches[normalized]
+        
+        return None
+    
+    async def _check_rlm_for_url(self, url: str) -> Optional[str]:
+        """Check RLM memory for existing content from this URL.
+        
+        Args:
+            url: The URL to search for.
+            
+        Returns:
+            chunk_id if found in RLM, else None.
+        """
+        if not self._rlm_memory:
+            return None
+        
+        try:
+            # Search for web content with this URL in load_hints or source
+            from lollmsbot.agent.rlm.models import MemoryChunkType
+            
+            # Get all WEB_CONTENT chunks and check for URL match
+            # This is a more thorough check than the in-memory cache
+            results = await self._rlm_memory.search_ems(
+                query=url,
+                chunk_types=[MemoryChunkType.WEB_CONTENT],
+                limit=10,
+            )
+            
+            # Check if any result is from this exact URL
+            for chunk, score in results:
+                # Check source field for URL match
+                source = chunk.source or ""
+                if url in source or self._normalize_url(url) in self._normalize_url(source):
+                    # Check if content is fresh enough
+                    age_seconds = time.time() - chunk.last_accessed.timestamp()
+                    if age_seconds < self.dedup_window_seconds:
+                        # Update access time and return this chunk
+                        await self._rlm_memory._db.update_access(chunk.chunk_id, "reused")
+                        return chunk.chunk_id
+            
+            return None
+            
+        except Exception:
+            # If search fails, proceed with fetch
+            return None
+    
     def _validate_url(self, url: str) -> tuple[bool, Optional[str]]:
         """Validate URL scheme and format."""
         try:
@@ -184,7 +310,7 @@ class HttpTool(Tool):
         for tag in ['nav', 'header', 'footer', 'aside', 'menu', 'advertisement', 
                     'iframe', 'embed', 'object', 'video', 'audio', 'canvas',
                     'svg', 'noscript', 'template']:
-            text = re.sub(rf'<{tag}\b[^<]*(?:(?!</{tag}>)<[^<]*)*</{tag}>', ' ', text, 
+            text = re.sub(rf'<{tag}\b[^>]*(?:(?!</{tag}>)<[^<]*)*</{tag}>', ' ', text, 
                          flags=re.DOTALL | re.IGNORECASE)
         
         # Try to find main content area
@@ -361,6 +487,11 @@ class HttpTool(Tool):
         # Also load into RCB so LLM can see it immediately
         await self._rlm_memory.load_from_ems(stored_chunk_id, add_to_rcb=True)
         
+        # Track in recent fetches cache
+        normalized_url = self._normalize_url(url)
+        async with self._fetch_lock:
+            self._recent_fetches[normalized_url] = (time.time(), stored_chunk_id)
+        
         return stored_chunk_id, summary
     
     async def get(
@@ -370,8 +501,12 @@ class HttpTool(Tool):
         params: Optional[Dict[str, Any]] = None,
         extract_text: bool = True,
         importance: float = 7.0,
+        force_refresh: bool = False,
     ) -> ToolResult:
         """Execute GET request and store result in RLM memory.
+        
+        DEDUPLICATION: Checks for recent fetches of the same URL before
+        making a network request. Returns existing memory handle if found.
         
         Args:
             url: Target URL.
@@ -379,6 +514,7 @@ class HttpTool(Tool):
             params: Optional query parameters.
             extract_text: For HTML, extract main text content.
             importance: RLM memory importance (1-10, default 7 for user-requested content).
+            force_refresh: If True, skip deduplication and re-fetch.
             
         Returns:
             ToolResult with memory handle for accessing the content.
@@ -387,6 +523,37 @@ class HttpTool(Tool):
         if not is_valid:
             return ToolResult(success=False, output=None, error=error)
         
+        # DEDUPLICATION CHECK
+        if not force_refresh:
+            # Check in-memory cache first (fastest)
+            cached_chunk_id = self._check_recent_fetch(url)
+            
+            if not cached_chunk_id and self._rlm_memory:
+                # Check RLM memory for existing content
+                cached_chunk_id = await self._check_rlm_for_url(url)
+            
+            if cached_chunk_id:
+                # Return existing content handle
+                return ToolResult(
+                    success=True,
+                    output={
+                        "memory_handle": f"[[MEMORY:{cached_chunk_id}]]",
+                        "chunk_id": cached_chunk_id,
+                        "url": url,
+                        "content_type": "cached",
+                        "deduplicated": True,
+                        "note": "Content was fetched recently. Using cached version.",
+                        "access_instructions": (
+                            f"The content from {url} was recently fetched and is available "
+                            f"via memory handle [[MEMORY:{cached_chunk_id}]]. "
+                            f"Use force_refresh=True if you need fresh content."
+                        ),
+                    },
+                    error=None,
+                    execution_time=0.0,
+                )
+        
+        # No cache hit - proceed with fetch
         kwargs: Dict[str, Any] = {}
         if headers:
             kwargs["headers"] = headers
@@ -436,6 +603,7 @@ class HttpTool(Tool):
             "content_type": content_type,
             "content_length": len(content_to_store),
             "summary": summary,
+            "deduplicated": False,
             "metadata": metadata,
             "access_instructions": (
                 f"The full content from {url} is now available in your RLM memory. "
@@ -454,6 +622,7 @@ class HttpTool(Tool):
     
     async def post(self, url: str, **kwargs) -> ToolResult:
         """POST request - delegates to get with POST method, stores result."""
+        # POST requests are not deduplicated (they may change state)
         # Similar pattern: execute, store in RLM, return handle
         # Implementation omitted for brevity - follows same pattern as get
         return ToolResult(success=False, output=None, error="POST not fully implemented in RLM mode")
@@ -480,10 +649,12 @@ class HttpTool(Tool):
         query_params = params.get("params")
         extract_text = params.get("extract_text", True)
         importance = params.get("importance", 7.0)
+        force_refresh = params.get("force_refresh", False)
         
         if method == "get":
             return await self.get(url, headers=headers, params=query_params, 
-                                extract_text=extract_text, importance=importance)
+                                extract_text=extract_text, importance=importance,
+                                force_refresh=force_refresh)
         
         return ToolResult(
             success=False,
@@ -499,4 +670,4 @@ class HttpTool(Tool):
                 self._session = None
     
     def __repr__(self) -> str:
-        return f"HttpTool(timeout={self.default_timeout}, rlm_enabled={self._rlm_memory is not None})"
+        return f"HttpTool(timeout={self.default_timeout}, rlm_enabled={self._rlm_memory is not None}, dedup_window={self.dedup_window_seconds}s)"

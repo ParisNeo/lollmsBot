@@ -42,7 +42,7 @@ def print_ui_banner() -> None:
     console.print(panel)
 
 
-def print_gateway_banner(host: str, port: int, ui_enabled: bool) -> None:
+def print_gateway_banner(host: str, port: int, ui_enabled: bool, debug_mode: bool = False) -> None:
     """Print gateway startup banner with status."""
     
     # For display purposes, use localhost if host is 0.0.0.0 or empty
@@ -84,12 +84,19 @@ def print_gateway_banner(host: str, port: int, ui_enabled: bool) -> None:
             "Use --ui to enable"
         )
     
+    if debug_mode:
+        status_table.add_row(
+            "🐛 Debug Mode",
+            "✅ Enabled",
+            "Rich memory display active"
+        )
+    
     panel = Panel(
         status_table,
         box=box.ROUNDED,
         border_style="bright_green" if ui_enabled else "yellow",
         title="[bold bright_green]🚀 Gateway Starting[/bold bright_green]",
-        subtitle=f"[dim]LoLLMS Agentic Bot | Host: {host}[/dim]"
+        subtitle=f"[dim]LoLLMS Agentic Bot | Host: {host}{' | DEBUG MODE' if debug_mode else ''}[/dim]"
     )
     console.print()
     console.print(panel)
@@ -107,6 +114,7 @@ def main(argv: List[str] | None = None) -> None:
 │    lollmsbot wizard          # Interactive setup            │
 │    lollmsbot gateway         # Run API server               │
 │    lollmsbot gateway --ui    # API + Web UI together        │
+│    lollmsbot gateway --debug # Run with debug output        │
 │    lollmsbot ui              # Web UI only (standalone)     │
 │    lollmsbot ui --port 3000  # UI on custom port            │
 └─────────────────────────────────────────────────────────────┘
@@ -125,6 +133,7 @@ def main(argv: List[str] | None = None) -> None:
     gateway_parser.add_argument("--host", type=str, default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
     gateway_parser.add_argument("--port", type=int, default=8800, help="Port number (default: 8800)")
     gateway_parser.add_argument("--ui", action="store_true", help="Also start web UI at /ui")
+    gateway_parser.add_argument("--debug", action="store_true", help="Enable debug mode with rich memory display")
 
     # UI command (standalone)
     ui_parser = subparsers.add_parser(
@@ -155,8 +164,11 @@ def main(argv: List[str] | None = None) -> None:
             host = args.host or settings.host
             port = args.port or settings.port
             
+            # Set debug mode in gateway module
+            gateway.DEBUG_MODE = getattr(args, 'debug', False)
+            
             # Print startup banner
-            print_gateway_banner(host, port, args.ui)
+            print_gateway_banner(host, port, args.ui, gateway.DEBUG_MODE)
             
             # Enable UI if requested
             if args.ui:
@@ -168,8 +180,8 @@ def main(argv: List[str] | None = None) -> None:
                 "lollmsbot.gateway:app",
                 host=host,
                 port=port,
-                reload=args.host == "127.0.0.1" and not args.ui,
-                log_level="info",
+                reload=False,
+                log_level="debug" if gateway.DEBUG_MODE else "info"
             )
             
         elif args.command == "ui":
@@ -187,7 +199,7 @@ def main(argv: List[str] | None = None) -> None:
                     ui.app,
                     host=args.host,
                     port=args.port,
-                    log_level="warning" if args.quiet else "info",
+                    log_level="warning" if args.quiet else "info"
                 )
             except KeyboardInterrupt:
                 ui._print_shutdown_message()

@@ -1,9 +1,12 @@
 """
-Agent module for LollmsBot - RLM Memory Edition
+Agent module for LollmsBot - RLM Memory Edition with Semantic Anchors
 
 Updated to use RLM-compliant memory manager with double-memory structure:
-- External Memory Store (EMS): Compressed, chunked long-term storage
+- External Memory Store (EMS): Compressed, chunked long-term storage  
 - REPL Context Buffer (RCB): Working memory with loadable handles
+
+CRITICAL: Web content fetched via HTTP is now properly loaded into context
+with full text available via semantic anchors that describe memory contents.
 """
 
 from __future__ import annotations
@@ -11,7 +14,8 @@ from __future__ import annotations
 import asyncio
 import json
 import traceback
-from dataclasses import field
+import re
+from dataclasses import field, dataclass
 from typing import Any, Dict, List, Optional, Set, Callable, Awaitable
 
 from lollmsbot.config import BotConfig
@@ -51,16 +55,29 @@ from lollmsbot.agent.logging import AgentLogger
 from lollmsbot.agent.environment import EnvironmentDetector, detect_environment, EnvironmentInfo
 
 
+@dataclass
+class MemoryAnchor:
+    """Internal representation - never shown to users."""
+    chunk_id: str
+    anchor_type: str  # "web_content", "user_fact", "conversation", "self_knowledge", "file"
+    title: str
+    summary: str
+    tags: List[str]
+    content_preview: str
+    full_content_available: bool = True
+    importance: float = 1.0
+
+
 class Agent:
     """
-    Core AI agent with RLM-compliant memory system.
+    Core AI agent with RLM memory.
     
-    Uses the Recursive Language Model memory architecture:
-    - EMS (External Memory Store): SQLite-backed compressed storage in ~/.lollmsbot/rlm_memory.db
-    - RCB (REPL Context Buffer): Working memory with [[MEMORY:...]] handles visible to LLM
+    Memory architecture (internal, never exposed to users):
+    - EMS: Long-term compressed storage
+    - RCB: Working memory
     
-    The LLM sees a REPL-style interface where it can conceptually "load" memories.
-    The implementation handles actual retrieval and context management.
+    The LLM receives loaded content directly in context and responds naturally.
+    No memory IDs, no meta-commentary about memory systems.
     """
     
     def __init__(
@@ -72,7 +89,7 @@ class Agent:
         enable_guardian: bool = True,
         enable_skills: bool = True,
         verbose_logging: bool = True,
-        memory_db_path: Optional[Any] = None,  # Path or None for default
+        memory_db_path: Optional[Any] = None,
     ) -> None:
         # Core configuration
         self.config: BotConfig = config or BotConfig()
@@ -91,12 +108,11 @@ class Agent:
             if self._guardian.is_quarantined:
                 self._state = AgentState.QUARANTINED
         
-        # RLM MEMORY SYSTEM: New double-memory architecture
+        # RLM MEMORY SYSTEM
         self._memory: Optional[RLMMemoryManager] = None
         self._memory_lock: asyncio.Lock = asyncio.Lock()
         self._memory_db_path = memory_db_path
         
-        # Legacy compatibility: Identity detection still useful
         self._identity_detector = IdentityDetector()
         self._prompt_builder = PromptBuilder(agent_name=self.name)
         self._logger = AgentLogger(
@@ -105,24 +121,23 @@ class Agent:
             verbose=verbose_logging,
         )
         
-        # Environment detection
         self._environment_info: Optional[EnvironmentInfo] = None
         self._environment_detector = EnvironmentDetector()
         
-        # Tools management
+        # Tools
         self._tools: Dict[str, Tool] = {}
         self._tool_lock: asyncio.Lock = asyncio.Lock()
         self._tool_parser: Optional[ToolParser] = None
         self._file_generator: Optional[FileGenerator] = None
         
-        # Skills (lazy initialization)
+        # Skills
         self._skills_enabled = enable_skills
         self._skill_registry: Any = None
         self._skill_executor: Any = None
         self._skill_learner: Any = None
         self._skill_lock: asyncio.Lock = asyncio.Lock()
         
-        # LoLLMS client (lazy initialization)
+        # LoLLMS client
         self._lollms_client: Optional[LollmsClient] = None
         self._lollms_client_initialized = False
         
@@ -137,48 +152,57 @@ class Agent:
         self._skill_event_callback: Optional[Callable[[str, str, Dict[str, Any]], Awaitable[None]]] = None
         self._memory_event_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None]]] = None
         
-        # Soul (lazy initialization)
+        # Soul
         self._soul: Any = None
         self._soul_initialized = False
         
-        # Async initialization flag
         self._initialized = False
-        
-        # Dev mode flag for enhanced logging
         self._dev_mode = verbose_logging
+        
+        # Memory cache - internal only
+        self._anchor_cache: Dict[str, str] = {}
+        self._loaded_anchors: Set[str] = set()
+        
+        # Fast conversation cache
+        self._recent_conversations: Dict[str, List[ConversationTurn]] = {}
+        self._max_recent_history: int = 10
+        
+        self._debug_callback: Optional[Callable[[str, Dict[str, Any]], None]] = None
         
         if self._state == AgentState.QUARANTINED:
             self._logger.log_critical("🚨 Agent initialized in QUARANTINED state")
     
+    def set_debug_callback(self, callback: Callable[[str, Dict[str, Any]], None]) -> None:
+        self._debug_callback = callback
+    
+    def _debug(self, event_type: str, data: Dict[str, Any]) -> None:
+        if self._debug_callback:
+            try:
+                self._debug_callback(event_type, data)
+            except Exception:
+                pass
+    
     async def initialize(self, gateway_mode: str = "unknown", host_bindings: Optional[List[str]] = None) -> None:
-        """Async initialization - must be called before using agent."""
         if self._initialized:
             return
         
-        # Detect and store environment info FIRST (before memory init)
-        # This ensures environment facts are available for self-knowledge seeding
         self._environment_info = detect_environment(gateway_mode, host_bindings)
         self._logger.log(
             f"🌍 Environment: {self._environment_detector.get_summary()}",
             "cyan", "🖥️"
         )
         
-        # Initialize RLM Memory System FIRST (before tools that need it)
         await self._ensure_memory()
-        
-        # Store environment facts as self-knowledge
         await self._store_environment_knowledge()
         
         self._initialized = True
         self._logger.log(f"✅ Agent {self.name} initialized with environment awareness", "green", "🚀")
     
     def _generate_id(self) -> str:
-        """Generate a unique agent ID."""
         import uuid
         return str(uuid.uuid4())
     
     async def _ensure_memory(self) -> RLMMemoryManager:
-        """Lazy initialization of RLM Memory Manager."""
         if self._memory is None:
             self._logger.log("Initializing RLM Memory System...", "magenta", "🧠")
             
@@ -189,14 +213,11 @@ class Agent:
                 heartbeat_interval=30.0,
             )
             
-            # Set up memory event callbacks
             self._memory.on_memory_load(self._on_memory_loaded)
             self._memory.on_injection_detected(self._on_memory_injection_detected)
             
-            # Initialize DB and seed self-knowledge
             await self._memory.initialize()
             
-            # Log memory stats
             stats = await self._memory.get_stats()
             self._logger.log(
                 f"✅ RLM Memory ready: {stats.get('active_chunks', 0)} chunks in EMS, "
@@ -207,17 +228,14 @@ class Agent:
         return self._memory
     
     async def _store_environment_knowledge(self) -> None:
-        """Store detected environment information as self-knowledge."""
         if not self._environment_info or not self._memory:
             return
         
         self._logger.log("Storing environment knowledge...", "cyan", "🌍")
         
-        # Convert environment info to facts
         facts = self._environment_info.to_facts()
         
         for fact_id, content, importance in facts:
-            # Store in database as self-knowledge
             await self._memory._db.store_self_knowledge(
                 knowledge_id=f"environment_{fact_id}",
                 category="environment",
@@ -225,7 +243,6 @@ class Agent:
                 importance=importance,
             )
             
-            # Also store as chunk for consistency
             chunk_id = f"env_{fact_id}_{self.agent_id[:8]}"
             try:
                 await self._memory.store_in_ems(
@@ -243,24 +260,176 @@ class Agent:
         self._logger.log(f"✅ Stored {len(facts)} environment facts", "green", "🌍")
     
     def _on_memory_loaded(self, chunk_id: str, chunk: MemoryChunk) -> Awaitable[None]:
-        """Callback when memory is loaded from EMS to RCB."""
         self._logger.log(f"📥 Memory loaded: {chunk_id} ({chunk.chunk_type.name})", "cyan", "🧠")
-        return asyncio.sleep(0)  # Dummy awaitable
+        return asyncio.sleep(0)
     
     def _on_memory_injection_detected(self, event: Dict[str, Any]) -> Awaitable[None]:
-        """Callback when prompt injection is detected in memory content."""
         self._logger.log(
             f"🛡️ Injection sanitized in memory from {event.get('source', 'unknown')}: "
             f"{len(event.get('detections', []))} patterns neutralized",
             "yellow", "🚨"
         )
-        # Could also notify guardian here
-        return asyncio.sleep(0)  # Dummy awaitable
+        return asyncio.sleep(0)
     
-    # ========== Soul Integration ==========
+    async def _search_and_load_memories(
+        self,
+        memory: RLMMemoryManager,
+        user_id: str,
+        query: str,
+    ) -> List[Dict[str, Any]]:
+        """
+        Search for relevant memories and return loaded content.
+        PRIORITIZES web_content chunks with substantive content.
+        """
+        loaded_content = []
+        seen_chunks = set()
+        
+        # Extract key terms from query for better searching
+        key_terms = self._extract_key_terms(query)
+        self._logger.log(f"🔍 Searching for: '{query}' (terms: {key_terms})", "cyan")
+        
+        # CRITICAL: Search WITHOUT type restrictions first to get ALL relevant content
+        # The database search searches in summary, tags, load_hints AND content preview
+        all_results = await memory.search_ems(
+            query=query,
+            limit=20,
+        )
+        
+        self._logger.log(f"🔍 Found {len(all_results)} total chunks", "cyan")
+        
+        # Also search with key terms
+        if len(key_terms) > 0:
+            key_term_query = " ".join(key_terms)
+            key_results = await memory.search_ems(
+                query=key_term_query,
+                limit=15,
+            )
+            # Merge and deduplicate
+            for chunk, score in key_results:
+                found = False
+                for existing_chunk, existing_score in all_results:
+                    if existing_chunk.chunk_id == chunk.chunk_id:
+                        found = True
+                        break
+                if not found:
+                    all_results.append((chunk, score))
+        
+        self._logger.log(f"🔍 Total after key term search: {len(all_results)} chunks", "cyan")
+        
+        # Sort by score descending
+        all_results.sort(key=lambda x: -x[1])
+        
+        # Process results - prioritize web content
+        web_content_loaded = 0
+        other_content_loaded = 0
+        
+        for chunk, score in all_results:
+            if chunk.chunk_id in seen_chunks:
+                continue
+            seen_chunks.add(chunk.chunk_id)
+            
+            try:
+                content = chunk.decompress_content()
+                
+                # Skip if too short
+                if len(content) < 100:
+                    continue
+                
+                # Prioritize web content
+                if chunk.chunk_type == MemoryChunkType.WEB_CONTENT and web_content_loaded < 3:
+                    # For web content, we want substantial excerpts
+                    # But limit to avoid overwhelming the context
+                    excerpt = content[:15000] if len(content) > 15000 else content
+                    
+                    loaded_content.append({
+                        "chunk_id": chunk.chunk_id,
+                        "type": "web_content",
+                        "title": chunk.summary or "Web content",
+                        "content": excerpt,
+                        "full_length": len(content),
+                        "score": score,
+                    })
+                    
+                    self._anchor_cache[chunk.chunk_id] = content
+                    self._loaded_anchors.add(chunk.chunk_id)
+                    web_content_loaded += 1
+                    
+                    self._logger.log(
+                        f"📥 Loaded web content: {chunk.chunk_id[:20]}... ({len(content)} chars, score={score:.1f})",
+                        "green"
+                    )
+                    
+                elif chunk.chunk_type == MemoryChunkType.FACT and other_content_loaded < 2:
+                    loaded_content.append({
+                        "chunk_id": chunk.chunk_id,
+                        "type": "fact",
+                        "title": "User information",
+                        "content": content[:2000],
+                        "full_length": len(content),
+                        "score": score,
+                    })
+                    self._anchor_cache[chunk.chunk_id] = content
+                    other_content_loaded += 1
+                    
+                elif chunk.chunk_type == MemoryChunkType.CONVERSATION and other_content_loaded < 2:
+                    # Parse conversation
+                    try:
+                        conv_data = json.loads(content)
+                        user_msg = conv_data.get("user_message", "")
+                        agent_resp = conv_data.get("agent_response", "")
+                        
+                        if len(user_msg) > 20:
+                            loaded_content.append({
+                                "chunk_id": chunk.chunk_id,
+                                "type": "conversation",
+                                "title": "Previous conversation",
+                                "content": f"User: {user_msg}\nAssistant: {agent_resp[:1000]}",
+                                "full_length": len(content),
+                                "score": score,
+                            })
+                            other_content_loaded += 1
+                    except:
+                        pass
+                
+                # Stop once we have enough content
+                if web_content_loaded >= 2 and other_content_loaded >= 1:
+                    break
+                    
+            except Exception as e:
+                self._logger.log(f"Failed to load {chunk.chunk_id}: {e}", "yellow")
+        
+        self._logger.log(
+            f"✅ Loaded {web_content_loaded} web content + {other_content_loaded} other = {len(loaded_content)} total",
+            "green" if web_content_loaded > 0 else "yellow"
+        )
+        
+        return loaded_content
+    
+    def _extract_key_terms(self, query: str) -> List[str]:
+        """Extract meaningful key terms from query for searching."""
+        stop_words = {"do", "you", "remember", "my", "the", "a", "an", "is", "are", "was", "were",
+                     "i", "me", "my", "mine", "have", "has", "had", "this", "that", "these", "those",
+                     "can", "could", "would", "will", "about", "tell", "what", "who", "where", "when",
+                     "how", "why", "and", "or", "but", "if", "then", "than", "so", "very", "just",
+                     "now", "here", "there", "with", "from", "for", "to", "of", "in", "on", "at"}
+        
+        words = re.findall(r'\b\w+\b', query.lower())
+        
+        key_terms = []
+        for word in words:
+            if word not in stop_words and (len(word) >= 3 or word.isdigit()):
+                key_terms.append(word)
+        
+        # Add variations
+        expanded_terms = list(key_terms)
+        for term in key_terms:
+            if " " in query and term in query.lower():
+                expanded_terms.append(term.replace(" ", "-"))
+                expanded_terms.append(term.replace(" ", ""))
+        
+        return expanded_terms
     
     def _ensure_soul(self) -> Optional[Any]:
-        """Lazy initialization of Soul for personality and identity."""
         if not self._soul_initialized:
             self._logger.log("Initializing Soul...", "magenta", "🧬")
             try:
@@ -278,10 +447,7 @@ class Agent:
             self._soul_initialized = True
         return self._soul
     
-    # ========== LoLLMS Client ==========
-    
     def _ensure_lollms_client(self) -> Optional[LollmsClient]:
-        """Lazy initialization of LoLLMS client."""
         if not self._lollms_client_initialized:
             self._logger.log("Initializing LoLLMS client...", "cyan", "🔗")
             try:
@@ -293,10 +459,7 @@ class Agent:
             self._lollms_client_initialized = True
         return self._lollms_client
     
-    # ========== Skills ==========
-    
     def _ensure_skills_initialized(self) -> bool:
-        """Lazy initialization of skills subsystems."""
         if not self._skills_enabled:
             return False
         
@@ -319,15 +482,11 @@ class Agent:
         
         return True
     
-    # ========== Tool Management ==========
-    
     async def register_tool(self, tool: Tool) -> None:
-        """Register a tool with the agent."""
         async with self._tool_lock:
             if tool.name in self._tools:
                 raise ValueError(f"Tool '{tool.name}' already registered")
             
-            # SPECIAL HANDLING: Wire RLM memory to HTTP tool
             if tool.name == "http" and hasattr(tool, 'set_rlm_memory'):
                 tool.set_rlm_memory(self._memory)
                 self._logger.log(f"🔗 Connected RLM memory to HTTP tool", "cyan", "🔗")
@@ -338,15 +497,12 @@ class Agent:
                 "purple", "➕"
             )
             
-            # Update tool-dependent components
             self._tool_parser = ToolParser(self._tools)
             self._file_generator = FileGenerator(self._tools)
     
     @property
     def tools(self) -> Dict[str, Tool]:
         return dict(self._tools)
-    
-    # ========== Callbacks ==========
     
     def set_file_delivery_callback(
         self, 
@@ -369,10 +525,7 @@ class Agent:
     ) -> None:
         self._memory_event_callback = callback
     
-    # ========== Permissions ==========
-    
     async def check_permission(self, user_id: str, required_level: PermissionLevel) -> bool:
-        """Check if a user has the required permission level."""
         async with self._permission_lock:
             user_perms = self._user_permissions.get(user_id, self._default_permissions)
             has_permission = user_perms.level.value >= required_level.value
@@ -393,7 +546,6 @@ class Agent:
         allowed_skills: Optional[Set[str]] = None,
         denied_skills: Optional[Set[str]] = None,
     ) -> None:
-        """Set permissions for a specific user."""
         async with self._permission_lock:
             self._user_permissions[user_id] = UserPermissions(
                 level=level,
@@ -404,36 +556,27 @@ class Agent:
             )
             self._logger.log(f"🔐 Set permission for {user_id}: {level.name}", "cyan", "🔒")
     
-    # ========== Main Chat Processing ==========
-    
     async def chat(
         self,
         user_id: str,
         message: str,
         context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Process chat message - orchestrates all components including RLM memory."""
-        # Ensure initialized
         if not self._initialized:
             await self.initialize()
         
-        # Log command receipt
         self._logger.log_command_received(user_id, message, context, len(self._tools))
         
-        # Check quarantine
         if self._state == AgentState.QUARANTINED:
             return self._quarantine_response()
         
-        # Security screening
         security_result = await self._security_check(user_id, message)
         if security_result:
             return security_result
         
-        # Permission check
         if not await self.check_permission(user_id, PermissionLevel.BASIC):
             return self._permission_denied_response()
         
-        # Set processing state
         state_ok = await self._set_processing_state()
         if not state_ok:
             return self._busy_response()
@@ -443,11 +586,9 @@ class Agent:
             return result
             
         except Exception as exc:
-            # Enhanced dev mode logging with full traceback
             if self._dev_mode:
                 tb_str = traceback.format_exc()
                 self._logger.log_critical(f"🚨 DEV MODE FULL TRACEBACK:\n{tb_str}")
-                # Also log to console for immediate visibility
                 print(f"\n{'='*60}")
                 print("DEV MODE ERROR TRACEBACK:")
                 print(tb_str)
@@ -459,8 +600,6 @@ class Agent:
         
         finally:
             await self._return_to_idle()
-    
-    # ========== Response Helpers ==========
     
     def _quarantine_response(self) -> Dict[str, Any]:
         return {
@@ -490,14 +629,11 @@ class Agent:
             "tools_used": [], "skills_used": [], "files_to_send": [],
         }
     
-    # ========== Processing Steps ==========
-    
     async def _security_check(
         self,
         user_id: str,
         message: str,
     ) -> Optional[Dict[str, Any]]:
-        """Perform security screening. Returns response dict if blocked, None if safe."""
         if not self._guardian:
             return None
         
@@ -516,7 +652,6 @@ class Agent:
         return None
     
     async def _set_processing_state(self) -> bool:
-        """Set state to PROCESSING. Returns False if busy."""
         async with self._state_lock:
             if self._state == AgentState.PROCESSING:
                 self._logger.log("⚠️ Agent busy - rejecting concurrent request", "yellow", "⏳")
@@ -527,19 +662,104 @@ class Agent:
             return True
     
     async def _set_error_state(self) -> None:
-        """Set state to ERROR."""
         async with self._state_lock:
             old_state = self._state
             self._state = AgentState.ERROR
             self._logger.log_state_change(old_state.name, AgentState.ERROR.name, "exception occurred")
     
     async def _return_to_idle(self) -> None:
-        """Return state to IDLE from PROCESSING."""
         async with self._state_lock:
             if self._state != AgentState.ERROR:
                 old_state = self._state
                 self._state = AgentState.IDLE
                 self._logger.log_state_change(old_state.name, AgentState.IDLE.name, "processing complete")
+    
+    def _get_conversation_history(self, user_id: str) -> List[ConversationTurn]:
+        return self._recent_conversations.get(user_id, [])[-self._max_recent_history:]
+    
+    def _format_history_for_prompt(self, history: List[ConversationTurn]) -> str:
+        if not history:
+            return ""
+        
+        lines = ["", "=" * 60, "CONVERSATION HISTORY", "=" * 60, ""]
+        
+        for turn in history[-5:]:
+            lines.append(f"User: {turn.user_message}")
+            lines.append(f"Assistant: {turn.agent_response}")
+            lines.append("")
+        
+        lines.append("=" * 60)
+        return "\n".join(lines)
+    
+    def _extract_urls_and_facts(self, message: str) -> List[Dict[str, Any]]:
+        """Extract URLs and important facts from user messages for memory storage."""
+        extracted = []
+        
+        # URL pattern - matches http/https URLs
+        url_pattern = r'https?://[^\s<>"{}|\\^`\[\]]+'
+        urls = re.findall(url_pattern, message)
+        
+        for url in urls:
+            # Clean up common trailing punctuation
+            url = url.rstrip('.,;:!?)')
+            extracted.append({
+                "type": "url",
+                "content": url,
+                "context": message[:200],  # Surrounding context
+            })
+        
+        # Also look for domain-like patterns that might be URLs without protocol
+        domain_pattern = r'\b([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}\b'
+        domains = re.findall(domain_pattern, message)
+        # domains is list of tuples due to groups, flatten it
+        domains = [d[0] if isinstance(d, tuple) else d for d in domains]
+        
+        # Filter out common false positives
+        false_positives = {'com', 'org', 'net', 'io', 'ai', 'co', 'app', 'dev'}
+        for domain in domains:
+            # Skip if just TLD or common suffix without domain
+            parts = domain.lower().split('.')
+            if len(parts) < 2:
+                continue
+            # Check if it looks like a real domain (has substance before TLD)
+            if parts[0] not in false_positives and len(parts[0]) > 1:
+                # Check it's not already captured as full URL
+                full_url = f"https://{domain}"
+                if not any(full_url.startswith(u) or u.startswith(full_url) for u in urls):
+                    extracted.append({
+                        "type": "url",
+                        "content": full_url,
+                        "context": f"Domain mentioned: {domain}",
+                    })
+        
+        return extracted
+    
+    async def _store_extracted_facts(self, user_id: str, message: str, memory: RLMMemoryManager) -> None:
+        """Extract and store important facts, URLs, and references from user message."""
+        extracted = self._extract_urls_and_facts(message)
+        
+        for item in extracted:
+            if item["type"] == "url":
+                url = item["content"]
+                context = item["context"]
+                
+                # Store as high-importance fact about user's content
+                try:
+                    # Create a descriptive entry
+                    content = f"User shared URL: {url}\nContext: {context[:300]}"
+                    
+                    await memory.store_in_ems(
+                        content=content,
+                        chunk_type=MemoryChunkType.FACT,
+                        importance=8.0,  # High importance for user-shared URLs
+                        tags=["url", "user_shared", "reference", "important"],
+                        summary=f"URL from user: {url[:80]}",
+                        load_hints=[url, "url", "link", "website", "homo", "zombius", "novel", "book"],
+                        source=f"extracted_url:{user_id}",
+                    )
+                    self._logger.log(f"🔗 Stored URL in memory: {url[:60]}...", "cyan", "📝")
+                except Exception as e:
+                    self._logger.log(f"Failed to store URL: {e}", "yellow")
     
     async def _process_message_rlm(
         self,
@@ -547,132 +767,132 @@ class Agent:
         message: str,
         context: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
-        """Main message processing with RLM memory system."""
         tools_used: List[str] = []
         skills_used: List[str] = []
         files_to_send: List[Dict[str, Any]] = []
         
-        # Get RLM memory manager
         memory = await self._ensure_memory()
+        conversation_history = self._get_conversation_history(user_id)
         
-        # Identity detection for important information
+        # Debug info
+        try:
+            rcb_entries_full = await memory._db.get_rcb_entries(limit=50)
+        except Exception as e:
+            rcb_entries_full = []
+        
+        self._debug("memory_before", {
+            "user_id": user_id,
+            "rcb_count": len(rcb_entries_full) if isinstance(rcb_entries_full, list) else 0,
+            "anchor_cache_size": len(self._anchor_cache),
+            "conversation_history_turns": len(conversation_history),
+        })
+        
+        # CRITICAL NEW STEP: Extract and store URLs/facts from message BEFORE processing
+        # This ensures URLs are stored with high importance for future recall
+        await self._store_extracted_facts(user_id, message, memory)
+        
+        # Identity detection
         identity_detection = self._identity_detector.detect(message)
         if identity_detection.categories and identity_detection.extracted_facts:
             self._logger.log(
                 f"🔍 Identity detected: {', '.join(identity_detection.categories)}",
                 "gold", "🧠"
             )
-            # LOG: About to store identity information
-            self._logger.log(
-                f"💾 STORING TO RLM EMS: Identity info from {user_id} - "
-                f"categories: {identity_detection.categories}, "
-                f"facts: {list(identity_detection.extracted_facts.keys())}, "
-                f"importance: {identity_detection.importance_boost}",
-                "cyan", "📝"
-            )
-            # Store in EMS with high importance
             try:
-                # Build a human-readable summary with actual values, not just keys
                 facts_summary = []
                 for key, value in identity_detection.extracted_facts.items():
-                    if value:  # Only include non-empty values
-                        facts_summary.append(f"{key}='{value}'")
+                    if value:
+                        facts_summary.append(f"{key}={value}")
                 
-                summary_text = ", ".join(facts_summary) if facts_summary else "identity information recorded"
+                summary_text = ", ".join(facts_summary) if facts_summary else "identity recorded"
                 
-                chunk_id = await memory.store_in_ems(
+                await memory.store_in_ems(
                     content=json.dumps(identity_detection.extracted_facts),
                     chunk_type=MemoryChunkType.FACT,
                     importance=identity_detection.importance_boost,
-                    tags=identity_detection.categories + ["identity", "auto_detected", f"user_{user_id}"],
-                    summary=f"Identity info from {user_id}: {summary_text}",
-                    load_hints=list(identity_detection.extracted_facts.keys()) + list(identity_detection.extracted_facts.values())[:5],
-                    source=f"identity_detection:{user_id}",
+                    tags=identity_detection.categories + ["identity", f"user_{user_id}"],
+                    summary=f"Identity: {summary_text}",
+                    load_hints=list(identity_detection.extracted_facts.keys()),
+                    source=f"identity:{user_id}",
                 )
-                # LOG: Successfully stored
-                self._logger.log(
-                    f"✅ RLM EMS STORAGE SUCCESS: chunk_id={chunk_id}, "
-                    f"importance={identity_detection.importance_boost}, "
-                    f"tags={identity_detection.categories + ['identity', 'auto_detected']}",
-                    "green", "🧠"
-                )
-                # Also notify via memory event callback if set
-                if self._memory_event_callback:
-                    await self._memory_event_callback("identity_stored", {
-                        "chunk_id": chunk_id,
-                        "user_id": user_id,
-                        "categories": identity_detection.categories,
-                        "importance": identity_detection.importance_boost,
-                        "facts_keys": list(identity_detection.extracted_facts.keys()),
-                    })
             except Exception as e:
-                # LOG: Failed to store
-                self._logger.log(
-                    f"❌ RLM EMS STORAGE FAILED: {str(e)}",
-                    "red", "🧠"
-                )
-                # Continue processing even if storage fails
+                self._logger.log(f"Failed to store identity: {e}", "yellow")
         
-        # Check for informational query (no tools needed)
+        # Check for info query
         if self._identity_detector.is_informational_query(message):
             return await self._handle_informational_query(memory, user_id)
         
-        # Check for file generation request
         is_file_request = self._file_generator and self._file_generator.is_file_request(message)
         
-        # Build RLM-compliant system prompt with memory REPL interface
+        # CRITICAL: Search and load relevant memories
+        loaded_memories = await self._search_and_load_memories(memory, user_id, message)
+        
+        # Build prompt with loaded content
         soul = self._ensure_soul()
-        system_prompt = await self._build_rlm_system_prompt(
-            memory=memory,
-            tools=self._tools,
-            context=context,
+        system_prompt = self._build_system_prompt(
             soul=soul,
+            context=context,
+            conversation_history=conversation_history,
+            loaded_memories=loaded_memories,
             is_file_request=is_file_request,
-            user_id=user_id,
         )
         
-        # Get LLM response - with full RLM context
+        # CRITICAL DEBUG: Log the actual memory content being sent
+        if loaded_memories:
+            for i, mem in enumerate(loaded_memories[:2]):
+                content_preview = mem.get("content", "")[:500]
+                self._logger.log(
+                    f"📋 Memory {i+1} in prompt: {mem.get('type')} - {mem.get('title', 'untitled')[:50]}... "
+                    f"(content: {len(mem.get('content', ''))} chars, preview: {content_preview[:100]}...)",
+                    "cyan"
+                )
+        
+        # Get LLM response
         client = self._ensure_lollms_client()
-        response, extracted_tools, extracted_files = await self._get_llm_response(
-            client, system_prompt, user_id, message, is_file_request, memory
+        response, extracted_tools, extracted_files, raw_llm_response, tool_results = await self._get_llm_response_with_tools(
+            client, system_prompt, user_id, message, is_file_request, memory, conversation_history
         )
+        
+        # FULL raw response logging
+        self._debug("llm_raw_response", {
+            "user_id": user_id,
+            "full_raw_response": raw_llm_response,  # FULL content
+            "response_length": len(response),
+            "tools_used": len(extracted_tools),
+        })
         
         tools_used.extend(extracted_tools)
         files_to_send.extend(extracted_files)
         
-        # LOG: Storing conversation in EMS
-        self._logger.log(
-            f"💾 STORING TO RLM EMS: Conversation turn from {user_id}, "
-            f"tools_used: {tools_used}, importance: {2.0 if identity_detection.categories else 1.0}",
-            "cyan", "📝"
+        # Store conversation
+        new_turn = ConversationTurn(
+            user_message=message,
+            agent_response=response,
+            tools_used=tools_used,
+            skills_used=skills_used,
+            importance_score=2.0 if identity_detection.categories else 1.0,
         )
         
-        # Store conversation in EMS (long-term memory)
+        if user_id not in self._recent_conversations:
+            self._recent_conversations[user_id] = []
+        self._recent_conversations[user_id].append(new_turn)
+        if len(self._recent_conversations[user_id]) > self._max_recent_history:
+            self._recent_conversations[user_id] = self._recent_conversations[user_id][-self._max_recent_history:]
+        
         try:
-            conv_chunk_id = await memory.store_conversation_turn(
+            await memory.store_conversation_turn(
                 user_id=user_id,
                 user_message=message,
                 agent_response=response,
                 tools_used=tools_used,
                 importance=2.0 if identity_detection.categories else 1.0,
             )
-            self._logger.log(
-                f"✅ RLM EMS CONVERSATION STORED: chunk_id={conv_chunk_id}",
-                "green", "🧠"
-            )
         except Exception as e:
-            self._logger.log(
-                f"❌ RLM EMS CONVERSATION STORAGE FAILED: {str(e)}",
-                "red", "🧠"
-            )
+            self._logger.log(f"Failed to store conversation: {e}", "yellow")
         
-        # Deliver files
         await self._deliver_files(user_id, files_to_send)
         
-        # Build final response
         final_response = self._build_final_response(response, files_to_send)
-        
-        # Log completion
         self._logger.log_response_sent(user_id, len(final_response), tools_used)
         
         return {
@@ -681,264 +901,129 @@ class Agent:
             "tools_used": tools_used,
             "skills_used": skills_used,
             "files_to_send": files_to_send,
-            "memory_stored": True,
         }
     
-    async def _build_rlm_system_prompt(
+    def _build_system_prompt(
         self,
-        memory: RLMMemoryManager,
-        tools: Dict[str, Tool],
-        context: Optional[Dict[str, Any]],
         soul: Optional[Any],
+        context: Optional[Dict[str, Any]],
+        conversation_history: List[ConversationTurn],
+        loaded_memories: List[Dict[str, Any]],
         is_file_request: bool,
-        user_id: str,
     ) -> str:
-        """Build system prompt with RLM memory REPL interface."""
+        """Build system prompt with loaded memories integrated naturally."""
         
-        # Start with Soul's identity if available
+        # Start with soul identity
         if soul:
             base_prompt = soul.generate_system_prompt(context)
         else:
-            base_prompt = f"You are {self.name}, an AI assistant with RLM (Recursive Language Model) memory."
+            base_prompt = f"You are {self.name}, a helpful AI assistant."
         
-        # Add RLM memory interface explanation - with web content specifics
-        rlm_explanation = """
-## Your Memory System (RLM Architecture)
-
-You have a **double-memory structure** following MIT CSAIL's Recursive Language Model research:
-
-1. **External Memory Store (EMS)**: All your long-term memories are stored here as compressed, 
-   sanitized chunks with importance-weighted retention. This includes:
-   - Conversation history
-   - Important facts about users
-   - Web content you have fetched
-   - Self-knowledge about your own systems
-
-2. **REPL Context Buffer (RCB)**: What you see below - your working memory with loadable handles.
-
-### How to Use Your Memory
-
-The RCB shows memory handles like: [[MEMORY:abc123|{"type": "SELF_KNOWLEDGE", "summary": "..."}]]
-
-To access full content of a memory, reference its handle in your reasoning. The system 
-automatically retrieves the full content when you need it.
-
-### WEB CONTENT - Special Handling
-
-When you use the HTTP tool to fetch a URL:
-- The full content is stored as a WEB_CONTENT chunk in EMS
-- You receive a memory handle like [[MEMORY:web_abc123]]
-- The chunk is automatically loaded into your RCB
-- YOU MUST read and process this actual content - never hallucinate
-
-CRITICAL: When a user asks you to summarize web content:
-1. Use the HTTP tool to fetch it
-2. The content becomes available via memory handle
-3. ACTUALLY READ the content through the handle
-4. Provide a real summary based on what was fetched
-5. NEVER make up a generic description
-"""
+        parts = [base_prompt]
         
-        # Get formatted RCB (working memory) from memory manager
-        rcb_content = memory.format_rcb_for_prompt(max_chars=8000)  # Increased for web content
+        # Add conversation history
+        if conversation_history:
+            parts.append(self._format_history_for_prompt(conversation_history))
         
-        # Add tool documentation with HTTP-specific instructions
-        tool_list = self._prompt_builder._format_tool_list(tools)
-        
-        # HTTP-specific instructions - emphasizing RLM integration
-        http_instructions = ""
-        if "http" in tools:
-            http_instructions = """
-### HTTP TOOL - RLM-Integrated Usage
-
-When you need to fetch content from a URL:
-1. Call [[TOOL:http|{"method": "get", "url": "THE_URL"}]]
-2. The tool stores content in RLM memory and returns a memory handle
-3. The handle is automatically loaded into your RCB below
-4. YOU MUST reference this handle to access the content
-5. Provide accurate responses based on the ACTUAL fetched content
-
-The HTTP tool does NOT return raw text - it returns a memory handle.
-The content is in your RLM system. Use it via the memory handles in your RCB.
-"""
-        
-        # Add environment context if available
-        env_context = ""
-        if self._environment_info:
-            env = self._environment_info
-            env_context = f"""
-## Your Runtime Environment
-
-You are running on:
-- **Platform**: {env.os_system} {env.os_release} ({env.os_machine})
-- **Python**: {env.python_version} ({env.python_implementation})
-- **Virtual Environment**: {"Yes - " + env.virtualenv_path if env.in_virtualenv else "No - system Python"}
-- **Container**: {"Docker container" if env.in_docker else "WSL" if env.in_wsl else "Bare metal/VM"}
-- **Working Directory**: {env.working_directory}
-- **Data Storage**: {env.lollmsbot_data_dir}
-- **Current Channel/Mode**: {env.gateway_mode}
-"""
-            if env.host_bindings:
-                env_context += f"- **Network Access**: {', '.join(env.host_bindings)}\n"
-        
-        # Search for user-specific identity memories and load them
-        user_memories = []
-        try:
-            # FIXED: Search with just user_id tag, not "user_id identity" - the tag is stored as f"user_{user_id}" not "user_{user_id} identity"
-            # Use user_id directly to match the tag pattern
-            identity_results = await memory.search_ems(
-                query=user_id,  # FIXED: Changed from f"user_{user_id} identity" to just user_id
-                chunk_types=[MemoryChunkType.FACT],
-                min_importance=2.0,
-                limit=5,
-            )
-            for chunk, score in identity_results:
-                # Only process identity-related chunks
-                tags = chunk.tags or []
-                if "identity" not in tags and "creator_identity" not in tags:
-                    continue
-                    
-                content = chunk.decompress_content()
-                try:
-                    facts = json.loads(content)
-                    # Format facts nicely for display
-                    fact_lines = []
-                    for k, v in facts.items():
-                        if v:  # Only show non-empty values
-                            fact_lines.append(f"{k}: {v}")
-                    if fact_lines:
-                        user_memories.append(f"User identity - {', '.join(fact_lines)}")
-                except:
-                    # If not valid JSON, show summary
-                    user_memories.append(f"User memory: {chunk.summary or content[:100]}")
+        # CRITICAL: Add loaded memories with FULL CONTENT - this is the key fix
+        if loaded_memories:
+            # Sort by type: web_content first, then others
+            web_memories = [m for m in loaded_memories if m.get("type") == "web_content"]
+            other_memories = [m for m in loaded_memories if m.get("type") != "web_content"]
+            sorted_memories = web_memories + other_memories
             
-            # Also search for any memories tagged with this user more broadly
-            user_conversation_results = await memory.search_ems(
-                query=user_id,
-                chunk_types=[MemoryChunkType.CONVERSATION, MemoryChunkType.FACT],
-                min_importance=1.0,
-                limit=3,
-            )
-            for chunk, score in user_conversation_results:
-                if chunk.chunk_type == MemoryChunkType.CONVERSATION:
-                    # Don't load full conversation content, just note it exists
-                    user_memories.append(f"Previous conversation on {chunk.created_at.strftime('%Y-%m-%d') if hasattr(chunk, 'created_at') and chunk.created_at else 'earlier'}")
-        except Exception as e:
-            self._logger.log(f"Error loading user memories: {e}", "yellow")
+            memory_parts = []
+            
+            # Add a very clear header
+            memory_parts.append("")
+            memory_parts.append("=" * 80)
+            memory_parts.append("BELOW IS THE FULL CONTENT OF RELEVANT MEMORIES FROM LONG-TERM STORAGE")
+            memory_parts.append("=" * 80)
+            memory_parts.append("")
+            memory_parts.append("⚠️  IMPORTANT: Read this content carefully and use it to answer the user's question.")
+            memory_parts.append("⚠️  The user is asking about something you've discussed before - it's RIGHT BELOW.")
+            memory_parts.append("⚠️  DO NOT say you don't remember or don't have access - you DO have it below!")
+            memory_parts.append("")
+            
+            for i, mem in enumerate(sorted_memories[:3], 1):  # Top 3 max
+                mem_type = mem.get("type", "unknown")
+                title = mem.get("title", "Memory")
+                content = mem.get("content", "")
+                
+                memory_parts.append(f"{'='*80}")
+                memory_parts.append(f"MEMORY {i}: {title}")
+                memory_parts.append(f"Type: {mem_type} | Full length: {mem.get('full_length', len(content))} chars")
+                memory_parts.append(f"{'='*80}")
+                memory_parts.append("CONTENT:")
+                memory_parts.append(content)  # FULL content, no truncation here
+                memory_parts.append("")
+                memory_parts.append(f"--- END MEMORY {i} ---")
+                memory_parts.append("")
+            
+            memory_parts.append("=" * 80)
+            memory_parts.append("END OF LOADED MEMORIES")
+            memory_parts.append("=" * 80)
+            memory_parts.append("")
+            memory_parts.append("INSTRUCTIONS:")
+            memory_parts.append("1. Use the information ABOVE to answer the user's question.")
+            memory_parts.append("2. DO NOT mention 'memory', 'stored', 'database', 'loaded', or technical terms.")
+            memory_parts.append("3. DO NOT say 'According to my memory...' - just answer naturally.")
+            memory_parts.append("4. If the user asks about a novel/story above, DESCRIBE IT from the content.")
+            memory_parts.append("5. Speak as if you personally remember this, not as if you're reading a file.")
+            
+            parts.append("\n".join(memory_parts))
+        else:
+            # No memories found
+            parts.append("")
+            parts.append("=" * 80)
+            parts.append("NO RELEVANT MEMORIES FOUND")
+            parts.append("=" * 80)
+            parts.append("")
+            parts.append("I don't have specific information about this topic in my memory.")
+            parts.append("I'll answer based on my general knowledge or ask for clarification.")
         
-        user_context = ""
-        if user_memories:
-            user_context = """
-## Information About This User
-
-"""
-            for mem in user_memories:
-                user_context += f"- {mem}\n"
-        
-        # Combine all parts
-        parts = [
-            base_prompt,
-            rlm_explanation,
-            env_context,
-            user_context,
-            "",
-            "=" * 60,
-            "YOUR CURRENT WORKING MEMORY (RCB)",
-            "=" * 60,
-            rcb_content,
-            "",
-            "=" * 60,
-            "AVAILABLE TOOLS",
-            "=" * 60,
-            tool_list,
-            http_instructions,
-        ]
+        # Add tool instructions
+        parts.append("")
+        parts.append("=" * 60)
+        parts.append("AVAILABLE TOOLS")
+        parts.append("=" * 60)
+        parts.append(self._prompt_builder._build_strict_tool_instructions(self._tools))
+        parts.append("")
         
         if is_file_request:
-            parts.extend([
-                "",
-                "FILE GENERATION MODE: Use filesystem tool to create files. Do not output code directly.",
-            ])
+            parts.append("FILE GENERATION: Use filesystem tool to create files when requested.")
+        
+        # Final reminder
+        parts.append("")
+        parts.append("FINAL REMINDER: Answer based on the MEMORY CONTENT shown above if available.")
+        parts.append("Speak naturally - DO NOT reference memory IDs or technical storage terms.")
         
         if context:
             channel = context.get("channel", "unknown")
-            parts.append(f"\nCurrent channel: {channel}")
+            parts.append(f"Channel: {channel}")
         
-        return "\n".join(parts)
+        final_prompt = "\n".join(parts)
+        
+        # Log prompt length for debugging
+        self._logger.log(f"📝 System prompt length: {len(final_prompt)} characters", "cyan")
+        
+        return final_prompt
     
     async def _handle_informational_query(
         self,
         memory: RLMMemoryManager,
         user_id: str,
     ) -> Dict[str, Any]:
-        """Handle simple informational query about capabilities."""
-        self._logger.log("ℹ️ Detected informational query - using memory + tools list", "cyan", "📝")
-        
-        # Get self-knowledge from memory
-        self_knowledge = await memory.search_ems(
-            query="self knowledge purpose architecture",
-            chunk_types=[MemoryChunkType.SELF_KNOWLEDGE],
-            min_importance=5.0,
-            limit=3,
-        )
-        
-        # Get environment knowledge
-        env_knowledge = await memory.search_ems(
-            query="environment platform os runtime",
-            chunk_types=[MemoryChunkType.SELF_KNOWLEDGE],
-            min_importance=5.0,
-            limit=3,
-        )
-        
-        # Build response from self-knowledge and tools
-        knowledge_parts = []
-        for chunk, relevance in self_knowledge:
-            content = chunk.decompress_content()
-            # Extract key sentences
-            sentences = [s.strip() for s in content.split('.') if len(s.strip()) > 20]
-            knowledge_parts.extend(sentences[:2])
-        
-        # Add environment info
-        env_parts = []
-        for chunk, relevance in env_knowledge:
-            content = chunk.decompress_content()
-            env_parts.append(content)
-        
-        # Get memory stats for transparency
         stats = await memory.get_stats()
         
-        # Build environment summary
-        env_summary = ""
-        if self._environment_info:
-            env = self._environment_info
-            env_summary = (
-                f"I'm running on {env.os_system} {env.os_release} "
-                f"with Python {env.python_version}"
-            )
-            if env.in_docker:
-                env_summary += " inside a Docker container"
-            elif env.in_wsl:
-                env_summary += " in WSL"
-            if env.in_virtualenv:
-                env_summary += f" (virtualenv: {env.virtualenv_path})"
-            env_summary += "."
-        
-        tool_list = "\n".join([
-            f"- **{name}**: {tool.description[:80]}"
-            for name, tool in self._tools.items()
-        ])
-        
         response = (
-            f"I am {self.name}, an AI assistant with RLM (Recursive Language Model) memory.\n\n"
-            f"**My Environment**: {env_summary}\n\n"
-            f"**Memory System**: {stats.get('active_chunks', 0)} long-term memory chunks, "
-            f"{stats.get('rcb_entries', 0)}/{stats.get('rcb_capacity', 10)} RCB entries. "
-            f"I use recursive loading to manage unlimited context beyond my native window.\n\n"
-            f"**Available Tools**:\n{tool_list}\n\n"
-            f"Just ask me to use any of these, or tell me about something you'd like me to remember!"
+            f"I can help you with various tasks using my available tools:\n\n"
+            f"**Tools:** File operations, HTTP requests, calendar management\n\n"
+            f"I maintain memory of our conversations and can recall information "
+            f"you've shared with me previously. Just ask me about something "
+            f"we've discussed before.\n\n"
+            f"What would you like to do?"
         )
-        
-        self._logger.log_response_sent(user_id, len(response), [])
         
         return {
             "success": True,
@@ -948,7 +1033,7 @@ You are running on:
             "files_to_send": [],
         }
     
-    async def _get_llm_response(
+    async def _get_llm_response_with_tools(
         self,
         client: Optional[LollmsClient],
         system_prompt: str,
@@ -956,92 +1041,92 @@ You are running on:
         message: str,
         is_file_request: bool,
         memory: RLMMemoryManager,
-    ) -> tuple[str, List[str], List[Dict[str, Any]]]:
-        """Get response from LLM, with RLM memory-aware processing."""
+        conversation_history: Optional[List[ConversationTurn]] = None,
+        max_iterations: int = 5,
+    ) -> tuple[str, List[str], List[Dict[str, Any]], str, List[Dict[str, Any]]]:
         if not client:
-            # Fallback: try direct tool execution
-            return await self._try_direct_execution(message, user_id)
+            response = await self._try_direct_execution(message, user_id)
+            return response[0], response[1], response[2], "[no LLM]", []
         
-        # Build conversation context with recent EMS conversations loaded into RCB
-        # Search for recent conversations with this user
-        recent_convs = await memory.search_ems(
-            query=user_id,
-            chunk_types=[MemoryChunkType.CONVERSATION],
-            limit=3,
-        )
+        tools_used: List[str] = []
+        files_generated: List[Dict[str, Any]] = []
+        all_tool_results: List[Dict[str, Any]] = []
+        last_raw_response = ""
         
-        # Load top conversations into RCB temporarily
-        for chunk, _ in recent_convs:
-            await memory.load_from_ems(chunk.chunk_id, add_to_rcb=True)
+        base_prompt = system_prompt
         
-        # Also search for and load any high-importance facts about this user
-        # FIXED: Use user_id directly to match tags properly
-        user_facts = await memory.search_ems(
-            query=user_id,
-            chunk_types=[MemoryChunkType.FACT],
-            min_importance=2.0,
-            limit=3,
-        )
-        for chunk, _ in user_facts:
-            # Only load identity-related facts
-            tags = chunk.tags or []
-            if "identity" in tags or "creator_identity" in tags:
-                await memory.load_from_ems(chunk.chunk_id, add_to_rcb=True)
-        
-        # Refresh system prompt with updated RCB (now includes loaded memories)
-        # We need to rebuild the prompt to include the updated RCB
-        # Actually, let's rebuild to get fresh RCB
-        soul = self._ensure_soul()
-        fresh_prompt = await self._build_rlm_system_prompt(
-            memory=memory,
-            tools=self._tools,
-            context={"channel": "chat"},  # Simplified context
-            soul=soul,
-            is_file_request=is_file_request,
-            user_id=user_id,
-        )
-        
-        # Build final prompt with conversation
-        prompt = f"{fresh_prompt}\n\nUser: {message}\nAssistant:"
-        
-        self._logger.log_llm_call(len(prompt), fresh_prompt[:500])
-        
-        # Call LLM
-        llm_response = client.generate_text(
-            prompt=prompt,
-            temperature=0.7,
-            top_p=0.9,
-            repeat_penalty=1.1,
-        )
-        
-        has_tools = "[[TOOL:" in llm_response or "<function_calls>" in llm_response
-        self._logger.log_llm_response(len(llm_response), has_tools)
-        
-        # Parse and execute tools
-        if self._tool_parser:
-            result = await self._tool_parser.parse_and_execute(llm_response, user_id, None)
+        for iteration in range(max_iterations):
+            if iteration == 0:
+                current_prompt = f"{base_prompt}\n\nUser: {message}\nAssistant:"
+            else:
+                tool_results_text = self._format_tool_results_for_llm(all_tool_results[-1])
+                current_prompt = f"{base_prompt}\n\nUser: {message}\n\n{tool_results_text}\nAssistant:"
             
-            final_response, tools_used, files_generated = result
+            self._logger.log_llm_call(len(current_prompt), base_prompt[:500])
             
-            # Strip any [[MEMORY:...]] references from the response - they shouldn't be visible to user
-            final_response = self._strip_memory_handles(final_response)
+            llm_response = client.generate_text(
+                prompt=current_prompt,
+                temperature=0.7,
+                top_p=0.9,
+                repeat_penalty=1.1,
+            )
             
-            # NO MORE SECOND PASS - RLM handles this naturally!
-            # The HTTP tool stores content in RLM, and the RCB shows the handle.
-            # If the LLM didn't properly use the content, that's a prompt engineering issue,
-            # not a workflow issue. The RLM architecture is designed to make content
-            # available via the RCB in the next turn if needed.
+            last_raw_response = llm_response
             
-            return final_response, tools_used, files_generated
+            has_tool_calls = "<tool>" in llm_response or "[[TOOL:" in llm_response
+            
+            if not has_tool_calls:
+                clean_response = self._strip_memory_handles(llm_response.strip())
+                return clean_response, tools_used, files_generated, last_raw_response, all_tool_results
+            
+            if self._tool_parser:
+                if self._tool_event_callback:
+                    await self._tool_event_callback("planning_start", "unknown", {})
+                
+                result = await self._tool_parser.parse_and_execute(llm_response, user_id, None)
+                parsed_response, iteration_tools, iteration_files = result
+                
+                if not iteration_tools:
+                    clean_response = self._strip_memory_handles(llm_response.strip())
+                    return clean_response, tools_used, files_generated, last_raw_response, all_tool_results
+                
+                tools_used.extend(iteration_tools)
+                files_generated.extend(iteration_files)
+                
+                tool_result = {
+                    "iteration": iteration,
+                    "tools_used": iteration_tools,
+                    "files_generated": iteration_files,
+                    "response_preview": parsed_response[:500],
+                }
+                all_tool_results.append(tool_result)
+                continue
+            else:
+                clean_response = self._strip_memory_handles(llm_response.strip())
+                return clean_response, tools_used, files_generated, last_raw_response, all_tool_results
         
-        # Strip memory handles from raw response too
-        clean_response = self._strip_memory_handles(llm_response.strip())
-        return clean_response, [], []
+        self._logger.log("⚠️ Max tool iterations reached", "yellow", "⏳")
+        final_response = self._strip_memory_handles(last_raw_response.strip())
+        return final_response, tools_used, files_generated, last_raw_response, all_tool_results
+    
+    def _format_tool_results_for_llm(self, tool_result: Dict[str, Any]) -> str:
+        lines = [
+            "",
+            "TOOL EXECUTION RESULTS:",
+            f"Tools: {', '.join(tool_result['tools_used'])}",
+        ]
+        
+        if tool_result.get('files_generated'):
+            lines.append(f"Files created: {len(tool_result['files_generated'])}")
+        
+        if tool_result.get('response_preview'):
+            lines.append(f"Result: {tool_result['response_preview']}")
+        
+        lines.append("Provide your response based on these results.")
+        
+        return "\n".join(lines)
     
     def _strip_memory_handles(self, text: str) -> str:
-        """Remove [[MEMORY:...]] references from response text."""
-        import re
-        # Pattern matches [[MEMORY:chunk_id|{metadata}]] or [[MEMORY:chunk_id]]
         pattern = r'\[\[MEMORY:[^\]]+\]\]'
         return re.sub(pattern, '', text).strip()
     
@@ -1051,12 +1136,11 @@ You are running on:
         user_id: str,
         context: Optional[Dict[str, Any]] = None,
     ) -> tuple[str, List[str], List[Dict[str, Any]]]:
-        """Try direct tool execution without LLM."""
-        self._logger.log("⚠️ No LLM client - attempting direct tool execution", "yellow", "🔧")
+        self._logger.log("⚠️ No LLM client - attempting direct execution", "yellow", "🔧")
         
         if not self._file_generator:
             return (
-                f"I received: '{message}'. However, I'm not connected to a language model backend.",
+                f"I'm not connected to a language model backend. Please check your configuration.",
                 [],
                 []
             )
@@ -1069,16 +1153,16 @@ You are running on:
             if self._file_generator.last_tool_result:
                 tools_used = [self._file_generator.last_tool_name or "unknown"]
                 files = self._file_generator.last_tool_result.files_to_send or []
+                
             return response, tools_used, files
         
         return (
-            f"I received: '{message}'. However, I'm not connected to a language model backend.",
+            f"I'm not connected to a language model backend.",
             [],
             []
         )
     
     async def _deliver_files(self, user_id: str, files: List[Dict[str, Any]]) -> None:
-        """Trigger file delivery callback if files were generated."""
         if not files or not self._file_delivery_callback:
             return
         
@@ -1094,22 +1178,17 @@ You are running on:
         response: str,
         files_to_send: List[Dict[str, Any]],
     ) -> str:
-        """Build final response with file information if needed."""
         if not files_to_send:
             return response
         
-        # Check if response already mentions files
         file_keywords = ["created", "saved", "generated", "built", "file"]
         has_file_mention = any(kw in response.lower() for kw in file_keywords)
         
         if has_file_mention:
             return response
         
-        # Add file mention
         file_names = [f.get("filename", "unnamed") for f in files_to_send]
         return f"{response}\n\n📁 I've created: {', '.join(file_names)}"
-    
-    # ========== Properties ==========
     
     @property
     def state(self) -> AgentState:
@@ -1126,10 +1205,7 @@ You are running on:
     
     @property
     def environment_info(self) -> Optional[EnvironmentInfo]:
-        """Get detected environment information."""
         return self._environment_info
-    
-    # ========== Skill Methods ==========
     
     async def list_available_skills(
         self,
@@ -1137,7 +1213,6 @@ You are running on:
         category: Optional[str] = None,
         search_query: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """List skills available to this user."""
         if not self._ensure_skills_initialized():
             return []
         
@@ -1145,7 +1220,6 @@ You are running on:
         if perms.level.value < PermissionLevel.SKILLS.value:
             return []
         
-        # Get skills
         if search_query:
             skills = self._skill_registry.search(search_query)
             skills = [s for s, _ in skills]
@@ -1154,13 +1228,11 @@ You are running on:
         else:
             skills = list(self._skill_registry._skills.values())
         
-        # Filter by permissions
         if perms.allowed_skills is not None:
             skills = [s for s in skills if s.name in perms.allowed_skills]
         skills = [s for s in skills if s.name not in perms.denied_skills]
         
-        # Format results
-        available_tools = set(self._tools.keys())
+        available_tools = set(self._tools.keys()) if hasattr(self, 'tools') else set()
         available_skills = set(self._skill_registry._skills.keys())
         
         return [
@@ -1183,7 +1255,6 @@ You are running on:
         inputs: Dict[str, Any],
         context: Optional[Dict[str, Any]] = None,
     ) -> SkillResult:
-        """Execute a skill with full permission checking."""
         if not self._ensure_skills_initialized():
             return SkillResult(
                 success=False, result=None, skill_name=skill_name, skill_version="unknown",
@@ -1192,7 +1263,6 @@ You are running on:
         
         perms = self._user_permissions.get(user_id, self._default_permissions)
         
-        # Permission checks
         self._logger.log(f"🔒 Checking permissions for skill '{skill_name}'", "yellow", "🛡️")
         
         if perms.level.value < PermissionLevel.SKILLS.value:
@@ -1204,11 +1274,9 @@ You are running on:
         if perms.allowed_skills is not None and skill_name not in perms.allowed_skills:
             return self._skill_permission_denied(skill_name, "not in allowlist")
         
-        # Notify start
         if self._skill_event_callback:
             await self._skill_event_callback("skill_start", skill_name, {"inputs": list(inputs.keys())})
         
-        # Execute
         self._logger.log(f"🎯 Executing skill '{skill_name}'...", "magenta", "📚")
         
         from datetime import datetime
@@ -1216,7 +1284,6 @@ You are running on:
         result = await self._skill_executor.execute(skill_name, inputs, context)
         duration = (datetime.now() - start).total_seconds()
         
-        # Build result
         skill_result = SkillResult(
             success=result.get("success", False),
             result=result.get("result"),
@@ -1230,10 +1297,8 @@ You are running on:
             error=result.get("error"),
         )
         
-        # Log completion
         self._logger.log_skill_execution(skill_name, skill_result.success)
         
-        # Store skill execution in RLM memory
         if self._initialized and self._memory:
             await self._memory.store_in_ems(
                 content=json.dumps({
@@ -1243,13 +1308,12 @@ You are running on:
                     "duration": skill_result.duration_seconds,
                 }),
                 chunk_type=MemoryChunkType.SKILL_EXECUTION,
-                importance=3.0 if skill_result.success else 5.0,  # Higher importance if failed (to avoid repeating)
+                importance=3.0 if skill_result.success else 5.0,
                 tags=["skill", skill_name, "execution"],
-                summary=f"Skill '{skill_name}' execution: {'success' if skill_result.success else 'failed'}",
-                source=f"skill_execution:{user_id}",
+                summary=f"Skill '{skill_name}': {'success' if skill_result.success else 'failed'}",
+                source=f"skill:{user_id}",
             )
         
-        # Notify completion
         if self._skill_event_callback:
             event_type = "skill_complete" if skill_result.success else "skill_error"
             await self._skill_event_callback(
@@ -1261,7 +1325,6 @@ You are running on:
         return skill_result
     
     def _skill_permission_denied(self, skill_name: str, reason: str) -> SkillResult:
-        """Build permission denied skill result."""
         self._logger.log(f"🚫 Skill '{skill_name}' {reason}", "red", "❌")
         return SkillResult(
             success=False,
@@ -1272,19 +1335,13 @@ You are running on:
             error=f"Permission denied: {reason}",
         )
     
-    # ========== Memory Maintenance ==========
-    
     async def run_memory_maintenance(self) -> Dict[str, Any]:
-        """Run RLM memory maintenance (forgetting curve, compression)."""
         if not self._initialized or not self._memory:
             return {"error": "Memory not initialized"}
         
         self._logger.log("🧠 Running RLM memory maintenance...", "cyan", "💓")
         
-        # Apply forgetting curve
         forgetting_result = await self._memory.apply_forgetting_curve()
-        
-        # Get updated stats
         stats = await self._memory.get_stats()
         
         self._logger.log(
@@ -1299,7 +1356,6 @@ You are running on:
         }
     
     async def close(self) -> None:
-        """Cleanup and close resources."""
         if self._memory:
             await self._memory.close()
             self._memory = None

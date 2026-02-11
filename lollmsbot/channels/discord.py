@@ -83,6 +83,107 @@ class DiscordChannel:
         
         # Register file delivery callback with agent
         self.agent.set_file_delivery_callback(self._deliver_files)
+        
+        # Register debug callback if in debug mode
+        self._setup_debug_callback()
+
+    def _setup_debug_callback(self) -> None:
+        """Setup debug callback for rich display if agent has debug mode enabled."""
+        try:
+            from rich.console import Console
+            from rich.panel import Panel
+            from rich.table import Table
+            from rich.json import JSON as RichJSON
+            from rich.syntax import Syntax
+            from rich import box
+            from rich.text import Text
+            
+            console = Console()
+            
+            def debug_handler(event_type: str, data: Dict[str, Any]) -> None:
+                """Handle debug events from agent with FULL output (no truncation)."""
+                if event_type == "memory_before":
+                    # Display memory state - NO max_width to prevent truncation
+                    table = Table(title="🔍 DEBUG: Memory State", show_lines=True)
+                    table.add_column("Property", style="cyan", no_wrap=True)
+                    table.add_column("Value", style="green", overflow="fold")
+                    for key, value in data.items():
+                        # Convert value to string, handle nested structures
+                        if isinstance(value, (dict, list)):
+                            val_str = str(value)
+                        else:
+                            val_str = str(value)
+                        table.add_row(key, val_str)
+                    console.print(table)
+                    
+                elif event_type == "llm_raw_response":
+                    # Display raw LLM response - NO word_wrap to show full content
+                    # Use Text with overflow="fold" instead of Syntax to avoid truncation
+                    full_response = data.get("raw_response", "")
+                    response_text = Text(full_response, overflow="fold", no_wrap=False)
+                    console.print(Panel(
+                        response_text,
+                        title="🔍 DEBUG: Raw LLM Response",
+                        border_style="blue",
+                        box=box.DOUBLE,
+                        expand=True
+                    ))
+                    
+                elif event_type == "llm_prompt":
+                    # Display prompt info - show FULL system prompt
+                    preview = data.get("system_prompt_preview", "")
+                    # Show complete prompt - NO TRUNCATION
+                    # Use a very large height or let it auto-expand
+                    prompt_text = Text(preview, overflow="fold", no_wrap=False)
+                    console.print(Panel(
+                        prompt_text,
+                        title=f"🔍 DEBUG: FULL System Prompt (len={data.get('prompt_length', 0)})",
+                        border_style="cyan",
+                        expand=True,
+                        height=None  # Allow full height
+                    ))
+                    
+                elif event_type == "response_complete":
+                    # Display completion info - NO max_width on any column
+                    table = Table(title="🔍 DEBUG: Response Complete", show_lines=True)
+                    table.add_column("Field", style="cyan", no_wrap=True)
+                    table.add_column("Value", style="green", overflow="fold")
+                    table.add_row("User ID", str(data.get("user_id", "unknown"))[:50])
+                    table.add_row("Success", str(data.get("success", False)))
+                    tools_used = data.get("tools_used", [])
+                    table.add_row("Tools Used", ", ".join(tools_used) if tools_used else "none")
+                    table.add_row("Skills Used", ", ".join(data.get("skills_used", [])) or "none")
+                    table.add_row("Files Count", str(data.get("files_count", 0)))
+                    # Show full response preview without truncation
+                    preview = data.get("response_preview", "")
+                    full_preview = preview
+                    table.add_row("Response Preview", full_preview)
+                    console.print(table)
+                    
+                elif event_type == "tool_execution":
+                    # NEW: Show tool execution details
+                    table = Table(title=f"🔍 DEBUG: Tool Execution - {data.get('tool_name', 'unknown')}", show_lines=True)
+                    table.add_column("Property", style="cyan", no_wrap=True)
+                    table.add_column("Value", style="green", overflow="fold")
+                    table.add_row("Tool Name", str(data.get("tool_name", "unknown")))
+                    table.add_row("Success", str(data.get("success", False)))
+                    table.add_row("Parameters", str(data.get("parameters", {})))
+                    if data.get("error"):
+                        table.add_row("Error", str(data.get("error")))
+                    if data.get("result"):
+                        result_str = str(data.get("result"))
+                        # Show full result without truncation
+                        display_result = result_str
+                        table.add_row("Result", display_result)
+                    console.print(table)
+            
+            # Only register if agent has dev_mode enabled
+            if getattr(self.agent, '_dev_mode', False):
+                self.agent.set_debug_callback(debug_handler)
+                logger.info("Debug callback registered for Discord channel")
+                
+        except ImportError:
+            pass  # Rich not available
 
     def _setup_handlers(self) -> None:
         """Set up Discord.py event handlers."""

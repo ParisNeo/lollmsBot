@@ -1,13 +1,15 @@
 #!/usr/bin/env python
 """
-lollmsBot Gateway - Central Agent Architecture with File Delivery
+lollmsBot Gateway - Central Agent Architecture with File Delivery and Debug Mode
 """
+import argparse
 import asyncio
 import json
 import os
 import secrets
 import hashlib
 import hmac
+import sys
 from typing import Any, Dict, List, Optional, Set
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -18,8 +20,14 @@ from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.tree import Tree
+from rich.json import JSON as RichJSON
+from rich.syntax import Syntax
+from rich import box
 
-from lollmsbot.config import BotConfig, LollmsSettings
+from lollmsbot.config import BotConfig, LollmsSettings, GatewaySettings
 from lollmsbot.agent import Agent, PermissionLevel
 # Import tools for registration
 from lollmsbot.tools.filesystem import FilesystemTool
@@ -29,6 +37,9 @@ from lollmsbot.tools.shell import ShellTool
 
 console = Console()
 app = FastAPI(title="lollmsBot API")
+
+# Global debug flag
+DEBUG_MODE = False
 
 # UI instance (optional)
 _ui_instance: Optional[Any] = None
@@ -203,6 +214,162 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ========== DEBUG DISPLAY FUNCTIONS ==========
+
+def _display_debug_memory(agent: Agent, user_id: str) -> None:
+    """Display rich debug information about agent memory state."""
+    if not DEBUG_MODE:
+        return
+    
+    console.print()
+    console.print(Panel(
+        "[bold yellow]🔍 DEBUG: Agent Memory State[/bold yellow]",
+        border_style="yellow",
+        box=box.DOUBLE
+    ))
+    
+    # RLM Memory Stats
+    if agent._memory:
+        try:
+            # Run async stats retrieval
+            import asyncio
+            stats = asyncio.get_event_loop().run_until_complete(agent._memory.get_stats())
+            
+            stats_table = Table(title="RLM Memory Statistics")
+            stats_table.add_column("Metric", style="cyan")
+            stats_table.add_column("Value", style="green")
+            
+            for key, value in stats.items():
+                stats_table.add_row(key, str(value))
+            
+            console.print(stats_table)
+            
+            # Show RCB entries
+            try:
+                rcb_entries = asyncio.get_event_loop().run_until_complete(agent._memory._db.get_rcb_entries(limit=10))
+                if rcb_entries:
+                    rcb_table = Table(title="REPL Context Buffer (RCB) - Working Memory")
+                    rcb_table.add_column("Order", style="dim")
+                    rcb_table.add_column("Type", style="cyan")
+                    rcb_table.add_column("Content Preview", style="green")
+                    rcb_table.add_column("Chunk ID", style="yellow")
+                    
+                    for entry in rcb_entries:
+                        content_preview = entry.get("content", "")[:50] + "..." if len(entry.get("content", "")) > 50 else entry.get("content", "")
+                        rcb_table.add_row(
+                            str(entry.get("display_order", "?")),
+                            entry.get("entry_type", "unknown"),
+                            content_preview,
+                            entry.get("chunk_id", "none")[:12] if entry.get("chunk_id") else "none"
+                        )
+                    
+                    console.print(rcb_table)
+            except Exception as e:
+                console.print(f"[dim]Could not retrieve RCB entries: {e}[/]")
+            
+            # Show anchor cache
+            if hasattr(agent, '_anchor_cache') and agent._anchor_cache:
+                anchor_table = Table(title="Memory Anchor Cache (Full Content Available)")
+                anchor_table.add_column("Chunk ID", style="cyan")
+                anchor_table.add_column("Content Length", style="green")
+                anchor_table.add_column("In RCB", style="yellow")
+                
+                for chunk_id, content in list(agent._anchor_cache.items())[:10]:
+                    in_rcb = "✅" if chunk_id in agent._loaded_anchors else "❌"
+                    anchor_table.add_row(chunk_id[:20], str(len(content)), in_rcb)
+                
+                console.print(anchor_table)
+                
+        except Exception as e:
+            console.print(f"[red]Error retrieving memory stats: {e}[/]")
+    
+    # Conversation History
+    if hasattr(agent, '_memory') and agent._memory:
+        try:
+            user_history = agent._memory.get_user_history(user_id)
+            if user_history:
+                history_table = Table(title=f"Conversation History for {user_id[:30]}...")
+                history_table.add_column("Turn", style="dim")
+                history_table.add_column("User Message", style="cyan", max_width=40)
+                history_table.add_column("Tools Used", style="yellow")
+                
+                for i, turn in enumerate(user_history[-5:], 1):
+                    msg_preview = turn.user_message[:40] + "..." if len(turn.user_message) > 40 else turn.user_message
+                    tools = ", ".join(turn.tools_used) if turn.tools_used else "none"
+                    history_table.add_row(str(i), msg_preview, tools)
+                
+                console.print(history_table)
+        except Exception as e:
+            console.print(f"[dim]Could not retrieve conversation history: {e}[/]")
+    
+    # Important Facts
+    if hasattr(agent, '_memory') and agent._memory:
+        try:
+            facts = agent._memory.get_important_facts()
+            if facts:
+                facts_panel = Panel(
+                    RichJSON.from_data(facts),
+                    title="Important Facts Stored",
+                    border_style="green"
+                )
+                console.print(facts_panel)
+        except Exception as e:
+            console.print(f"[dim]Could not retrieve important facts: {e}[/]")
+    
+    console.print(Panel(
+        "[dim]End of debug memory display[/dim]",
+        border_style="yellow"
+    ))
+    console.print()
+
+def _display_debug_response(result: Dict[str, Any], user_id: str, message: str) -> None:
+    """Display rich debug information about a chat response."""
+    if not DEBUG_MODE:
+        return
+    
+    console.print()
+    console.print(Panel(
+        f"[bold blue]🔍 DEBUG: Response Details for {user_id[:30]}...[/bold blue]",
+        border_style="blue",
+        box=box.DOUBLE
+    ))
+    
+    # Request info
+    req_table = Table(title="Request")
+    req_table.add_column("Field", style="cyan")
+    req_table.add_column("Value", style="green")
+    req_table.add_row("User ID", user_id[:50])
+    req_table.add_row("Message", message[:60] + "..." if len(message) > 60 else message)
+    console.print(req_table)
+    
+    # Response info
+    resp_table = Table(title="Response")
+    resp_table.add_column("Field", style="cyan")
+    resp_table.add_column("Value", style="green")
+    resp_table.add_row("Success", "✅ Yes" if result.get("success") else "❌ No")
+    resp_table.add_row("Response Length", str(len(result.get("response", ""))))
+    resp_table.add_row("Tools Used", ", ".join(result.get("tools_used", [])) or "none")
+    resp_table.add_row("Skills Used", ", ".join(result.get("skills_used", [])) or "none")
+    resp_table.add_row("Files Generated", str(len(result.get("files_to_send", []))))
+    if result.get("error"):
+        resp_table.add_row("Error", f"[red]{result.get('error')[:100]}[/]")
+    console.print(resp_table)
+    
+    # Raw response preview
+    if result.get("response"):
+        response_preview = result["response"][:500] + "..." if len(result["response"]) > 500 else result["response"]
+        console.print(Panel(
+            Syntax(response_preview, "markdown", theme="monokai", word_wrap=True),
+            title="Response Preview",
+            border_style="green"
+        ))
+    
+    console.print(Panel(
+        "[dim]End of debug response display[/dim]",
+        border_style="blue"
+    ))
+    console.print()
+
 # ========== ROUTES ==========
 
 @app.get("/")
@@ -232,7 +399,7 @@ async def root():
             "virtualenv": env.in_virtualenv,
         }
     
-    return {
+    response = {
         "api": f"http://{HOST}:{PORT}",
         "docs": "/docs",
         "health": "/health",
@@ -256,9 +423,19 @@ async def root():
             "file_delivery": True,
             "web_ui": _ui_enabled,
             "environment_awareness": True,
+            "debug_mode": DEBUG_MODE,
         },
         "environment": env_info,
     }
+    
+    # Add debug endpoints if in debug mode
+    if DEBUG_MODE:
+        response["debug_endpoints"] = {
+            "memory": "/debug/memory",
+            "stats": "/debug/stats",
+        }
+    
+    return response
 
 @app.get("/health", response_model=Health)
 async def health():
@@ -284,7 +461,7 @@ async def health():
         elif env.in_wsl:
             env_summary += " (WSL)"
     
-    return {
+    response = {
         "status": "ok",
         "url": f"http://{HOST}:{PORT}",
         "discord": discord_status,
@@ -303,20 +480,31 @@ async def health():
             "pending_files": pending_files,
             "file_delivery_enabled": True,
             "environment_awareness": True,
+            "debug_mode": DEBUG_MODE,
         },
         "environment": env_summary,
     }
+    
+    return response
 
 @app.post("/chat", response_model=ChatResp, dependencies=[Depends(require_auth)])
 async def chat(req: ChatReq):
     """Process a chat message through the Agent with file delivery support."""
     agent = await get_agent()
     
+    # Debug: Display memory before processing
+    if DEBUG_MODE:
+        _display_debug_memory(agent, req.user_id or "anonymous")
+    
     result = await agent.chat(
         user_id=req.user_id or "anonymous",
         message=req.message,
         context={"channel": "gateway_http", "source": "api"},
     )
+    
+    # Debug: Display response details
+    if DEBUG_MODE:
+        _display_debug_response(result, req.user_id or "anonymous", req.message)
     
     # Build file download info if files were generated
     file_downloads = []
@@ -371,6 +559,51 @@ async def set_permission(req: PermissionReq):
         "success": False,
         "error": "Admin permission management not yet implemented in this version",
     }
+
+# ========== DEBUG ENDPOINTS ==========
+
+if DEBUG_MODE:
+    @app.get("/debug/memory")
+    async def debug_memory():
+        """Debug endpoint to view agent memory state."""
+        agent = await get_agent()
+        
+        memory_data = {}
+        
+        if agent._memory:
+            try:
+                stats = await agent._memory.get_stats()
+                memory_data["rlm_stats"] = stats
+                
+                rcb_entries = await agent._memory._db.get_rcb_entries(limit=20)
+                memory_data["rcb_entries"] = rcb_entries
+                
+                self_knowledge = await agent._memory._db.get_self_knowledge()
+                memory_data["self_knowledge"] = self_knowledge
+                
+            except Exception as e:
+                memory_data["error"] = str(e)
+        
+        if hasattr(agent, '_anchor_cache'):
+            memory_data["anchor_cache"] = {
+                chunk_id: len(content) 
+                for chunk_id, content in agent._anchor_cache.items()
+            }
+        
+        return memory_data
+    
+    @app.get("/debug/stats")
+    async def debug_stats():
+        """Debug endpoint to view detailed system stats."""
+        agent = await get_agent()
+        
+        return {
+            "agent_state": agent.state.name,
+            "tools_registered": list(agent.tools.keys()),
+            "memory_initialized": agent._memory is not None,
+            "soul_initialized": agent._soul_initialized,
+            "lollms_client_initialized": agent._lollms_client_initialized,
+        }
 
 # ========== FILE DOWNLOAD ENDPOINTS ==========
 
@@ -445,6 +678,18 @@ async def lifespan(app_: FastAPI):
         if API_KEY:
             console.print(f"[bold green]🔐 API key authentication ENABLED[/]")
     
+    # Show debug mode status
+    if DEBUG_MODE:
+        console.print(Panel(
+            "[bold yellow]🐛 DEBUG MODE ENABLED[/bold yellow]\n\n"
+            "• Memory state will be displayed for each request\n"
+            "• Response details will be logged with rich formatting\n"
+            "• Debug endpoints available at /debug/*\n"
+            "• Performance impact: moderate",
+            border_style="yellow",
+            box=box.DOUBLE
+        ))
+    
     # Initialize shared Agent (this triggers async initialization with env detection)
     agent = await get_agent()
     lollms_client = get_lollms_client()
@@ -501,6 +746,9 @@ async def lifespan(app_: FastAPI):
     console.print(f"[green]🚀 Gateway starting on http://{HOST}:{PORT}[/]")
     console.print(f"[dim]  • Chat endpoint: POST /chat[/]")
     console.print(f"[dim]  • File downloads: GET /files/download/<file_id>[/]")
+    if DEBUG_MODE:
+        console.print(f"[dim]  • Debug memory: GET /debug/memory[/]")
+        console.print(f"[dim]  • Debug stats: GET /debug/stats[/]")
     
     # Auto-enable UI
     if os.getenv("LOLLMSBOT_ENABLE_UI", "").lower() in ("true", "1", "yes"):
@@ -624,6 +872,44 @@ async def lifespan(app_: FastAPI):
 
 app.router.lifespan_context = lifespan
 
-if __name__ == "__main__":
+def main():
+    """Main entry point with argument parsing."""
+    global DEBUG_MODE, HOST, PORT
+    
+    parser = argparse.ArgumentParser(
+        description="LollmsBot Gateway Server",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python -m lollmsbot.gateway              # Run normally
+  python -m lollmsbot.gateway --debug      # Run with debug output
+  python -m lollmsbot.gateway --host 0.0.0.0 --port 9000
+        """
+    )
+    parser.add_argument("--host", type=str, default=HOST, help=f"Host to bind to (default: {HOST})")
+    parser.add_argument("--port", type=int, default=PORT, help=f"Port to listen on (default: {PORT})")
+    parser.add_argument("--debug", action="store_true", help="Enable debug mode with rich memory display")
+    parser.add_argument("--ui", action="store_true", help="Enable web UI")
+    
+    args = parser.parse_args()
+    
+    # Apply arguments
+    HOST = args.host
+    PORT = args.port
+    DEBUG_MODE = args.debug
+    
+    if args.ui:
+        enable_ui()
+    
+    # Import and run uvicorn
     import uvicorn
-    uvicorn.run("lollmsbot.gateway:app", host=HOST, port=PORT)
+    uvicorn.run(
+        "lollmsbot.gateway:app",
+        host=HOST,
+        port=PORT,
+        reload=False,
+        log_level="debug" if DEBUG_MODE else "info"
+    )
+
+if __name__ == "__main__":
+    main()

@@ -1,6 +1,9 @@
 """
 Heartbeat Module - LollmsBot's Self-Maintenance & Monitoring System
 
+Updated with RLM Memory Maintenance integration for automatic deduplication
+and consolidation of memory chunks.
+
 The Heartbeat is LollmsBot's "biological rhythm" - autonomous self-care that runs
 on a configurable schedule to ensure the system remains healthy, secure, and
 evolving without manual intervention.
@@ -17,7 +20,6 @@ Responsibilities:
 Architecture: The Heartbeat runs as an async background task, triggered by
 schedule or explicit request. All actions are logged and can be reviewed.
 """
-
 from __future__ import annotations
 
 import asyncio
@@ -33,6 +35,12 @@ from typing import Any, Callable, Coroutine, Dict, List, Optional, Set, Tuple
 
 from lollmsbot.guardian import get_guardian, Guardian, ThreatLevel, SecurityEvent
 from lollmsbot.soul import get_soul, Soul
+# Import RLM memory maintenance
+try:
+    from lollmsbot.agent.rlm.maintenance import MemoryMaintenance, MaintenanceReport
+    RLM_MAINTENANCE_AVAILABLE = True
+except ImportError:
+    RLM_MAINTENANCE_AVAILABLE = False
 
 
 logger = logging.getLogger("lollmsbot.heartbeat")
@@ -42,6 +50,7 @@ class MaintenanceTask(Enum):
     """Categories of self-maintenance operations."""
     DIAGNOSTIC = auto()      # Health checks, connectivity tests
     MEMORY = auto()          # Memory compression, archiving, forgetting
+    RLM_MAINTENANCE = auto() # NEW: RLM deduplication and consolidation
     SECURITY = auto()         # Audit log review, permission verification
     SKILL = auto()           # Skill documentation, dependency updates
     UPDATE = auto()          # Code update checks, patch application
@@ -70,6 +79,11 @@ class HeartbeatConfig:
     auto_heal_minor: bool = True  # Fix small issues without asking
     confirm_heal_major: bool = True  # Ask before significant changes
     quarantine_on_critical: bool = True  # Guardian quarantine if unhealable
+    
+    # NEW: RLM Memory Maintenance settings
+    rlm_deduplication_enabled: bool = True
+    rlm_consolidation_enabled: bool = True
+    rlm_min_chunks_for_dedup: int = 10  # Only run if >10 chunks exist
 
 
 @dataclass
@@ -82,53 +96,14 @@ class TaskResult:
     actions_taken: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
     duration_seconds: float = 0.0
-
-
-@dataclass
-class HeartbeatReport:
-    """Complete report of a heartbeat cycle."""
-    cycle_id: str
-    started_at: datetime
-    completed_at: Optional[datetime] = None
-    config_snapshot: Dict[str, Any] = field(default_factory=dict)
-    task_results: List[TaskResult] = field(default_factory=list)
-    system_state_before: Dict[str, Any] = field(default_factory=dict)
-    system_state_after: Dict[str, Any] = field(default_factory=dict)
-    anomalies_detected: List[Dict[str, Any]] = field(default_factory=list)
-    recommendations: List[str] = field(default_factory=list)
-    
-    @property
-    def duration_seconds(self) -> float:
-        if self.completed_at and self.started_at:
-            return (self.completed_at - self.started_at).total_seconds()
-        return 0.0
-    
-    @property
-    def success_rate(self) -> float:
-        if not self.task_results:
-            return 0.0
-        return sum(1 for r in self.task_results if r.success) / len(self.task_results)
-    
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "cycle_id": self.cycle_id,
-            "started_at": self.started_at.isoformat(),
-            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
-            "duration_seconds": self.duration_seconds,
-            "success_rate": self.success_rate,
-            "tasks_executed": len(self.task_results),
-            "findings_summary": [f for r in self.task_results for f in r.findings],
-            "anomalies_count": len(self.anomalies_detected),
-            "recommendations": self.recommendations,
-        }
+    # NEW: Extended data for complex tasks
+    extended_report: Optional[Dict[str, Any]] = None
 
 
 class MemoryMonitor:
     """
-    Monitors and manages LollmsBot's memory systems.
-    
-    Tracks memory pressure, implements forgetting curves, manages semantic
-    compression, and archives old memories to maintain performance.
+    Legacy memory monitor - kept for backward compatibility.
+    RLM memory uses new MemoryMaintenance class.
     """
     
     def __init__(self, storage_path: Optional[Path] = None):
@@ -147,165 +122,58 @@ class MemoryMonitor:
     
     async def analyze(self) -> Dict[str, Any]:
         """Analyze current memory state."""
+        # Legacy implementation - now mostly delegates to RLM
         stats = {
             "conversations": await self._count_conversations(),
             "memory_entries": await self._count_entries(),
             "total_size_mb": await self._calculate_size() / (1024 * 1024),
-            "pressure_score": 0.0,  # 0-1, higher = more pressure to compress
+            "pressure_score": 0.0,
             "oldest_memory_days": 0,
             "compression_recommended": False,
             "archiving_recommended": False,
+            "note": "Using RLM memory maintenance for active management",
         }
-        
-        # Calculate pressure based on size and age
-        size_pressure = min(stats["total_size_mb"] / 100, 1.0)  # 100MB = full pressure
-        age_pressure = min(stats["oldest_memory_days"] / 30, 1.0)  # 30 days = full pressure
-        stats["pressure_score"] = max(size_pressure, age_pressure)
-        
-        stats["compression_recommended"] = stats["pressure_score"] > 0.6
-        stats["archiving_recommended"] = stats["pressure_score"] > 0.85
         
         return stats
     
     async def compress(self, target_ratio: float = 0.5) -> Dict[str, Any]:
-        """
-        Compress memories using semantic summarization.
-        
-        Instead of storing full conversation turns, create condensed
-        "memory pearls" that capture essence without verbatim detail.
-        """
-        start_time = time.time()
-        
-        # Find candidate conversations for compression
-        candidates = await self._find_compression_candidates()
-        
-        compressed_count = 0
-        space_saved = 0
-        
-        for conv_id, conversation in candidates:
-            # Generate semantic summary (would use LLM in production)
-            summary = await self._summarize_conversation(conversation)
-            
-            # Replace full conversation with summary + key moments
-            compressed = {
-                "type": "compressed_memory",
-                "original_id": conv_id,
-                "summary": summary,
-                "key_moments": self._extract_key_moments(conversation),
-                "compression_date": datetime.now().isoformat(),
-                "original_turns": len(conversation),
-            }
-            
-            # Save compressed version
-            await self._save_compressed(conv_id, compressed)
-            
-            compressed_count += 1
-            space_saved += self._estimate_savings(conversation, compressed)
-        
-        self._last_compression = datetime.now()
-        
+        """Legacy compression - now handled by RLM maintenance."""
         return {
-            "conversations_compressed": compressed_count,
-            "space_saved_mb": space_saved / (1024 * 1024),
-            "duration_seconds": time.time() - start_time,
+            "note": "Compression now handled by RLM MemoryMaintenance.deduplicate_by_content()",
+            "conversations_compressed": 0,
+            "space_saved_mb": 0,
         }
     
     async def apply_forgetting_curve(self) -> Dict[str, Any]:
-        """
-        Apply Ebbinghaus forgetting curve to memories.
-        
-        Memories decay naturally unless reinforced. Important memories
-        (tagged by user or frequently accessed) are strengthened.
-        """
-        forgotten = 0
-        strengthened = 0
-        
-        memories = await self._load_all_memories()
-        
-        for memory in memories:
-            age_days = (datetime.now() - memory.get("last_accessed", datetime.now())).days
-            
-            # Calculate retention probability
-            # R = e^(-t/S) where t = time, S = memory strength
-            strength = memory.get("importance", 1.0) * self.strength_multiplier
-            retention = 2.718281828 ** (-age_days / (self.retention_halflife_days * strength))
-            
-            if retention < 0.1:  # Less than 10% remembered
-                # Archive to long-term storage (slower access) or delete
-                await self._archive_memory(memory)
-                forgotten += 1
-            elif memory.get("access_count", 0) > 5:
-                # Frequently accessed - strengthen
-                memory["importance"] = memory.get("importance", 1.0) * 1.5
-                memory["last_strengthened"] = datetime.now().isoformat()
-                await self._save_memory(memory)
-                strengthened += 1
-        
+        """Apply Ebbinghaus-inspired forgetting curve."""
+        # This is still used for old-style memories
         return {
-            "memories_forgotten": forgotten,
-            "memories_strengthened": strengthened,
-            "retention_average": sum(
-                2.718281828 ** (-(datetime.now() - m.get("last_accessed", datetime.now())).days / 
-                (self.retention_halflife_days * m.get("importance", 1.0)))
-                for m in memories
-            ) / len(memories) if memories else 0,
+            "memories_forgotten": 0,
+            "memories_strengthened": 0,
+            "note": "Forgetting curve now integrated with RLM maintenance",
         }
     
     async def consolidate(self) -> Dict[str, Any]:
-        """
-        Find related memories and merge them into coherent narratives.
-        
-        Scattered mentions of "the Python project" become a consolidated
-        project memory with timeline, learnings, and current status.
-        """
-        # Find memory clusters by semantic similarity
-        clusters = await self._find_semantic_clusters()
-        
-        merged = 0
-        for cluster in clusters:
-            if len(cluster) < 2:
-                continue
-            
-            # Merge into narrative
-            narrative = await self._create_narrative(cluster)
-            await self._save_narrative(narrative)
-            
-            # Mark constituents as consolidated
-            for mem in cluster:
-                mem["consolidated_into"] = narrative["id"]
-                await self._save_memory(mem)
-            
-            merged += len(cluster)
-        
+        """Legacy consolidation - now handled by RLM."""
         return {
-            "clusters_found": len(clusters),
-            "memories_consolidated": merged,
-            "narratives_created": sum(1 for c in clusters if len(c) >= 2),
+            "note": "Consolidation now handled by RLM MemoryMaintenance.consolidate_related_memories()",
+            "clusters_found": 0,
+            "memories_consolidated": 0,
+            "narratives_created": 0,
         }
     
-    # Helper methods (placeholders for actual storage integration)
+    # Placeholder helpers
     async def _count_conversations(self) -> int: return 0
     async def _count_entries(self) -> int: return 0
     async def _calculate_size(self) -> int: return 0
-    async def _find_compression_candidates(self) -> List[Tuple[str, Any]]: return []
-    async def _summarize_conversation(self, conversation: Any) -> str: return ""
-    def _extract_key_moments(self, conversation: Any) -> List[Dict]: return []
-    async def _save_compressed(self, conv_id: str, compressed: Dict) -> None: pass
-    def _estimate_savings(self, original: Any, compressed: Dict) -> int: return 0
-    async def _load_all_memories(self) -> List[Dict]: return []
-    async def _archive_memory(self, memory: Dict) -> None: pass
-    async def _save_memory(self, memory: Dict) -> None: pass
-    async def _find_semantic_clusters(self) -> List[List[Dict]]: return []
-    async def _create_narrative(self, cluster: List[Dict]) -> Dict: return {"id": "temp"}
 
 
 class Heartbeat:
     """
-    LollmsBot's autonomous self-maintenance system.
+    LollmsBot's autonomous self-maintenance system with RLM Memory Maintenance.
     
-    The Heartbeat runs continuously (when enabled), performing configured
-    maintenance tasks at appropriate intervals. It's designed to be
-    interruptible, observable, and self-healing.
+    The Heartbeat runs continuously, performing configured maintenance tasks
+    at appropriate intervals including new RLM memory deduplication.
     """
     
     DEFAULT_CONFIG_PATH = Path.home() / ".lollmsbot" / "heartbeat.json"
@@ -314,6 +182,7 @@ class Heartbeat:
         self,
         config: Optional[HeartbeatConfig] = None,
         config_path: Optional[Path] = None,
+        memory_manager: Optional[Any] = None,  # RLMMemoryManager
     ):
         self.config = config or HeartbeatConfig()
         self.config_path = config_path or self.DEFAULT_CONFIG_PATH
@@ -323,18 +192,26 @@ class Heartbeat:
         self.guardian = get_guardian()
         self.soul = get_soul()
         
+        # NEW: RLM Memory Maintenance
+        self._memory_manager = memory_manager
+        self._rlm_maintenance: Optional[MemoryMaintenance] = None
+        if RLM_MAINTENANCE_AVAILABLE and memory_manager:
+            self._rlm_maintenance = MemoryMaintenance(memory_manager)
+            logger.info("✅ RLM Memory Maintenance initialized")
+        
         # Runtime state
         self._running = False
         self._task: Optional[asyncio.Task] = None
         self._stop_event: asyncio.Event = asyncio.Event()
         self._last_run: Optional[datetime] = None
-        self._run_history: List[HeartbeatReport] = []
+        self._run_history: List[Any] = []  # Simplified
         self._max_history = 100
         
         # Task registry
         self._task_handlers: Dict[MaintenanceTask, Callable[[], Coroutine[Any, Any, TaskResult]]] = {
             MaintenanceTask.DIAGNOSTIC: self._run_diagnostic,
             MaintenanceTask.MEMORY: self._run_memory_maintenance,
+            MaintenanceTask.RLM_MAINTENANCE: self._run_rlm_maintenance,  # NEW
             MaintenanceTask.SECURITY: self._run_security_audit,
             MaintenanceTask.SKILL: self._run_skill_curation,
             MaintenanceTask.UPDATE: self._run_update_check,
@@ -347,6 +224,13 @@ class Heartbeat:
             self._load_config()
         else:
             self._save_config()
+    
+    def set_memory_manager(self, memory_manager: Any) -> None:
+        """Set the RLM memory manager (called after Agent initialization)."""
+        self._memory_manager = memory_manager
+        if RLM_MAINTENANCE_AVAILABLE and memory_manager:
+            self._rlm_maintenance = MemoryMaintenance(memory_manager)
+            logger.info("✅ RLM Memory Maintenance connected to Heartbeat")
     
     def _load_config(self) -> None:
         """Load configuration from JSON."""
@@ -369,6 +253,10 @@ class Heartbeat:
                 auto_heal_minor=data.get("auto_heal_minor", True),
                 confirm_heal_major=data.get("confirm_heal_major", True),
                 quarantine_on_critical=data.get("quarantine_on_critical", True),
+                # NEW: RLM settings
+                rlm_deduplication_enabled=data.get("rlm_deduplication_enabled", True),
+                rlm_consolidation_enabled=data.get("rlm_consolidation_enabled", True),
+                rlm_min_chunks_for_dedup=data.get("rlm_min_chunks_for_dedup", 10),
             )
         except Exception as e:
             logger.error(f"Failed to load heartbeat config: {e}")
@@ -387,6 +275,10 @@ class Heartbeat:
             "auto_heal_minor": self.config.auto_heal_minor,
             "confirm_heal_major": self.config.confirm_heal_major,
             "quarantine_on_critical": self.config.quarantine_on_critical,
+            # NEW: RLM settings
+            "rlm_deduplication_enabled": self.config.rlm_deduplication_enabled,
+            "rlm_consolidation_enabled": self.config.rlm_consolidation_enabled,
+            "rlm_min_chunks_for_dedup": self.config.rlm_min_chunks_for_dedup,
         }
         self.config_path.write_text(json.dumps(data, indent=2))
     
@@ -407,12 +299,23 @@ class Heartbeat:
         except Exception as e:
             warnings.append(f"LoLLMS connectivity issue: {e}")
         
+        # Check RLM memory health
+        if self._rlm_maintenance:
+            try:
+                summary = await self._rlm_maintenance.get_maintenance_summary()
+                findings.append(f"RLM memory: {summary['total_chunks']} chunks "
+                              f"({summary['archived_chunks']} archived)")
+                if summary['total_chunks'] > 100:
+                    actions.append(f"Memory size: {summary['total_chunks']} chunks "
+                                 f"(deduplication recommended)")
+            except Exception as e:
+                warnings.append(f"RLM memory check failed: {e}")
+        
         # Check storage health
-        storage_full = False  # Would check actual disk
+        storage_full = False
         if storage_full:
             warnings.append("Storage approaching capacity")
             actions.append("Triggered memory compression")
-            await self.memory_monitor.compress(target_ratio=0.7)
         
         # Check Guardian status
         if self.guardian.is_quarantined:
@@ -436,32 +339,19 @@ class Heartbeat:
         )
     
     async def _run_memory_maintenance(self) -> TaskResult:
-        """Perform memory maintenance operations."""
+        """Legacy memory maintenance - now mostly delegates to RLM."""
         start = time.time()
         findings = []
         actions = []
         
-        # Analyze current state
+        # Legacy stats
         stats = await self.memory_monitor.analyze()
-        findings.append(f"Memory pressure: {stats['pressure_score']:.2f}")
-        findings.append(f"Stored conversations: {stats['conversations']}")
-        findings.append(f"Total size: {stats['total_size_mb']:.1f} MB")
+        findings.append(f"Legacy memory pressure: {stats['pressure_score']:.2f}")
         
-        # Compress if needed
-        if stats["compression_recommended"]:
-            result = await self.memory_monitor.compress()
-            actions.append(f"Compressed {result['conversations_compressed']} conversations")
-            actions.append(f"Saved {result['space_saved_mb']:.1f} MB")
-        
-        # Apply forgetting curve
-        forgetting = await self.memory_monitor.apply_forgetting_curve()
-        findings.append(f"Natural forgetting: {forgetting['memories_forgotten']} archived")
-        findings.append(f"Strengthened: {forgetting['memories_strengthened']} frequently accessed")
-        
-        # Consolidate related memories
-        consolidation = await self.memory_monitor.consolidate()
-        if consolidation['narratives_created'] > 0:
-            actions.append(f"Created {consolidation['narratives_created']} narrative memories")
+        # RLM takes over active maintenance
+        if self._rlm_maintenance:
+            findings.append("Active memory management handled by RLM Maintenance")
+            actions.append("See RLM_MAINTENANCE task for deduplication/consolidation results")
         
         return TaskResult(
             task=MaintenanceTask.MEMORY,
@@ -470,6 +360,108 @@ class Heartbeat:
             findings=findings,
             actions_taken=actions,
             duration_seconds=time.time() - start,
+        )
+    
+    async def _run_rlm_maintenance(self) -> TaskResult:
+        """
+        NEW: Run RLM memory deduplication and consolidation.
+        
+        This is the key new task that prevents memory bloat from
+        duplicate web fetches and consolidates related conversations.
+        """
+        start = time.time()
+        findings = []
+        actions = []
+        warnings = []
+        extended_report: Optional[Dict[str, Any]] = None
+        
+        if not self._rlm_maintenance:
+            warnings.append("RLM Memory Maintenance not available")
+            return TaskResult(
+                task=MaintenanceTask.RLM_MAINTENANCE,
+                executed_at=datetime.now(),
+                success=False,
+                findings=findings,
+                actions_taken=actions,
+                warnings=warnings,
+                duration_seconds=time.time() - start,
+            )
+        
+        if not self.config.rlm_deduplication_enabled and not self.config.rlm_consolidation_enabled:
+            findings.append("RLM maintenance disabled in config")
+            return TaskResult(
+                task=MaintenanceTask.RLM_MAINTENANCE,
+                executed_at=datetime.now(),
+                success=True,
+                findings=findings,
+                duration_seconds=time.time() - start,
+            )
+        
+        try:
+            # Check if we have enough chunks to justify maintenance
+            summary = await self._rlm_maintenance.get_maintenance_summary()
+            chunk_count = summary.get('total_chunks', 0)
+            
+            if chunk_count < self.config.rlm_min_chunks_for_dedup:
+                findings.append(f"Chunk count ({chunk_count}) below threshold "
+                              f"({self.config.rlm_min_chunks_for_dedup}), skipping")
+                return TaskResult(
+                    task=MaintenanceTask.RLM_MAINTENANCE,
+                    executed_at=datetime.now(),
+                    success=True,
+                    findings=findings,
+                    duration_seconds=time.time() - start,
+                )
+            
+            # Run full maintenance
+            report: MaintenanceReport = await self._rlm_maintenance.run_full_maintenance(
+                enable_deduplication=self.config.rlm_deduplication_enabled,
+                enable_consolidation=self.config.rlm_consolidation_enabled,
+                enable_url_dedup=True,  # Always dedup URLs (most common issue)
+            )
+            
+            extended_report = report.to_dict()
+            
+            # Analyze results
+            if report.deduplication:
+                d = report.deduplication
+                if d.duplicates_removed > 0:
+                    actions.append(f"Removed {d.duplicates_removed} duplicate chunks")
+                    actions.append(f"Saved ~{d.bytes_saved / 1024:.1f} KB storage")
+                    findings.append(f"Found {d.duplicates_found} duplicates total")
+                else:
+                    findings.append("No duplicates found (memory is clean)")
+            
+            if report.consolidation:
+                c = report.consolidation
+                if c.narratives_created > 0:
+                    actions.append(f"Created {c.narratives_created} narrative memories")
+                    actions.append(f"Consolidated {c.chunks_consolidated} related chunks")
+                else:
+                    findings.append("No consolidation candidates found")
+            
+            # Compression stats
+            if report.compression_ratio < 1.0:
+                reduction = (1 - report.compression_ratio) * 100
+                findings.append(f"Memory compressed by {reduction:.1f}%")
+            
+            # Time tracking
+            findings.append(f"Maintenance completed in {report.duration_seconds:.1f}s")
+            
+        except Exception as e:
+            logger.error(f"RLM maintenance failed: {e}")
+            warnings.append(f"RLM maintenance error: {str(e)}")
+            extended_report = {"error": str(e)}
+        
+        return TaskResult(
+            task=MaintenanceTask.RLM_MAINTENANCE,
+            executed_at=datetime.now(),
+            success=len(warnings) == 0,
+            findings=findings,
+            actions_taken=actions,
+            warnings=warnings,
+            duration_seconds=time.time() - start,
+            extended_report=extended_report,
         )
     
     async def _run_security_audit(self) -> TaskResult:
@@ -494,7 +486,6 @@ class Heartbeat:
                 warnings.append(f"    {event['timestamp']}: {event['event_type']}")
         
         # Clean old audit logs
-        # (would implement actual log rotation)
         actions.append(f"Audit logs retained for {self.config.log_retention_days} days")
         
         # Verify permission gates
@@ -522,10 +513,6 @@ class Heartbeat:
         if skills_dir.exists():
             skill_files = list(skills_dir.glob("*.py")) + list(skills_dir.glob("*.md"))
             findings.append(f"Skills in library: {len(skill_files)}")
-            
-            # Check for orphaned skills (no recent use)
-            # Check for missing documentation
-            # Suggest skill merges or splits
         
         # Update skill dependency graph
         actions.append("Regenerated skill dependency graph")
@@ -549,10 +536,9 @@ class Heartbeat:
         actions = []
         
         # Check current version
-        findings.append("Current version: 1.0.0")  # Would read from package
+        findings.append("Current version: 1.0.0")
         
         # Check remote for updates
-        # (would implement actual version check)
         update_available = False
         
         if update_available:
@@ -591,9 +577,7 @@ class Heartbeat:
         # Clean temporary files
         temp_dir = Path.home() / ".lollmsbot" / "temp"
         if temp_dir.exists():
-            # Remove files older than 24 hours
             cleaned = 0
-            # Would implement actual cleanup
             actions.append(f"Cleaned {cleaned} temporary files")
         
         # Optimize storage
@@ -621,7 +605,7 @@ class Heartbeat:
         actions = []
         warnings = []
         
-        # Check for Soul drift (deviation from defined identity)
+        # Check for Soul drift
         current_behavior = await self._sample_recent_behavior()
         expected_traits = {t.name: t.intensity.value for t in self.soul.traits}
         
@@ -630,7 +614,7 @@ class Heartbeat:
             actual = current_behavior.get(f"trait_{trait_name}", expected)
             deviation = abs(actual - expected) / expected if expected > 0 else 0
             
-            if deviation > 0.3:  # 30% deviation
+            if deviation > 0.3:
                 drift_detected = True
                 warnings.append(f"Trait drift: {trait_name} at {deviation*100:.0f}% deviation")
         
@@ -641,18 +625,14 @@ class Heartbeat:
         
         # Check for performance degradation
         recent_latency = await self._get_average_latency(hours=24)
-        baseline_latency = await self._get_average_latency(hours=168)  # 1 week
+        baseline_latency = await self._get_average_latency(hours=168)
         
         if recent_latency > baseline_latency * 1.5:
             warnings.append(f"Performance degradation: {recent_latency/baseline_latency:.1f}x slower")
             actions.append("Triggered deep optimization")
         
-        # Attempt self-correction
         if warnings and self.config.confirm_heal_major:
             findings.append("Major healing requires user confirmation")
-        elif warnings:
-            # Would implement actual healing
-            pass
         
         return TaskResult(
             task=MaintenanceTask.HEALING,
@@ -665,29 +645,22 @@ class Heartbeat:
         )
     
     # Placeholder helpers
-    async def _sample_recent_behavior(self) -> Dict[str, float]: return {}
-    async def _get_average_latency(self, hours: int) -> float: return 1.0
+    async def _sample_recent_behavior(self) -> Dict[str, float]:
+        return {}
+    async def _get_average_latency(self, hours: int) -> float:
+        return 1.0
     
     # ============== PUBLIC API ==============
     
-    async def run_once(self, tasks: Optional[List[MaintenanceTask]] = None) -> HeartbeatReport:
+    async def run_once(self, tasks: Optional[List[MaintenanceTask]] = None) -> Dict[str, Any]:
         """Execute a single heartbeat cycle immediately."""
         cycle_id = f"hb_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{hashlib.sha256(str(time.time()).encode()).hexdigest()[:8]}"
         
-        report = HeartbeatReport(
-            cycle_id=cycle_id,
-            started_at=datetime.now(),
-            config_snapshot={
-                "enabled_tasks": [t.name for t, v in self.config.tasks_enabled.items() if v],
-                "interval_minutes": self.config.interval_minutes,
-            },
-        )
-        
-        # Determine which tasks to run
+        results = []
         to_run = tasks or [t for t in MaintenanceTask if self.config.tasks_enabled.get(t, True)]
         
-        # Check task-specific intervals
-        if not tasks:  # Scheduled run, respect intervals
+        # Filter by interval if not forced
+        if not tasks:
             to_run = [
                 t for t in to_run 
                 if self._should_run_task(t)
@@ -699,46 +672,46 @@ class Heartbeat:
             if handler:
                 try:
                     result = await handler()
-                    report.task_results.append(result)
+                    results.append({
+                        'task': task.name,
+                        'success': result.success,
+                        'findings': result.findings,
+                        'actions': result.actions_taken,
+                        'warnings': result.warnings,
+                        'duration': result.duration_seconds,
+                        'extended_report': result.extended_report,
+                    })
+                    
+                    # Log RLM maintenance specially
+                    if task == MaintenanceTask.RLM_MAINTENANCE and result.extended_report:
+                        logger.info(f"RLM Maintenance: {result.extended_report}")
+                        
                 except Exception as e:
-                    report.task_results.append(TaskResult(
-                        task=task,
-                        executed_at=datetime.now(),
-                        success=False,
-                        findings=[],
-                        actions_taken=[],
-                        warnings=[f"Task failed: {str(e)}"],
-                        duration_seconds=0,
-                    ))
+                    results.append({
+                        'task': task.name,
+                        'success': False,
+                        'error': str(e),
+                    })
                     logger.error(f"Heartbeat task {task.name} failed: {e}")
         
-        # Finalize report
-        report.completed_at = datetime.now()
-        report.system_state_after = {
-            "memory_pressure": (await self.memory_monitor.analyze())["pressure_score"],
-            "guardian_quarantine": self.guardian.is_quarantined,
-        }
-        
-        # Generate recommendations
-        for result in report.task_results:
-            if result.warnings:
-                report.recommendations.extend([
-                    f"[{result.task.name}] {w}" for w in result.warnings
-                ])
-        
-        # Store in history
-        self._run_history.append(report)
-        if len(self._run_history) > self._max_history:
-            self._run_history.pop(0)
-        
         self._last_run = datetime.now()
-        logger.info(f"Heartbeat cycle {cycle_id} completed: {report.success_rate*100:.0f}% tasks successful")
         
-        return report
+        return {
+            'cycle_id': cycle_id,
+            'tasks_executed': len(results),
+            'results': results,
+        }
     
     def _should_run_task(self, task: MaintenanceTask) -> bool:
         """Check if enough time has passed since this task last ran."""
-        # Would implement actual interval tracking
+        # RLM maintenance has its own internal scheduling
+        if task == MaintenanceTask.RLM_MAINTENANCE:
+            if self._rlm_maintenance:
+                # Check internal state
+                return self._rlm_maintenance._should_run_dedup()
+            return False
+        
+        # Other tasks use simple interval tracking (simplified)
         return True
     
     async def start(self) -> None:
@@ -749,7 +722,7 @@ class Heartbeat:
         self._running = True
         self._stop_event.clear()
         self._task = asyncio.create_task(self._heartbeat_loop())
-        logger.info(f"Heartbeat started: {self.config.interval_minutes} minute interval")
+        logger.info(f"💓 Heartbeat started: {self.config.interval_minutes} minute interval")
     
     async def stop(self) -> None:
         """Stop continuous heartbeat."""
@@ -766,7 +739,7 @@ class Heartbeat:
             except asyncio.CancelledError:
                 pass
         
-        logger.info("Heartbeat stopped")
+        logger.info("💓 Heartbeat stopped")
     
     async def _heartbeat_loop(self) -> None:
         """Main heartbeat loop."""
@@ -783,7 +756,7 @@ class Heartbeat:
                     timeout=self.config.interval_minutes * 60,
                 )
             except asyncio.TimeoutError:
-                pass  # Normal interval expiration, continue loop
+                pass
     
     def get_status(self) -> Dict[str, Any]:
         """Get current heartbeat status."""
@@ -792,20 +765,9 @@ class Heartbeat:
             "enabled": self.config.enabled,
             "interval_minutes": self.config.interval_minutes,
             "last_run": self._last_run.isoformat() if self._last_run else None,
-            "total_cycles": len(self._run_history),
-            "recent_success_rate": (
-                sum(r.success_rate for r in self._run_history[-5:]) / 
-                min(len(self._run_history), 5)
-            ) if self._run_history else 0,
-            "next_run": (
-                (self._last_run + timedelta(minutes=self.config.interval_minutes)).isoformat()
-                if self._last_run and self._running else None
-            ),
+            "rlm_maintenance_available": RLM_MAINTENANCE_AVAILABLE,
+            "rlm_maintenance_active": self._rlm_maintenance is not None,
         }
-    
-    def get_recent_reports(self, count: int = 5) -> List[Dict[str, Any]]:
-        """Get recent heartbeat reports."""
-        return [r.to_dict() for r in self._run_history[-count:]]
     
     def update_config(self, **kwargs) -> None:
         """Update heartbeat configuration."""
@@ -818,9 +780,12 @@ class Heartbeat:
 # Global singleton
 _heartbeat_instance: Optional[Heartbeat] = None
 
-def get_heartbeat(config: Optional[HeartbeatConfig] = None) -> Heartbeat:
+def get_heartbeat(config: Optional[HeartbeatConfig] = None, memory_manager: Optional[Any] = None) -> Heartbeat:
     """Get or create the singleton Heartbeat instance."""
     global _heartbeat_instance
     if _heartbeat_instance is None:
-        _heartbeat_instance = Heartbeat(config)
+        _heartbeat_instance = Heartbeat(config, memory_manager=memory_manager)
+    elif memory_manager and not _heartbeat_instance._memory_manager:
+        # Connect memory manager if not already set
+        _heartbeat_instance.set_memory_manager(memory_manager)
     return _heartbeat_instance

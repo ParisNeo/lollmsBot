@@ -4,9 +4,7 @@ Tool execution, parsing, and file generation utilities.
 Handles parsing LLM responses to extract and execute tool calls,
 and generating HTML games/apps for direct execution.
 
-CRITICAL: HTTP tool now returns memory handles via RLM. The LLM must
-reference these handles to access content. This is not a bug - it's
-the RLM architecture working as designed.
+CRITICAL: Uses ONLY XML format. Markdown JSON format is REJECTED.
 """
 
 from __future__ import annotations
@@ -22,25 +20,41 @@ if TYPE_CHECKING:
 class ToolParser:
     """Parses LLM responses to extract and execute tool calls.
     
-    IMPORTANT: For HTTP tool, the result is a MEMORY HANDLE, not raw content.
-    The LLM must use the handle [[MEMORY:chunk_id]] to access content via RLM.
-    This is the intended RLM architecture.
+    ONLY accepts XML format with <tool>, <method>, <url>, <query> tags.
+    Markdown JSON format is REJECTED with a warning to enforce correct format.
     """
     
-    # Pattern for native [[TOOL:...]] format
+    # Pattern for XML tool calls - ONLY valid format
+    XML_TOOL_PATTERN = r'<tool>([^<]+)</tool>'
+    XML_METHOD_PATTERN = r'<method>([^<]+)</method>'
+    XML_URL_PATTERN = r'<url>([^<]+)</url>'
+    XML_QUERY_PATTERN = r'<query>(.*?)</query>'
+    XML_OPERATION_PATTERN = r'<operation>([^<]+)</operation>'
+    XML_PATH_PATTERN = r'<path>([^<]+)</path>'
+    XML_FILENAME_PATTERN = r'<filename>([^<]+)</filename>'
+    XML_HTML_CONTENT_PATTERN = r'<html_content>(.*?)</html_content>'
+    XML_TITLE_PATTERN = r'<title>([^<]+)</title>'
+    XML_START_PATTERN = r'<start>([^<]+)</start>'
+    XML_END_PATTERN = r'<end>([^<]+)</end>'
+    XML_DESCRIPTION_PATTERN = r'<description>([^<]+)</description>'
+    XML_DATA_PATTERN = r'<data>(.*?)</data>'
+    XML_HEADERS_PATTERN = r'<headers>(.*?)</headers>'
+    XML_PARAMS_PATTERN = r'<params>(.*?)</params>'
+    
+    # Pattern to DETECT JSON markdown format (for rejection/warning)
+    JSON_TOOL_PATTERN = r'```(?:json)?\s*(\{[\s\S]*?\})\s*```'
+    
+    # Pattern to detect JSON inside XML (malformed)
+    JSON_IN_XML_PATTERN = r'<tool>\s*(\{[^}]+\})\s*</tool>'
+    
+    # Old native format (also rejected)
     NATIVE_PATTERN = r'\[\[TOOL:(\w+)\|(\{.*?\})\]\]'
-    
-    # Pattern for XML-style function calls
-    XML_PATTERN = r'<function_calls>\s*<invoke\s+name="([^"]+)">\s*(?:<parameter[^>]*>)?\s*<!\[CDATA\[(.*?)\]\]>\s*(?:</parameter>)?\s*</invoke>\s*</function_calls>'
-    
-    # Alternative XML without CDATA
-    XML_PATTERN_ALT = r'<function_calls>\s*<invoke\s+name="([^"]+)">(.*?)</invoke>\s*</function_calls>'
-    
-    # Code block containing XML
-    CODE_BLOCK_PATTERN = r'```(?:xml|json)?\s*(<function_calls>.*?</function_calls>)```'
     
     def __init__(self, tools: Dict[str, Tool]) -> None:
         self.tools = tools
+        self._json_warnings: List[str] = []  # Track JSON attempts for feedback
+        self._last_tool_result: Optional["ToolResult"] = None  # Store last result for debug
+        self._last_tool_name: Optional[str] = None  # Store last tool name for debug
     
     async def parse_and_execute(
         self,
@@ -51,8 +65,8 @@ class ToolParser:
         """
         Parse LLM response and execute any embedded tool calls.
         
-        For HTTP tool: The result includes a memory handle. The LLM should
-        reference this handle to access content. We add a note explaining this.
+        ONLY accepts XML format with proper tag structure.
+        Markdown JSON format is rejected with warning to enforce schema compliance.
         
         Returns:
             Tuple of (cleaned_response, tools_used, files_generated)
@@ -60,10 +74,22 @@ class ToolParser:
         tools_used: List[str] = []
         files_generated: List[Dict[str, Any]] = []
         
-        # Find all tool calls
-        all_matches = self._find_tool_calls(llm_response)
+        # First: Check for JSON format attempts and inject warnings
+        json_warnings = self._detect_json_attempts(llm_response)
         
-        if not all_matches:
+        # Check for JSON inside XML (malformed but common LLM error)
+        json_in_xml = self._detect_json_in_xml(llm_response)
+        
+        # Find XML tool calls (only valid format)
+        xml_matches = self._find_xml_tool_calls(llm_response)
+        
+        # Also check for old [[TOOL:...]] format
+        native_matches = self._find_native_tool_calls(llm_response)
+        
+        # Combine all matches, sorted by position
+        all_matches = sorted(xml_matches + native_matches, key=lambda x: x[0])
+        
+        if not all_matches and not json_warnings and not json_in_xml:
             # No tool calls found, return response as-is
             return llm_response.strip(), tools_used, files_generated
         
@@ -71,189 +97,320 @@ class ToolParser:
         response_parts = []
         last_end = 0
         
-        for start, end, format_type, tool_name, content in all_matches:
+        for start, end, format_type, tool_data in all_matches:
             # Add text before this tool call
             response_parts.append(llm_response[last_end:start])
             
-            # Parse parameters based on format
-            tool_params = self._parse_parameters(format_type, content)
+            # Handle native format (convert to tool call but warn)
+            if format_type == 'native':
+                tool_name = tool_data.get("tool", "").lower()
+                # Add warning about deprecated format
+                response_parts.append(
+                    "\n\n**⚠️ WARNING: Using deprecated [[TOOL:...]] format. "
+                    "Use XML format instead.**\n\n"
+                )
             
-            # Validate tool exists
+            # Extract tool name - STRICT VALIDATION
+            tool_name = tool_data.get("tool", "").lower().strip()
+            
+            # CRITICAL: Reject if tool name contains JSON artifacts or is malformed
+            if not tool_name or '{' in tool_name or '"' in tool_name or ':' in tool_name:
+                # This is a malformed tool call - reject it entirely
+                response_parts.append(
+                    "\n\n**❌ MALFORMED TOOL CALL REJECTED**\n\n"
+                    f"The tool call contained invalid characters in the tool name: '{tool_name[:50]}...'\n"
+                    "Tool names must be simple strings like 'http', 'filesystem', 'calendar'.\n"
+                    "Do NOT put JSON inside XML tags.\n\n"
+                    "**Correct format:**\n"
+                    "```xml\n<tool>http</tool>\n<method>get</method>\n<url>https://example.com</url>\n```\n\n"
+                )
+                last_end = end
+                continue
+            
+            if not tool_name:
+                last_end = end
+                continue
+            
+            # Check if tool exists
             if tool_name not in self.tools:
-                if tool_name in ("toolname", "tool"):
-                    last_end = end
-                    continue
+                response_parts.append(
+                    f"\n\n**⚠️ Unknown tool '{tool_name}'. "
+                    f"Available: {', '.join(self.tools.keys())}**\n\n"
+                )
                 last_end = end
                 continue
             
             # Execute the tool
             tool = self.tools[tool_name]
-            result = await self._execute_tool(tool, tool_name, tool_params)
+            result = await tool.execute(**tool_data)
+            
+            # Store for debug
+            self._last_tool_result = result
+            self._last_tool_name = tool_name
             
             if result.success:
                 tools_used.append(tool_name)
                 if result.files_to_send:
                     files_generated.extend(result.files_to_send)
                 
-                # HTTP TOOL: Result is a memory handle via RLM
-                if tool_name == "http" and result.output:
-                    # The HTTP tool returns a dict with memory_handle, chunk_id, etc.
-                    if isinstance(result.output, dict) and "memory_handle" in result.output:
-                        handle = result.output.get("memory_handle", "[[MEMORY:unknown]]")
-                        summary = result.output.get("summary", "Web content")
-                        url = result.output.get("url", "unknown URL")
-                        
-                        # Inform the LLM about the memory handle
-                        # The content is now in RLM and accessible via this handle
-                        response_parts.append(
-                            f"\n\n[HTTP FETCH COMPLETE - Content stored in RLM memory]\n"
-                            f"URL: {url}\n"
-                            f"Memory handle: {handle}\n"
-                            f"Summary: {summary[:100]}...\n"
-                            f"To access this content, reference the memory handle in your reasoning.\n"
-                        )
-                    else:
-                        # Fallback for old format
-                        response_parts.append(f"\n\n[HTTP request completed]\n")
+                # Simple indicator - no details
+                response_parts.append("\n\n**🔧 called tool**\n\n")
                 
-                # For other tools with structured output, add summary
-                elif tool_name != "http":
-                    output_preview = self._format_tool_output_preview(result.output, tool_name)
-                    if output_preview:
-                        response_parts.append(f"\n\n[{tool_name.upper()} RESULT]:\n{output_preview}\n\n")
+                # For HTTP with RLM memory handle, silent (no user-facing info)
+                if tool_name == "http" and isinstance(result.output, dict):
+                    if "memory_handle" in result.output:
+                        pass  # RLM handles this internally
             
             else:
-                # Tool failed - include error for context
-                error_msg = result.error or "Unknown error"
-                response_parts.append(f"\n\n[{tool_name.upper()} ERROR: {error_msg}]\n\n")
+                # Tool failed - minimal error
+                response_parts.append("\n\n**⚠️ tool error**\n\n")
             
             last_end = end
         
         # Add remaining text
         response_parts.append(llm_response[last_end:])
         
+        # Add JSON warnings at the start if any were detected
+        warning_text = ""
+        if json_warnings:
+            warning_text += (
+                "\n\n**⚠️ JSON FORMAT REJECTED**\n\n"
+                "You attempted to use JSON markdown format.\n"
+                "This format is NOT SUPPORTED.\n\n"
+            )
+        
+        if json_in_xml:
+            warning_text += (
+                "\n\n**⚠️ MALFORMED XML DETECTED - JSON INSIDE XML TAGS**\n\n"
+                "You put JSON content inside XML tags like <tool>{...}</tool>.\n"
+                "This is WRONG. XML tags must contain PLAIN TEXT values only.\n\n"
+            )
+        
+        if warning_text:
+            warning_text += (
+                "**Use ONLY this format:**\n"
+                "```xml\n"
+                "<tool>http</tool>\n"
+                "<method>get</method>\n"
+                "<url>https://example.com</url>\n"
+                "```\n\n"
+                "**NOT this:**\n"
+                "```xml\n"
+                '<tool>{"tool_type": "http", ...}</tool>  ❌ WRONG - JSON inside XML\n'
+                "```\n\n"
+                "**Key rules:**\n"
+                "1. <tool>http</tool> - just the tool name, NO JSON, NO braces\n"
+                "2. <method>get</method> - just the method name\n"
+                "3. <url>https://...</url> - just the URL string\n"
+                "4. NO curly braces {} inside any XML tag\n"
+                "5. NO double quotes around values inside XML tags\n\n"
+                "Please retry with correct XML format.\n\n"
+            )
+            response_parts.insert(0, warning_text)
+        
         # Clean up the response
         final_response = self._clean_response("".join(response_parts))
         
         return final_response, tools_used, files_generated
     
-    def _format_tool_output_preview(self, output: Any, tool_name: str) -> str:
-        """Create a readable preview of tool output for inclusion in response."""
-        if output is None:
-            return ""
+    def _detect_json_attempts(self, text: str) -> List[Dict[str, Any]]:
+        """Detect JSON format attempts for rejection."""
+        warnings = []
         
-        # Handle dict outputs
-        if isinstance(output, dict):
-            # If there's a 'content' key, use that
-            if "content" in output:
-                content = output["content"]
-                if isinstance(content, str):
-                    if len(content) > 2000:
-                        return content[:2000] + f"\n... [truncated, total: {len(content)} chars]"
-                    return content
-                else:
-                    return json.dumps(content, indent=2, ensure_ascii=False, default=str)
-            
-            # Format the whole dict nicely
-            return json.dumps(output, indent=2, ensure_ascii=False, default=str)
+        # Check for ```json blocks
+        for match in re.finditer(self.JSON_TOOL_PATTERN, text, re.DOTALL):
+            warnings.append({
+                "type": "json_block",
+                "position": match.start(),
+                "content": match.group(0)[:100]
+            })
         
-        # Handle string outputs
-        if isinstance(output, str):
-            if len(output) > 2000:
-                return output[:2000] + f"\n... [truncated, total: {len(output)} chars]"
-            return output
-        
-        # Default
-        return str(output)
+        return warnings
     
-    def _find_tool_calls(self, text: str) -> List[Tuple[int, int, str, str, str]]:
-        """Find all tool calls in text with positions."""
+    def _detect_json_in_xml(self, text: str) -> List[Dict[str, Any]]:
+        """Detect JSON content inside XML tags (malformed)."""
+        warnings = []
+        
+        # Check for { inside <tool> tags
+        for match in re.finditer(self.JSON_IN_XML_PATTERN, text, re.DOTALL):
+            warnings.append({
+                "type": "json_in_xml",
+                "position": match.start(),
+                "content": match.group(0)[:100]
+            })
+        
+        # Also check for any { inside other common XML tags
+        json_in_tags = [
+            (r'<method>\s*\{', 'method'),
+            (r'<url>\s*\{', 'url'),
+            (r'<operation>\s*\{', 'operation'),
+        ]
+        for pattern, tag_name in json_in_tags:
+            for match in re.finditer(pattern, text, re.DOTALL):
+                warnings.append({
+                    "type": f"json_in_{tag_name}",
+                    "position": match.start(),
+                    "content": f"JSON inside <{tag_name}> tag"
+                })
+        
+        return warnings
+    
+    def _find_xml_tool_calls(self, text: str) -> List[Tuple[int, int, str, Dict[str, Any]]]:
+        """Find XML tool calls in the response."""
         matches = []
         
-        # Native format
-        for match in re.finditer(self.NATIVE_PATTERN, text, re.DOTALL):
-            matches.append((
-                match.start(), match.end(), 'native',
-                match.group(1).lower(), match.group(2)
-            ))
+        # Find all <tool> tags
+        for tool_match in re.finditer(self.XML_TOOL_PATTERN, text, re.IGNORECASE):
+            tool_content = tool_match.group(1).strip()
+            start_pos = tool_match.start()
+            end_pos = tool_match.end()
+            
+            # CRITICAL: Reject if tool content contains JSON markers
+            if '{' in tool_content or '}' in tool_content or '"tool_type"' in tool_content or '"tool_input"' in tool_content:
+                # This is a malformed JSON-in-XML call - mark it but don't try to parse
+                # It will be rejected later when we validate the tool name
+                pass  # Let it through to be rejected by tool name validation
+            
+            # Look for related tags after this tool tag
+            remaining_text = text[end_pos:]
+            
+            # Clean up the tool name - remove any JSON artifacts
+            tool_name = tool_content.lower()
+            # Remove any JSON-like artifacts
+            tool_name = re.sub(r'[{}"]', '', tool_name)
+            tool_name = re.sub(r'tool_type\s*:', '', tool_name)
+            tool_name = re.sub(r'tool_input\s*:', '', tool_name)
+            tool_name = tool_name.strip()
+            
+            # Additional cleanup: remove any remaining non-word characters
+            tool_name = re.sub(r'[^\w]', '', tool_name)
+            
+            tool_data = {"tool": tool_name}
+            
+            # Find <method> if present
+            method_match = re.search(self.XML_METHOD_PATTERN, remaining_text, re.IGNORECASE)
+            if method_match:
+                method_value = method_match.group(1).strip()
+                # Clean up method value - remove JSON artifacts
+                method_value = re.sub(r'[{}"]', '', method_value)
+                tool_data["method"] = method_value.lower()
+                end_pos = max(end_pos, tool_match.end() + method_match.end())
+            
+            # Find <url> if present
+            url_match = re.search(self.XML_URL_PATTERN, remaining_text, re.IGNORECASE)
+            if url_match:
+                url_value = url_match.group(1).strip()
+                # Clean up URL - remove JSON artifacts and quotes
+                url_value = re.sub(r'^[\'"]', '', url_value)
+                url_value = re.sub(r'[\'"]$', '', url_value)
+                tool_data["url"] = url_value
+                end_pos = max(end_pos, tool_match.end() + url_match.end())
+            
+            # Find <query> if present
+            query_match = re.search(self.XML_QUERY_PATTERN, remaining_text, re.DOTALL | re.IGNORECASE)
+            if query_match:
+                tool_data["query"] = query_match.group(1)
+                end_pos = max(end_pos, tool_match.end() + query_match.end())
+            
+            # Find <operation> if present
+            operation_match = re.search(self.XML_OPERATION_PATTERN, remaining_text, re.IGNORECASE)
+            if operation_match:
+                tool_data["operation"] = operation_match.group(1).strip().lower()
+                end_pos = max(end_pos, tool_match.end() + operation_match.end())
+            
+            # Find <path> if present
+            path_match = re.search(self.XML_PATH_PATTERN, remaining_text, re.IGNORECASE)
+            if path_match:
+                tool_data["path"] = path_match.group(1).strip()
+                end_pos = max(end_pos, tool_match.end() + path_match.end())
+            
+            # Find <filename> if present
+            filename_match = re.search(self.XML_FILENAME_PATTERN, remaining_text, re.IGNORECASE)
+            if filename_match:
+                tool_data["filename"] = filename_match.group(1).strip()
+                end_pos = max(end_pos, tool_match.end() + filename_match.end())
+            
+            # Find <html_content> if present
+            html_content_match = re.search(self.XML_HTML_CONTENT_PATTERN, remaining_text, re.DOTALL | re.IGNORECASE)
+            if html_content_match:
+                tool_data["html_content"] = html_content_match.group(1)
+                end_pos = max(end_pos, tool_match.end() + html_content_match.end())
+            
+            # Find <title> if present
+            title_match = re.search(self.XML_TITLE_PATTERN, remaining_text, re.IGNORECASE)
+            if title_match:
+                tool_data["title"] = title_match.group(1).strip()
+                end_pos = max(end_pos, tool_match.end() + title_match.end())
+            
+            # Find <start> if present
+            start_match = re.search(self.XML_START_PATTERN, remaining_text, re.IGNORECASE)
+            if start_match:
+                tool_data["start"] = start_match.group(1).strip()
+                end_pos = max(end_pos, tool_match.end() + start_match.end())
+            
+            # Find <end> if present
+            end_match = re.search(self.XML_END_PATTERN, remaining_text, re.IGNORECASE)
+            if end_match:
+                tool_data["end"] = end_match.group(1).strip()
+                end_pos = max(end_pos, tool_match.end() + end_match.end())
+            
+            # Find <description> if present
+            description_match = re.search(self.XML_DESCRIPTION_PATTERN, remaining_text, re.IGNORECASE)
+            if description_match:
+                tool_data["description"] = description_match.group(1).strip()
+                end_pos = max(end_pos, tool_match.end() + description_match.end())
+            
+            # Find <data> if present
+            data_match = re.search(self.XML_DATA_PATTERN, remaining_text, re.DOTALL | re.IGNORECASE)
+            if data_match:
+                tool_data["data"] = data_match.group(1)
+                end_pos = max(end_pos, tool_match.end() + data_match.end())
+            
+            # Calculate overall end position - include all related tags
+            # Find the furthest tag end
+            furthest_end = tool_match.end()
+            for tag_pattern in [
+                self.XML_METHOD_PATTERN, self.XML_URL_PATTERN, self.XML_QUERY_PATTERN,
+                self.XML_OPERATION_PATTERN, self.XML_PATH_PATTERN, self.XML_FILENAME_PATTERN,
+                self.XML_HTML_CONTENT_PATTERN, self.XML_TITLE_PATTERN, self.XML_START_PATTERN,
+                self.XML_END_PATTERN, self.XML_DESCRIPTION_PATTERN, self.XML_DATA_PATTERN,
+                self.XML_HEADERS_PATTERN, self.XML_PARAMS_PATTERN,
+            ]:
+                tag_match = re.search(tag_pattern, remaining_text, re.DOTALL | re.IGNORECASE)
+                if tag_match:
+                    furthest_end = max(furthest_end, tool_match.end() + tag_match.end())
+            
+            matches.append((start_pos, furthest_end, 'xml', tool_data))
         
-        # XML format
-        for match in re.finditer(self.XML_PATTERN, text, re.DOTALL | re.IGNORECASE):
-            matches.append((
-                match.start(), match.end(), 'xml',
-                match.group(1).lower(), match.group(2)
-            ))
-        
-        # Alternative XML
-        for match in re.finditer(self.XML_PATTERN_ALT, text, re.DOTALL | re.IGNORECASE):
-            if not any(m[0] == match.start() for m in matches):
-                matches.append((
-                    match.start(), match.end(), 'xml',
-                    match.group(1).lower(), match.group(2)
-                ))
-        
-        # Code blocks
-        for block_match in re.finditer(self.CODE_BLOCK_PATTERN, text, re.DOTALL | re.IGNORECASE):
-            inner = block_match.group(1)
-            inner_match = re.search(
-                r'<invoke\s+name="([^"]+)".*?>(.*?)</invoke>',
-                inner, re.DOTALL | re.IGNORECASE
-            )
-            if inner_match:
-                matches.append((
-                    block_match.start(), block_match.end(), 'xml',
-                    inner_match.group(1).lower(), inner_match.group(2)
-                ))
-        
-        # Sort by position to maintain order
-        matches.sort(key=lambda x: x[0])
         return matches
     
-    def _parse_parameters(self, format_type: str, content: str) -> Dict[str, Any]:
-        """Parse tool parameters from different formats."""
-        tool_params: Dict[str, Any] = {}
+    def _find_native_tool_calls(self, text: str) -> List[Tuple[int, int, str, Dict[str, Any]]]:
+        """Find old [[TOOL:...|{}]] format (deprecated but handled)."""
+        matches = []
         
-        if format_type == 'xml':
-            cdata_match = re.search(r'<!\[CDATA\[(.*?)\]\]>', content, re.DOTALL)
-            if cdata_match:
-                param_content = cdata_match.group(1)
-                
-                if "operation" not in content:
-                    if "<!DOCTYPE html>" in param_content or "<html" in param_content:
-                        tool_params["operation"] = "create_html_app"
-                        tool_params["filename"] = "app.html"
-                        tool_params["html_content"] = param_content
-                    else:
-                        tool_params["operation"] = "write_file"
-                        tool_params["path"] = "output.txt"
-                        tool_params["content"] = param_content
-                else:
-                    param_pattern = r'<parameter name="([^"]+)">\s*(?:<!\[CDATA\[(.*?)\]\]>|\s*([^<]*))\s*</parameter>'
-                    for pmatch in re.finditer(param_pattern, content, re.DOTALL):
-                        p_name = pmatch.group(1)
-                        p_value = pmatch.group(2) if pmatch.group(2) else pmatch.group(3)
-                        tool_params[p_name] = p_value.strip() if p_value else ""
-            else:
-                param_pattern = r'<parameter name="([^"]+)">(.*?)</parameter>'
-                for pmatch in re.finditer(param_pattern, content, re.DOTALL):
-                    p_name = pmatch.group(1)
-                    p_value = pmatch.group(2).strip()
-                    tool_params[p_name] = p_value
-        
-        elif format_type == 'native':
+        for match in re.finditer(self.NATIVE_PATTERN, text, re.DOTALL):
+            tool_name = match.group(1).lower()
+            json_content = match.group(2)
+            
             try:
-                tool_params = json.loads(content)
+                tool_data = json.loads(json_content)
+                tool_data["tool"] = tool_name  # Ensure tool field is set
+                matches.append((match.start(), match.end(), 'native', tool_data))
             except json.JSONDecodeError:
-                pass
+                # Try with just the tool name
+                matches.append((match.start(), match.end(), 'native', {
+                    "tool": tool_name,
+                    "content": json_content
+                }))
         
-        return tool_params
+        return matches
     
     async def _execute_tool(
         self,
         tool: Any,
         tool_name: str,
         params: Dict[str, Any],
-    ) -> ToolResult:
+    ) -> "ToolResult":
         """Execute a single tool with error handling."""
         try:
             result = await tool.execute(**params)
@@ -267,12 +424,34 @@ class ToolParser:
             )
     
     def _clean_response(self, text: str) -> str:
-        """Clean tool call syntax from user-facing response."""
-        # Remove all tool call formats
-        text = re.sub(self.NATIVE_PATTERN, '', text)
-        text = re.sub(r'<function_calls>.*?</function_calls>', '', text, flags=re.DOTALL | re.IGNORECASE)
+        """Clean all tool call syntax from user-facing response."""
+        # Remove XML tool tags and their content
+        text = re.sub(
+            r'<tool>[^<]*</tool>\s*(?:<method>[^<]*</method>)?\s*(?:<url>[^<]*</url>)?(?:<query>.*?</query>)?\s*(?:<operation>[^<]*</operation>)?\s*(?:<path>[^<]*</path>)?\s*(?:<filename>[^<]*</filename>)?\s*(?:<html_content>.*?</html_content>)?\s*(?:<title>[^<]*</title>)?\s*(?:<start>[^<]*</start>)?\s*(?:<end>[^<]*</end>)?\s*(?:<description>[^<]*</description>)?\s*(?:<data>.*?</data>)?',
+            '',
+            text,
+            flags=re.DOTALL | re.IGNORECASE
+        )
         
-        # Clean up empty lines and whitespace
+        # Remove JSON code blocks that contain tool calls
+        def remove_tool_blocks(match: re.Match) -> str:
+            try:
+                data = json.loads(match.group(1))
+                if "tool" in data or "tool_type" in data:
+                    return ""
+            except:
+                pass
+            return match.group(0)
+        
+        text = re.sub(self.JSON_TOOL_PATTERN, remove_tool_blocks, text, flags=re.DOTALL)
+        
+        # Remove native format
+        text = re.sub(self.NATIVE_PATTERN, '', text)
+        
+        # Clean up multiple newlines
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        
+        # Clean up empty lines at start/end
         lines = [line for line in text.split('\n') if line.strip()]
         return '\n'.join(lines).strip()
 
@@ -292,7 +471,7 @@ class FileGenerator:
     
     def __init__(self, tools: Dict[str, Tool]) -> None:
         self.tools = tools
-        self._last_tool_result: Optional[ToolResult] = None
+        self._last_tool_result: Optional["ToolResult"] = None
         self._last_tool_name: Optional[str] = None
     
     def is_file_request(self, message: str) -> bool:
@@ -525,7 +704,7 @@ draw();
 </html>'''
     
     @property
-    def last_tool_result(self) -> Optional[ToolResult]:
+    def last_tool_result(self) -> Optional["ToolResult"]:
         return self._last_tool_result
     
     @property

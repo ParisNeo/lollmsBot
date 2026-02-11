@@ -154,6 +154,7 @@ class RLMMemoryManager:
         ]
         
         for fact_id, content, importance in identity_facts:
+            # Store in database as self-knowledge
             await self._db.store_self_knowledge(
                 knowledge_id=f"identity_{fact_id}",
                 category="identity",
@@ -449,28 +450,115 @@ The actual content will be provided in your context automatically."""
         """
         Search EMS for relevant chunks.
         
+        CRITICAL FIX: This now performs actual semantic search by:
+        1. Getting all non-archived chunks from the database
+        2. Scoring each chunk by keyword match against the query
+        3. Returning sorted results with relevance scores
+        
         Returns list of (chunk, relevance_score) tuples.
         """
-        # Convert types to strings
+        # Ensure initialized
+        if not self._initialized:
+            await self.initialize()
+        
+        # Convert types to strings for database query
         type_names = None
         if chunk_types:
             type_names = [t.name for t in chunk_types]
         
-        # Search database
-        results = await self._db.search_chunks(
-            query=query,
-            chunk_types=type_names,
-            min_importance=min_importance,
-            limit=limit,
-        )
+        # CRITICAL FIX: Get ALL chunks and score them, not just keyword search in summary
+        # The database search is too limited - we need to search content too
         
-        # Convert to chunks
-        chunks = []
-        for row, score in results:
-            chunk = self._row_to_chunk(row)
-            chunks.append((chunk, score))
+        all_chunks = []
+        try:
+            # Get all non-archived chunks with decent importance
+            async with self._db._connection.execute(
+                """
+                SELECT * FROM memory_chunks 
+                WHERE (archived IS NULL OR archived = 0)
+                AND memory_importance >= ?
+                ORDER BY memory_importance DESC
+                LIMIT 500
+                """,
+                (min_importance if min_importance is not None else 0.0,)
+            ) as cursor:
+                rows = await cursor.fetchall()
+                for row in rows:
+                    chunk_dict = self._db._row_to_dict(cursor, row)
+                    all_chunks.append(self._row_to_chunk(chunk_dict))
+        except Exception as e:
+            logger.error(f"Failed to fetch chunks for search: {e}")
+            # Fall back to database search
+            results = await self._db.search_chunks(
+                query=query,
+                chunk_types=type_names,
+                min_importance=min_importance,
+                limit=limit,
+            )
+            # Convert to MemoryChunk objects
+            chunks = []
+            for row, score in results:
+                chunk = self._row_to_chunk(row)
+                chunks.append((chunk, score))
+            return chunks
         
-        return chunks
+        # Score each chunk by keyword relevance
+        query_lower = query.lower()
+        query_words = set(query_lower.split())
+        
+        scored_chunks = []
+        for chunk in all_chunks:
+            # Get searchable text
+            search_text = ""
+            try:
+                # Include summary
+                if chunk.summary:
+                    search_text += " " + chunk.summary.lower()
+                # Include tags
+                if chunk.tags:
+                    search_text += " " + " ".join(chunk.tags).lower()
+                # Include load_hints
+                if chunk.load_hints:
+                    search_text += " " + " ".join(chunk.load_hints).lower()
+                # Include beginning of content for better matching
+                try:
+                    content_preview = chunk.decompress_content()[:500].lower()
+                    search_text += " " + content_preview
+                except Exception:
+                    pass  # Skip content if decompression fails
+            except Exception:
+                continue  # Skip this chunk if we can't extract text
+            
+            # Calculate score
+            score = 0.0
+            
+            # Exact phrase match (highest score)
+            if query_lower in search_text:
+                score += 10.0
+            
+            # Word matches
+            for word in query_words:
+                if len(word) < 3:
+                    continue  # Skip short words
+                count = search_text.count(word)
+                score += count * 2.0
+            
+            # Boost by importance
+            score *= (0.5 + chunk.memory_importance / 10.0)
+            
+            # Boost by recency (more recent = higher score)
+            days_since = (datetime.now() - chunk.last_accessed).days
+            recency_boost = max(0.5, 1.0 - (days_since / 30.0))  # Decay over 30 days
+            score *= recency_boost
+            
+            if score > 0:
+                scored_chunks.append((chunk, score))
+        
+        # Sort by score descending
+        scored_chunks.sort(key=lambda x: -x[1])
+        
+        # Return top N
+        return scored_chunks[:limit]
     
     async def get_chunk_content(self, chunk_id: str) -> Optional[str]:
         """Get decompressed content of a specific chunk."""
