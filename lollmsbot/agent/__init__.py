@@ -1001,6 +1001,17 @@ class Agent:
         if context:
             channel = context.get("channel", "unknown")
             parts.append(f"Channel: {channel}")
+            
+            # Add document contexts if present
+            doc_contexts = context.get("document_contexts")
+            if doc_contexts:
+                parts.append("")
+                parts.append("=" * 60)
+                parts.append("DOCUMENT CONTEXTS")
+                parts.append("=" * 60)
+                for i, doc_ctx in enumerate(doc_contexts, 1):
+                    parts.append(f"\n--- Document Context {i} ---\n")
+                    parts.append(doc_ctx)
         
         final_prompt = "\n".join(parts)
         
@@ -1359,3 +1370,23 @@ class Agent:
         if self._memory:
             await self._memory.close()
             self._memory = None
+
+
+# Re-export for convenience
+from lollmsbot.agent.integrated_document_agent import IntegratedDocumentAgent
+
+__all__ = [
+    "Agent",
+    "IntegratedDocumentAgent",
+    "AgentState",
+    "PermissionLevel",
+    "Tool",
+    "ToolResult",
+    "SkillResult",
+    "UserPermissions",
+    "ConversationTurn",
+    "ToolEventCallback",
+    "ToolError",
+    "AgentError",
+    "MemoryAnchor",
+]

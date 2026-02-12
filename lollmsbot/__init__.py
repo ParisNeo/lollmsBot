@@ -7,6 +7,7 @@ A modular AI assistant with:
 - Skill framework for reusable workflows
 - Memory and identity management
 - Security and ethics layers
+- Document management for long-form writing
 """
 
 __version__ = "0.2.0"
@@ -24,6 +25,31 @@ from lollmsbot.agent.config import (
     AgentError,
 )
 from lollmsbot.agent import Agent
+from lollmsbot.agent.integrated_document_agent import IntegratedDocumentAgent
+
+# Document management
+from lollmsbot.document_manager import (
+    DocumentManager,
+    DocumentIndex,
+    DocumentBlock,
+    BookProject,
+    ContextLens,
+    BlockType,
+    create_document_manager,
+)
+
+# Writing tools
+from lollmsbot.writing_tools import (
+    IngestDocumentTool,
+    CreateBookProjectTool,
+    CreateOutlineTool,
+    GetDocumentContextTool,
+    WriteSectionTool,
+    SubmitWrittenContentTool,
+    SearchReferencesTool,
+    GetWritingProgressTool,
+    get_writing_tools,
+)
 
 # Configuration
 from lollmsbot.config import BotConfig, LollmsSettings, GatewaySettings
@@ -41,6 +67,7 @@ __all__ = [
     
     # Core agent
     "Agent",
+    "IntegratedDocumentAgent",
     "AgentState",
     "PermissionLevel",
     "Tool",
@@ -50,6 +77,26 @@ __all__ = [
     "ConversationTurn",
     "ToolError",
     "AgentError",
+    
+    # Document management
+    "DocumentManager",
+    "DocumentIndex",
+    "DocumentBlock",
+    "BookProject",
+    "ContextLens",
+    "BlockType",
+    "create_document_manager",
+    
+    # Writing tools
+    "IngestDocumentTool",
+    "CreateBookProjectTool",
+    "CreateOutlineTool",
+    "GetDocumentContextTool",
+    "WriteSectionTool",
+    "SubmitWrittenContentTool",
+    "SearchReferencesTool",
+    "GetWritingProgressTool",
+    "get_writing_tools",
     
     # Configuration
     "BotConfig",

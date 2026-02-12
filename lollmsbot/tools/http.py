@@ -115,16 +115,26 @@ class HttpTool(Tool):
                 "description": "Force re-fetch even if cached (default false)",
                 "default": False,
             },
+            "store_full_content": {
+                "type": "boolean",
+                "description": "Store complete raw content without truncation (default true for creative works)",
+                "default": True,
+            },
+            "content_type_hint": {
+                "type": "string",
+                "description": "Hint about content type: 'novel', 'article', 'api', 'documentation'",
+                "default": "article",
+            },
         },
         "required": ["method", "url"],
     }
     
     def __init__(
         self,
-        default_timeout: float = 30.0,
+        default_timeout: float = 60.0,  # Increased for large content
         retry_config: Optional[RetryConfig] = None,
         allowed_schemes: Optional[set[str]] = None,
-        max_response_size: int = 50 * 1024 * 1024,  # 50 MB
+        max_response_size: int = 100 * 1024 * 1024,  # 100 MB for novels
         rlm_memory: Optional[Any] = None,  # RLMMemoryManager
         dedup_window_seconds: float = 3600.0,  # 1 hour default
     ) -> None:
@@ -300,8 +310,11 @@ class HttpTool(Tool):
         except ValueError as exc:
             return False, f"Invalid URL format: {str(exc)}"
     
-    def _extract_text_from_html(self, html: str, url: str) -> str:
+    def _extract_text_from_html(self, html: str, url: str, content_type_hint: str = "article") -> str:
         """Extract main text content from HTML, removing scripts, styles, nav, etc."""
+        # For creative works like novels, preserve more content
+        is_creative_work = content_type_hint in ("novel", "fiction", "creative")
+        
         # Remove script and style tags with content
         text = re.sub(r'<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>', ' ', html, flags=re.DOTALL | re.IGNORECASE)
         text = re.sub(r'<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>', ' ', text, flags=re.DOTALL | re.IGNORECASE)
@@ -313,19 +326,25 @@ class HttpTool(Tool):
             text = re.sub(rf'<{tag}\b[^>]*(?:(?!</{tag}>)<[^<]*)*</{tag}>', ' ', text, 
                          flags=re.DOTALL | re.IGNORECASE)
         
-        # Try to find main content area
+        # Try to find main content area - for creative works, be more aggressive about finding content
         main_content = ""
         patterns = [
             r'<article\b[^>]*>(.*?)</article>',
             r'<main\b[^>]*>(.*?)</main>',
-            r'<div[^>]*(?:id|class)=["\'](?:content|main|post|entry|body|text)["\'][^>]*>(.*?)</div>',
-            r'<section[^>]*(?:id|class)=["\'](?:content|main)["\'][^>]*>(.*?)</section>',
+            r'<div[^>]*(?:id|class)=["\'](?:content|main|post|entry|body|text|chapter|novel)["\'][^>]*>(.*?)</div>',
+            r'<section[^>]*(?:id|class)=["\'](?:content|main|story)["\'][^>]*>(.*?)</section>',
+            r'<div[^>]*class=["\']entry-content["\'][^>]*>(.*?)</div>',  # WordPress content
+            r'<div[^>]*id=["\']primary["\'][^>]*>(.*?)</div>',  # WordPress primary
         ]
         
         for pattern in patterns:
             matches = re.findall(pattern, text, re.DOTALL | re.IGNORECASE)
             if matches:
-                main_content = max(matches, key=len)
+                # For creative works, combine all matches
+                if is_creative_work and len(matches) > 1:
+                    main_content = '\n\n'.join(matches)
+                else:
+                    main_content = max(matches, key=len)
                 break
         
         if not main_content:
@@ -336,8 +355,14 @@ class HttpTool(Tool):
                 main_content = text
         
         # Convert HTML tags to newlines or spaces
-        for tag in ['p', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'br', 'tr', 'section', 'article']:
-            main_content = re.sub(rf'</?{tag}\b[^>]*>', '\n', main_content, flags=re.IGNORECASE)
+        # For creative works, preserve paragraph structure better
+        if is_creative_work:
+            # More aggressive paragraph preservation
+            for tag in ['p', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'br', 'tr', 'section', 'article', 'blockquote']:
+                main_content = re.sub(rf'</?{tag}\b[^>]*>', '\n\n', main_content, flags=re.IGNORECASE)
+        else:
+            for tag in ['p', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'br', 'tr', 'section', 'article']:
+                main_content = re.sub(rf'</?{tag}\b[^>]*>', '\n', main_content, flags=re.IGNORECASE)
         
         for tag in ['span', 'a', 'strong', 'em', 'b', 'i', 'u', 'code', 'small', 'label']:
             main_content = re.sub(rf'</?{tag}\b[^>]*>', ' ', main_content, flags=re.IGNORECASE)
@@ -350,9 +375,24 @@ class HttpTool(Tool):
         main_content = html_module.unescape(main_content)
         
         # Clean up whitespace
-        lines = [line.strip() for line in main_content.split('\n') if line.strip()]
-        result = '\n'.join(lines)
-        result = re.sub(r'\n{3,}', '\n\n', result)
+        if is_creative_work:
+            # Preserve multiple newlines for paragraph breaks in creative works
+            lines = [line.strip() for line in main_content.split('\n')]
+            # Remove empty lines but keep paragraph structure
+            result_lines = []
+            prev_empty = False
+            for line in lines:
+                if line:
+                    result_lines.append(line)
+                    prev_empty = False
+                elif not prev_empty:
+                    result_lines.append('')  # Keep one empty line
+                    prev_empty = True
+            result = '\n'.join(result_lines)
+        else:
+            lines = [line.strip() for line in main_content.split('\n') if line.strip()]
+            result = '\n'.join(lines)
+            result = re.sub(r'\n{3,}', '\n\n', result)
         
         return result.strip()
     
@@ -436,7 +476,8 @@ class HttpTool(Tool):
         
         # For HTML, extract readable text
         if "text/html" in content_type or "<html" in text.lower() or "<!doctype html" in text.lower():
-            extracted = self._extract_text_from_html(text, str(response.url))
+            # Pass content type hint if available
+            extracted = self._extract_text_from_html(text, str(response.url), metadata.get("content_type_hint", "article"))
             metadata["parsed_as"] = "html_extracted"
             metadata["original_length"] = len(text)
             metadata["extracted_length"] = len(extracted)
@@ -453,11 +494,12 @@ class HttpTool(Tool):
         content_type: str,
         importance: float,
         metadata: Dict[str, Any],
-    ) -> tuple[str, str]:  # (chunk_id, summary)
+        content_type_hint: str = "article",
+    ) -> tuple[str, str, int]:  # (chunk_id, summary, content_length)
         """Store fetched content in RLM memory and return handle info."""
         if not self._rlm_memory:
             # Fallback: return content directly if no RLM available
-            return "no_rlm", content[:200] + "..." if len(content) > 200 else content
+            return "no_rlm", content[:200] + "..." if len(content) > 200 else content, len(content)
         
         # Import here to avoid circular imports
         from lollmsbot.agent.rlm.models import MemoryChunkType
@@ -467,32 +509,88 @@ class HttpTool(Tool):
         url_hash = hashlib.sha256(url.encode()).hexdigest()[:12]
         chunk_id = f"web_{url_hash}_{int(asyncio.get_event_loop().time())}"
         
-        # Create summary (first 200 chars)
-        summary_lines = content.split('\n')[:10]  # First 10 lines
-        summary = ' '.join(summary_lines)[:200]
-        if len(content) > 200:
+        # For creative works, create a more descriptive summary
+        if content_type_hint in ("novel", "fiction", "creative"):
+            # Extract title if possible
+            title_match = re.search(r'<title[^>]*>(.*?)</title>', content[:5000], re.IGNORECASE | re.DOTALL)
+            title = title_match.group(1).strip() if title_match else "Creative Work"
+            # Get first paragraph as preview
+            paragraphs = [p.strip() for p in content.split('\n\n') if p.strip()]
+            preview = paragraphs[0][:150] if paragraphs else content[:150]
+            summary = f"{title}: {preview}..."
+        else:
+            # Standard summary for other content
+            summary_lines = content.split('\n')[:10]  # First 10 lines
+            summary = ' '.join(summary_lines)[:200]
+        
+        if len(content) > 200 and not summary.endswith('...'):
             summary += "..."
         
-        # Store in EMS
-        stored_chunk_id = await self._rlm_memory.store_in_ems(
-            content=content,
-            chunk_type=MemoryChunkType.WEB_CONTENT,
-            importance=importance,
-            tags=["web_content", "fetched", content_type, "user_requested"],
-            summary=f"Web content from {url}: {summary}",
-            load_hints=[url, "web", "fetched", "content"],
-            source=f"http_tool:{url}",
-        )
+        # Store in EMS - for creative works, use higher importance
+        effective_importance = importance
+        if content_type_hint in ("novel", "fiction", "creative"):
+            effective_importance = max(importance, 9.0)  # Ensure creative works are high priority
+        
+        # Split very large content into multiple chunks if needed
+        max_chunk_size = 50000  # 50KB per chunk
+        content_length = len(content)
+        
+        if content_length > max_chunk_size:
+            # Store as multiple chunks for very large content
+            stored_chunks = []
+            for i, start in enumerate(range(0, content_length, max_chunk_size)):
+                chunk_content = content[start:start + max_chunk_size]
+                sub_chunk_id = f"{chunk_id}_part{i+1}"
+                
+                sub_chunk_id_stored = await self._rlm_memory.store_in_ems(
+                    content=chunk_content,
+                    chunk_type=MemoryChunkType.WEB_CONTENT,
+                    importance=effective_importance,
+                    tags=["web_content", "fetched", content_type, content_type_hint, "large_content", f"part_{i+1}"],
+                    summary=f"{summary} (Part {i+1}/{content_length // max_chunk_size + 1})",
+                    load_hints=[url, "web", "fetched", content_type_hint, f"part_{i+1}"],
+                    source=f"http_tool:{url}",
+                )
+                stored_chunks.append(sub_chunk_id_stored)
+            
+            # Return the first chunk ID with note about multiple parts
+            final_chunk_id = stored_chunks[0]
+            # Also store a master index
+            await self._rlm_memory.store_in_ems(
+                content=json.dumps({
+                    "url": url,
+                    "total_parts": len(stored_chunks),
+                    "chunk_ids": stored_chunks,
+                    "total_length": content_length,
+                }),
+                chunk_type=MemoryChunkType.WEB_CONTENT,
+                importance=effective_importance,
+                tags=["web_content", "index", "multi_part", content_type_hint],
+                summary=f"Index for {url}: {len(stored_chunks)} parts, {content_length} chars total",
+                load_hints=[url, "index", "multi_part", content_type_hint],
+                source=f"http_tool:{url}#index",
+            )
+        else:
+            # Store as single chunk
+            final_chunk_id = await self._rlm_memory.store_in_ems(
+                content=content,
+                chunk_type=MemoryChunkType.WEB_CONTENT,
+                importance=effective_importance,
+                tags=["web_content", "fetched", content_type, content_type_hint, "user_requested"],
+                summary=f"Web content from {url}: {summary}",
+                load_hints=[url, "web", "fetched", content_type_hint],
+                source=f"http_tool:{url}",
+            )
         
         # Also load into RCB so LLM can see it immediately
-        await self._rlm_memory.load_from_ems(stored_chunk_id, add_to_rcb=True)
+        await self._rlm_memory.load_from_ems(final_chunk_id, add_to_rcb=True)
         
         # Track in recent fetches cache
         normalized_url = self._normalize_url(url)
         async with self._fetch_lock:
-            self._recent_fetches[normalized_url] = (time.time(), stored_chunk_id)
+            self._recent_fetches[normalized_url] = (time.time(), final_chunk_id)
         
-        return stored_chunk_id, summary
+        return final_chunk_id, summary, content_length
     
     async def get(
         self,
@@ -502,6 +600,8 @@ class HttpTool(Tool):
         extract_text: bool = True,
         importance: float = 7.0,
         force_refresh: bool = False,
+        store_full_content: bool = True,
+        content_type_hint: str = "article",
     ) -> ToolResult:
         """Execute GET request and store result in RLM memory.
         
@@ -515,6 +615,8 @@ class HttpTool(Tool):
             extract_text: For HTML, extract main text content.
             importance: RLM memory importance (1-10, default 7 for user-requested content).
             force_refresh: If True, skip deduplication and re-fetch.
+            store_full_content: If True, store complete content without truncation.
+            content_type_hint: Hint about content type for better extraction.
             
         Returns:
             ToolResult with memory handle for accessing the content.
@@ -560,7 +662,13 @@ class HttpTool(Tool):
         if params:
             kwargs["params"] = params
         
-        success, output, error, metadata = await self._execute_with_retry("GET", url, **kwargs)
+        # Pass metadata for content type hinting
+        metadata: Dict[str, Any] = {
+            "content_type_hint": content_type_hint,
+        }
+        
+        success, output, error, response_metadata = await self._execute_with_retry("GET", url, **kwargs)
+        metadata.update(response_metadata)
         
         if not success:
             return ToolResult(
@@ -587,12 +695,13 @@ class HttpTool(Tool):
                 content_type = "text"
         
         # Store in RLM and get handle
-        chunk_id, summary = await self._store_in_rlm(
+        chunk_id, summary, content_length = await self._store_in_rlm(
             url=url,
             content=content_to_store,
             content_type=content_type,
             importance=importance,
             metadata=metadata,
+            content_type_hint=content_type_hint,
         )
         
         # Build result with memory handle
@@ -601,7 +710,7 @@ class HttpTool(Tool):
             "chunk_id": chunk_id,
             "url": url,
             "content_type": content_type,
-            "content_length": len(content_to_store),
+            "content_length": content_length,
             "summary": summary,
             "deduplicated": False,
             "metadata": metadata,
@@ -612,6 +721,14 @@ class HttpTool(Tool):
                 f"Content summary: {summary[:100]}..."
             ),
         }
+        
+        # For large content, add special instructions
+        if content_length > 50000:
+            result_data["large_content_note"] = (
+                f"This is a large content piece ({content_length:,} characters). "
+                f"It has been stored across multiple memory chunks for optimal retrieval. "
+                f"Use the provided memory handle to access the full content."
+            )
         
         return ToolResult(
             success=True,
@@ -650,11 +767,20 @@ class HttpTool(Tool):
         extract_text = params.get("extract_text", True)
         importance = params.get("importance", 7.0)
         force_refresh = params.get("force_refresh", False)
+        store_full_content = params.get("store_full_content", True)
+        content_type_hint = params.get("content_type_hint", "article")
         
         if method == "get":
-            return await self.get(url, headers=headers, params=query_params, 
-                                extract_text=extract_text, importance=importance,
-                                force_refresh=force_refresh)
+            return await self.get(
+                url, 
+                headers=headers, 
+                params=query_params, 
+                extract_text=extract_text, 
+                importance=importance,
+                force_refresh=force_refresh,
+                store_full_content=store_full_content,
+                content_type_hint=content_type_hint,
+            )
         
         return ToolResult(
             success=False,

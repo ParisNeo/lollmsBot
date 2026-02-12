@@ -107,6 +107,7 @@ Same brain, different interfaces:
 - **Discord**: Full bot integration with user allowlisting, file delivery via DM
 - **Telegram**: Bot integration with permission controls
 - **HTTP API**: REST endpoints with file download support
+- **Console Chat**: Direct terminal interface for power users
 
 ---
 
@@ -196,11 +197,40 @@ lollmsBot: [Uses HTTP tool with safe URL validation]
 
 ---
 
+## 💬 Console Chat Interface
+
+For power users who prefer a terminal-based workflow, lollmsBot includes a rich console chat interface:
+
+```bash
+# Start console chat
+lollmsbot chat
+
+# With verbose logging
+lollmsbot chat --verbose
+
+# Custom agent name
+lollmsbot chat --name "MyAssistant"
+```
+
+The console chat provides:
+- **Rich terminal UI** with syntax highlighting and markdown rendering
+- **Full tool access** including file generation with automatic delivery
+- **Conversation history** within the session
+- **Debug mode** with `--verbose` for detailed tool execution logs
+
+Perfect for:
+- Developers who live in the terminal
+- Headless server environments
+- Quick interactions without opening a browser
+- Testing and debugging agent behavior
+
+---
+
 ## ⚠️ Alpha Status & Roadmap
 
 **Current State (Alpha)**:
 - Core agent loop with tool integration: **stable**
-- Multi-channel support (Discord, Telegram, Web, HTTP): **functional**
+- Multi-channel support (Discord, Telegram, Web, HTTP, Console): **functional**
 - Guardian security layer: **operational, undergoing hardening**
 - Skill execution engine: **functional**
 - **Auto-skill generation**: *framework present, learning algorithms incomplete*
@@ -281,12 +311,13 @@ This table tracks what's implemented vs. planned. Updated as development progres
 | Memory compression/consolidation | 🔲 Planned | Architecture present, algorithms incomplete |
 | 📚 Skills (Capabilities) | ⚠️ Partial | Registry, execution, built-in skills work; auto-learning framework only |
 | 🔧 Tools | ✅ Implemented | Filesystem, HTTP, Calendar, Shell with safety controls |
-| 🆔 Identity (Multi-channel) | ✅ Implemented | Web UI, Discord, Telegram, HTTP API |
+| 🆔 Identity (Multi-channel) | ✅ Implemented | Web UI, Discord, Telegram, HTTP API, Console Chat |
 | **Channels** |||
 | Web UI | ✅ Stable | WebSocket chat, file downloads, tool visualization |
 | Discord | ✅ Stable | Full bot with DM file delivery, user allowlisting |
 | Telegram | ✅ Stable | Bot with permission controls |
 | HTTP API | ✅ Stable | REST endpoints, file downloads |
+| Console Chat | ✅ Stable | Rich terminal interface for power users |
 | Slack | 🔲 Planned | Dependencies present, implementation pending |
 | **Security Features** |||
 | Prompt injection detection | ⚠️ Basic | Regex patterns; semantic ML analysis planned |

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-lollmsBot CLI - Gateway + Wizard + UI
+lollmsBot CLI - Gateway + Wizard + UI + Console Chat
 """
 from __future__ import annotations
 
@@ -103,6 +103,28 @@ def print_gateway_banner(host: str, port: int, ui_enabled: bool, debug_mode: boo
     console.print()
 
 
+def print_chat_banner() -> None:
+    """Print console chat banner."""
+    console.print()
+    
+    banner = Text()
+    banner.append("╭────────────╮\n", style="magenta")
+    banner.append("│  💬        │  ", style="magenta")
+    banner.append("Console Chat", style="bold magenta")
+    banner.append("\n", style="bold")
+    banner.append("╰────────────╯\n", style="magenta")
+    
+    panel = Panel(
+        banner,
+        box=box.DOUBLE_EDGE,
+        border_style="bright_magenta",
+        title="[bold]Direct Terminal Interface[/bold]",
+        subtitle="[dim]Rich interactive chat with your AI agent[/dim]"
+    )
+    console.print(panel)
+    console.print()
+
+
 def main(argv: List[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="lollmsbot",
@@ -117,6 +139,8 @@ def main(argv: List[str] | None = None) -> None:
 │    lollmsbot gateway --debug # Run with debug output        │
 │    lollmsbot ui              # Web UI only (standalone)     │
 │    lollmsbot ui --port 3000  # UI on custom port            │
+│    lollmsbot chat            # Console chat interface       │
+│    lollmsbot chat --verbose  # Console chat with debug info │
 └─────────────────────────────────────────────────────────────┘
         """
     )
@@ -151,6 +175,16 @@ def main(argv: List[str] | None = None) -> None:
         help="Interactive setup wizard",
         description="Configure LoLLMS connection and bot settings interactively"
     )
+
+    # Console Chat command (NEW)
+    chat_parser = subparsers.add_parser(
+        "chat",
+        help="Console chat interface",
+        description="Start an interactive terminal chat session with the AI agent"
+    )
+    chat_parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
+    chat_parser.add_argument("--name", type=str, default=None, help="Agent name (default: from config)")
+    chat_parser.add_argument("--no-markdown", action="store_true", help="Disable markdown rendering")
 
     args = parser.parse_args(argv)
 
@@ -203,6 +237,24 @@ def main(argv: List[str] | None = None) -> None:
                 )
             except KeyboardInterrupt:
                 ui._print_shutdown_message()
+            
+        elif args.command == "chat":
+            # NEW: Console chat interface
+            print_chat_banner()
+            
+            from lollmsbot.console_chat import run_console_chat
+            from lollmsbot.config import BotConfig
+            
+            # Build config
+            config = BotConfig.from_env()
+            if args.name:
+                config.name = args.name
+            
+            # Run console chat
+            run_console_chat(
+                config=config,
+                verbose=args.verbose,
+            )
             
         elif args.command == "wizard":
             from lollmsbot import wizard

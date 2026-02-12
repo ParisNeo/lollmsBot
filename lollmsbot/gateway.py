@@ -10,6 +10,7 @@ import secrets
 import hashlib
 import hmac
 import sys
+import time
 from typing import Any, Dict, List, Optional, Set
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -34,6 +35,9 @@ from lollmsbot.tools.filesystem import FilesystemTool
 from lollmsbot.tools.http import HttpTool
 from lollmsbot.tools.calendar import CalendarTool
 from lollmsbot.tools.shell import ShellTool
+# Import document management
+from lollmsbot.document_manager import create_document_manager, DocumentManager
+from lollmsbot.writing_tools import get_writing_tools
 
 console = Console()
 app = FastAPI(title="lollmsBot API")
@@ -48,13 +52,16 @@ _ui_enabled: bool = False
 # HTTP API channel (optional)
 _http_api: Optional[Any] = None
 
+# Document manager (global)
+_document_manager: Optional[DocumentManager] = None
+
 # ========== SHARED AGENT INSTANCE ==========
 _agent: Optional[Agent] = None
 _agent_lock: asyncio.Lock = asyncio.Lock()
 
 async def get_agent() -> Agent:
     """Get or create the shared Agent instance with tools registered."""
-    global _agent
+    global _agent, _document_manager
     if _agent is None:
         async with _agent_lock:
             if _agent is None:
@@ -78,6 +85,23 @@ async def get_agent() -> Agent:
                     gateway_mode=gateway_mode,
                     host_bindings=host_bindings
                 )
+                
+                # Initialize document manager if memory is available
+                if _agent._memory:
+                    _document_manager = await create_document_manager(
+                        memory_manager=_agent._memory,
+                    )
+                    
+                    # Register writing tools
+                    writing_tools = get_writing_tools(_document_manager)
+                    for tool in writing_tools:
+                        try:
+                            await _agent.register_tool(tool)
+                        except ValueError:
+                            pass  # Already registered
+                    
+                    console.print(f"[green]✅ Document management initialized with {len(writing_tools)} writing tools[/]")
+                
                 console.print(f"[green]✅ Agent initialized: {_agent.name}[/]")
                 console.print(f"[dim]   Environment: {_agent._environment_detector.get_summary() if _agent.environment_info else 'unknown'}[/]")
     return _agent
@@ -199,6 +223,47 @@ class PermissionReq(BaseModel):
     level: str  # "NONE", "BASIC", "TOOLS", "ADMIN"
     allowed_tools: Optional[List[str]] = None
     denied_tools: Optional[List[str]] = None
+
+# Document management models
+class IngestDocumentReq(BaseModel):
+    source_type: str  # "url", "text"
+    source: str
+    title: Optional[str] = None
+    document_id: Optional[str] = None
+
+class IngestDocumentResp(BaseModel):
+    success: bool
+    document_id: Optional[str] = None
+    title: Optional[str] = None
+    blocks: int = 0
+    words_estimate: int = 0
+    error: Optional[str] = None
+
+class CreateBookReq(BaseModel):
+    title: str
+    author: Optional[str] = None
+    description: Optional[str] = None
+    references: Optional[List[str]] = None
+
+class CreateBookResp(BaseModel):
+    success: bool
+    project_id: Optional[str] = None
+    title: Optional[str] = None
+    references_connected: int = 0
+    error: Optional[str] = None
+
+class DocumentContextReq(BaseModel):
+    document_id: str
+    focus: Optional[str] = None
+    detail_level: Optional[str] = "summary"
+    include_references: Optional[bool] = True
+
+class DocumentContextResp(BaseModel):
+    success: bool
+    context_text: Optional[str] = None
+    tokens_used: int = 0
+    navigation_handles: Optional[List[str]] = None
+    error: Optional[str] = None
 
 # ========== CORS ==========
 
@@ -399,6 +464,12 @@ async def root():
             "virtualenv": env.in_virtualenv,
         }
     
+    # Document management status
+    doc_status = "available" if _document_manager else "unavailable"
+    if _document_manager:
+        docs = _document_manager.list_documents()
+        doc_status = f"{len(docs)} documents indexed"
+    
     response = {
         "api": f"http://{HOST}:{PORT}",
         "docs": "/docs",
@@ -424,6 +495,16 @@ async def root():
             "web_ui": _ui_enabled,
             "environment_awareness": True,
             "debug_mode": DEBUG_MODE,
+            "document_management": _document_manager is not None,
+        },
+        "documents": {
+            "status": doc_status,
+            "endpoints": {
+                "ingest": "/documents/ingest",
+                "create_book": "/documents/books",
+                "context": "/documents/context",
+                "list": "/documents",
+            } if _document_manager else None,
         },
         "environment": env_info,
     }
@@ -439,6 +520,7 @@ async def root():
 
 @app.get("/health", response_model=Health)
 async def health():
+    """Health check endpoint."""
     agent = await get_agent()
     lollms_client = get_lollms_client()
     lollms_ok = lollms_client is not None
@@ -461,6 +543,11 @@ async def health():
         elif env.in_wsl:
             env_summary += " (WSL)"
     
+    # Document status
+    doc_count = 0
+    if _document_manager:
+        doc_count = len(_document_manager.list_documents())
+    
     response = {
         "status": "ok",
         "url": f"http://{HOST}:{PORT}",
@@ -481,6 +568,14 @@ async def health():
             "file_delivery_enabled": True,
             "environment_awareness": True,
             "debug_mode": DEBUG_MODE,
+        },
+        "documents": {
+            "indexed": doc_count,
+            "writing_tools": sum(1 for t in agent.tools.keys() if t in [
+                "ingest_document", "create_book_project", "create_outline",
+                "get_document_context", "write_section", "submit_written_content",
+                "search_references", "get_writing_progress"
+            ]) if hasattr(agent, 'tools') else 0,
         },
         "environment": env_summary,
     }
@@ -548,6 +643,161 @@ async def chat(req: ChatReq):
         file_downloads=file_downloads,
     )
 
+# ========== DOCUMENT MANAGEMENT ENDPOINTS ==========
+
+@app.get("/documents")
+async def list_documents():
+    """List all indexed documents."""
+    if not _document_manager:
+        raise HTTPException(status_code=503, detail="Document management not available")
+    
+    return {
+        "documents": _document_manager.list_documents(),
+    }
+
+@app.post("/documents/ingest", response_model=IngestDocumentResp)
+async def ingest_document(req: IngestDocumentReq):
+    """Ingest a document for use as reference material."""
+    if not _document_manager:
+        raise HTTPException(status_code=503, detail="Document management not available")
+    
+    try:
+        if req.source_type == "url":
+            doc_id = await _document_manager.ingest_webpage(
+                url=req.source,
+                title=req.title,
+                document_id=req.document_id,
+            )
+        elif req.source_type == "text":
+            doc_id = await _document_manager.ingest_text(
+                content=req.source,
+                title=req.title or "Untitled Document",
+                document_id=req.document_id,
+            )
+        else:
+            return IngestDocumentResp(
+                success=False,
+                error=f"Unsupported source_type: {req.source_type}",
+            )
+        
+        # Get stats
+        index = _document_manager._documents.get(doc_id)
+        stats = index.get_statistics() if index else {}
+        
+        return IngestDocumentResp(
+            success=True,
+            document_id=doc_id,
+            title=req.title or "Untitled Document",
+            blocks=stats.get("total_blocks", 0),
+            words_estimate=stats.get("total_word_estimate", 0),
+        )
+        
+    except Exception as e:
+        return IngestDocumentResp(
+            success=False,
+            error=str(e),
+        )
+
+@app.post("/documents/books", response_model=CreateBookResp)
+async def create_book(req: CreateBookReq):
+    """Create a new book writing project."""
+    if not _document_manager:
+        raise HTTPException(status_code=503, detail="Document management not available")
+    
+    try:
+        project_id = await _document_manager.create_book_project(
+            title=req.title,
+            author=req.author,
+            description=req.description,
+            references=req.references or [],
+        )
+        
+        return CreateBookResp(
+            success=True,
+            project_id=project_id,
+            title=req.title,
+            references_connected=len(req.references or []),
+        )
+        
+    except Exception as e:
+        return CreateBookResp(
+            success=False,
+            error=str(e),
+        )
+
+@app.post("/documents/context", response_model=DocumentContextResp)
+async def get_document_context(req: DocumentContextReq):
+    """Get hierarchical context for a document."""
+    if not _document_manager:
+        raise HTTPException(status_code=503, detail="Document management not available")
+    
+    try:
+        # Map detail_level to budget
+        budget_map = {
+            "overview": "small",
+            "summary": "medium",
+            "detailed": "large",
+            "full": "full",
+        }
+        budget = budget_map.get(req.detail_level, "medium")
+        
+        lens = await _document_manager.get_context_lens(
+            document_id=req.document_id,
+            focus_block_id=req.focus if req.focus else None,
+            budget=budget,
+            include_surroundings=req.include_references if req.include_references is not None else True,
+        )
+        
+        return DocumentContextResp(
+            success=True,
+            context_text=lens.to_prompt_fragment(),
+            tokens_used=lens.current_tokens,
+            navigation_handles=lens.navigation_handles,
+        )
+        
+    except Exception as e:
+        return DocumentContextResp(
+            success=False,
+            error=str(e),
+        )
+
+@app.get("/documents/{document_id}")
+async def get_document(document_id: str):
+    """Get document details."""
+    if not _document_manager:
+        raise HTTPException(status_code=503, detail="Document management not available")
+    
+    index = _document_manager._documents.get(document_id)
+    if not index:
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    root_id = _document_manager._document_roots.get(document_id)
+    root = index.get_block(root_id) if root_id else None
+    
+    stats = index.get_statistics()
+    
+    # Get structure
+    structure = []
+    for block_type in ["CHAPTER", "SECTION"]:
+        for bid in index._sequence.get(getattr(__import__('lollmsbot.document_manager', fromlist=['BlockType']).BlockType, block_type, None) or [], []):
+            block = index.get_block(bid)
+            if block:
+                structure.append({
+                    "id": bid,
+                    "type": block_type.lower(),
+                    "title": block.title,
+                    "status": block.status,
+                    "word_count": block.word_count,
+                })
+    
+    return {
+        "document_id": document_id,
+        "title": root.title if root else "Unknown",
+        "type": "book" if document_id.startswith("book_") else "reference",
+        "statistics": stats,
+        "structure": structure,
+    }
+
 @app.post("/admin/permission", dependencies=[Depends(require_auth)])
 async def set_permission(req: PermissionReq):
     """Admin endpoint to set user permissions."""
@@ -590,6 +840,10 @@ if DEBUG_MODE:
                 for chunk_id, content in agent._anchor_cache.items()
             }
         
+        # Document data
+        if _document_manager:
+            memory_data["documents"] = _document_manager.list_documents()
+        
         return memory_data
     
     @app.get("/debug/stats")
@@ -603,6 +857,7 @@ if DEBUG_MODE:
             "memory_initialized": agent._memory is not None,
             "soul_initialized": agent._soul_initialized,
             "lollms_client_initialized": agent._lollms_client_initialized,
+            "document_manager_initialized": _document_manager is not None,
         }
 
 # ========== FILE DOWNLOAD ENDPOINTS ==========
@@ -691,6 +946,7 @@ async def lifespan(app_: FastAPI):
         ))
     
     # Initialize shared Agent (this triggers async initialization with env detection)
+    # This also initializes document manager
     agent = await get_agent()
     lollms_client = get_lollms_client()
     
@@ -746,6 +1002,8 @@ async def lifespan(app_: FastAPI):
     console.print(f"[green]🚀 Gateway starting on http://{HOST}:{PORT}[/]")
     console.print(f"[dim]  • Chat endpoint: POST /chat[/]")
     console.print(f"[dim]  • File downloads: GET /files/download/<file_id>[/]")
+    console.print(f"[dim]  • Document ingest: POST /documents/ingest[/]")
+    console.print(f"[dim]  • Book creation: POST /documents/books[/]")
     if DEBUG_MODE:
         console.print(f"[dim]  • Debug memory: GET /debug/memory[/]")
         console.print(f"[dim]  • Debug stats: GET /debug/stats[/]")
@@ -754,7 +1012,7 @@ async def lifespan(app_: FastAPI):
     if os.getenv("LOLLMSBOT_ENABLE_UI", "").lower() in ("true", "1", "yes"):
         enable_ui()
     
-    global _active_channels, _channel_tasks, _agent
+    global _active_channels, _channel_tasks, _agent, _document_manager
     
     # Discord with full agent capabilities
     if DISCORD_TOKEN:
@@ -834,6 +1092,9 @@ async def lifespan(app_: FastAPI):
     # Summary
     console.print(f"[bold green]📊 Active channels: {len(_active_channels)}[/]")
     console.print(f"[bold green]🤖 Agent: {agent.name} ({len(agent.tools)} tools)[/]")
+    if _document_manager:
+        doc_count = len(_document_manager.list_documents())
+        console.print(f"[bold green]📚 Documents: {doc_count} indexed[/]")
     if lollms_client:
         console.print(f"[bold green]🔗 LoLLMS: Connected ({LollmsSettings.from_env().host_address})[/]")
     else:

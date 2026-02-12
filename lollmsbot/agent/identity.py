@@ -46,6 +46,18 @@ class IdentityDetector:
             r"work with",
             r"my (?:boss|colleague|friend|mentor)",
         ],
+        "creative_work": [
+            r"i (?:wrote|authored|created) (?:a |the )?(?:book|novel|story|manuscript)",
+            r"my (?:book|novel|story) (?:is|called|titled)",
+            r"(?:homo zombius|the peace syndrome)",
+            r"parisneo",  # Direct mention of creator name
+        ],
+        "testing_memory": [
+            r"testing (?:your|the) memory",
+            r"do you remember",
+            r"recall (?:this|that)",
+            r"remember (?:this|that|my name)",
+        ],
     }
     
     def __init__(self) -> None:
@@ -77,7 +89,19 @@ class IdentityDetector:
                 match = pattern.search(message)
                 if match:
                     result.categories.append(category)
-                    result.importance_boost = max(result.importance_boost, 3.0)
+                    
+                    # Boost importance based on category
+                    importance_map = {
+                        "creator_identity": 10.0,
+                        "creative_work": 9.5,
+                        "personal_identity": 8.0,
+                        "relationship_revelation": 7.0,
+                        "testing_memory": 6.0,
+                    }
+                    result.importance_boost = max(
+                        result.importance_boost, 
+                        importance_map.get(category, 5.0)
+                    )
                     
                     # Extract specific information based on category
                     self._extract_facts(category, match, message_lower, result)
@@ -109,10 +133,32 @@ class IdentityDetector:
             if name_match:
                 result.extracted_facts["creator_name"] = name_match.group(1).strip()
             
-            # Check for known alias
-            result.extracted_facts["creator_alias"] = (
-                "ParisNeo" if "parisneo" in message_lower else None
-            )
+            # Check for known alias - ParisNeo
+            if "parisneo" in message_lower:
+                result.extracted_facts["creator_alias"] = "ParisNeo"
+                result.extracted_facts["creator_name"] = result.extracted_facts.get("creator_name", "ParisNeo")
+                # Add note about creative works
+                result.extracted_facts["known_works"] = ["Homo Zombius", "The Peace Syndrome", "lollms"]
+        
+        elif category == "creative_work":
+            # Extract work title if mentioned
+            work_patterns = [
+                r"(?:homo zombius)(?:\s*-\s*the peace syndrome)?",
+                r"the peace syndrome",
+                r"my (?:book|novel|story) (?:is|called|titled)['\"]?([^'\"]{2,50}?)['\"]?(?:\s*[,.]|$)",
+            ]
+            for pattern in work_patterns:
+                work_match = re.search(pattern, message_lower, re.IGNORECASE)
+                if work_match:
+                    work_name = work_match.group(0).strip()
+                    result.extracted_facts["creative_work"] = work_name
+                    result.extracted_facts["work_type"] = "novel"
+                    break
+            
+            # Always note ParisNeo as author if creative work mentioned
+            if "parisneo" in message_lower or result.extracted_facts.get("creative_work"):
+                result.extracted_facts["author"] = "ParisNeo"
+                result.extracted_facts["creator_alias"] = "ParisNeo"
         
         elif category == "personal_identity":
             # Extract the name they want to be called
@@ -136,6 +182,12 @@ class IdentityDetector:
                 )
                 if pseudo_match:
                     result.extracted_facts["pseudonym"] = pseudo_match.group(1).strip()
+        
+        elif category == "testing_memory":
+            # This is a test - note it for the agent
+            result.extracted_facts["memory_test"] = True
+            result.extracted_facts["test_context"] = "User is testing my ability to remember information"
+            # Don't reset importance - this adds context but identity facts are still primary
     
     def is_informational_query(self, message: str) -> bool:
         """Check if the message is asking about capabilities/tools (no tools needed)."""
