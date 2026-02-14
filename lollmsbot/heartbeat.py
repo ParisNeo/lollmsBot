@@ -652,9 +652,36 @@ class Heartbeat:
     
     # ============== PUBLIC API ==============
     
-    async def run_once(self, tasks: Optional[List[MaintenanceTask]] = None) -> Dict[str, Any]:
+    async def run_once(self, tasks: Optional[List[MaintenanceTask]] = None, is_startup: bool = False) -> Dict[str, Any]:
         """Execute a single heartbeat cycle immediately."""
+        import time
+        start_time = time.time()
+        
         cycle_id = f"hb_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{hashlib.sha256(str(time.time()).encode()).hexdigest()[:8]}"
+        
+        # Log heartbeat start with rich formatting
+        try:
+            from rich.console import Console
+            from rich.panel import Panel
+            from rich.table import Table
+            from rich import box
+            
+            console = Console()
+            
+            event_type = "🚀 STARTUP HEARTBEAT" if is_startup else "💓 Heartbeat"
+            panel = Panel(
+                f"[bold cyan]{event_type}[/bold cyan]\n"
+                f"[dim]Cycle ID: {cycle_id}[/dim]\n"
+                f"[dim]Tasks to run: {len(tasks) if tasks else 'auto-detected'}[/dim]",
+                border_style="bright_cyan" if is_startup else "cyan",
+                box=box.DOUBLE if is_startup else box.ROUNDED,
+                title="[bold]Self-Maintenance Event[/bold]",
+                subtitle="[dim]RLM Memory Optimization[/dim]" if is_startup else None
+            )
+            console.print()
+            console.print(panel)
+        except ImportError:
+            logger.info(f"Heartbeat {'startup ' if is_startup else ''}cycle {cycle_id} starting")
         
         results = []
         to_run = tasks or [t for t in MaintenanceTask if self.config.tasks_enabled.get(t, True)]
@@ -671,7 +698,10 @@ class Heartbeat:
             handler = self._task_handlers.get(task)
             if handler:
                 try:
+                    task_start = time.time()
                     result = await handler()
+                    task_duration = time.time() - task_start
+                    
                     results.append({
                         'task': task.name,
                         'success': result.success,
@@ -682,9 +712,48 @@ class Heartbeat:
                         'extended_report': result.extended_report,
                     })
                     
-                    # Log RLM maintenance specially
-                    if task == MaintenanceTask.RLM_MAINTENANCE and result.extended_report:
-                        logger.info(f"RLM Maintenance: {result.extended_report}")
+                    # Log each task with rich formatting
+                    try:
+                        from rich.console import Console
+                        console = Console()
+                        
+                        status_icon = "✅" if result.success else "❌"
+                        status_color = "green" if result.success else "red"
+                        
+                        # Build task summary
+                        task_lines = [
+                            f"[bold]{task.name.replace('_', ' ').title()}[/bold]",
+                            f"Status: [{status_color}]{status_icon} {('Success' if result.success else 'Failed')}[/]",
+                            f"Duration: {result.duration_seconds:.2f}s",
+                        ]
+                        
+                        if result.actions_taken:
+                            task_lines.append(f"Actions: {len(result.actions_taken)}")
+                            for action in result.actions_taken[:3]:
+                                task_lines.append(f"  • {action[:60]}")
+                        
+                        if result.warnings:
+                            task_lines.append(f"[yellow]Warnings: {len(result.warnings)}[/]")
+                        
+                        # Special handling for RLM maintenance
+                        if task == MaintenanceTask.RLM_MAINTENANCE and result.extended_report:
+                            report = result.extended_report
+                            if report.get('deduplication', {}).get('duplicates_removed', 0) > 0:
+                                dupes = report['deduplication']['duplicates_removed']
+                                saved_kb = report['deduplication'].get('bytes_saved', 0) / 1024
+                                task_lines.append(f"[green]  🧹 Removed {dupes} duplicates, saved {saved_kb:.1f} KB[/]")
+                            if report.get('consolidation', {}).get('narratives_created', 0) > 0:
+                                narratives = report['consolidation']['narratives_created']
+                                task_lines.append(f"[green]  📚 Created {narratives} narrative memories[/]")
+                        
+                        console.print(Panel(
+                            "\n".join(task_lines),
+                            border_style=status_color,
+                            padding=(0, 2)
+                        ))
+                    except ImportError:
+                        logger.info(f"Task {task.name}: {'success' if result.success else 'failed'} "
+                                  f"({result.duration_seconds:.2f}s)")
                         
                 except Exception as e:
                     results.append({
@@ -693,13 +762,69 @@ class Heartbeat:
                         'error': str(e),
                     })
                     logger.error(f"Heartbeat task {task.name} failed: {e}")
+                    
+                    try:
+                        from rich.console import Console
+                        console = Console()
+                        console.print(Panel(
+                            f"[bold red]Task Failed: {task.name}[/]\n{str(e)[:200]}",
+                            border_style="red"
+                        ))
+                    except ImportError:
+                        pass
         
         self._last_run = datetime.now()
+        total_duration = time.time() - start_time
+        
+        # Log heartbeat completion
+        try:
+            from rich.console import Console
+            from rich.panel import Panel
+            from rich import box
+            
+            console = Console()
+            
+            success_count = sum(1 for r in results if r.get('success'))
+            failed_count = len(results) - success_count
+            
+            summary_lines = [
+                f"[bold]Tasks Executed:[/] {len(results)}",
+                f"[green]✅ Successful:[/] {success_count}",
+            ]
+            if failed_count > 0:
+                summary_lines.append(f"[red]❌ Failed:[/] {failed_count}")
+            
+            summary_lines.append(f"[dim]Total Duration: {total_duration:.2f}s[/]")
+            
+            # Memory stats if available
+            if self._rlm_maintenance and any(r.get('task') == 'RLM_MAINTENANCE' for r in results):
+                try:
+                    stats = await self._rlm_maintenance.get_maintenance_summary()
+                    summary_lines.append(f"\n[dim]Memory: {stats.get('total_chunks', 0)} chunks "
+                                       f"({stats.get('archived_chunks', 0)} archived)[/dim]")
+                except:
+                    pass
+            
+            completion_panel = Panel(
+                "\n".join(summary_lines),
+                border_style="bright_green" if failed_count == 0 else "yellow",
+                box=box.DOUBLE_EDGE if is_startup else box.ROUNDED,
+                title="[bold green]✓ Heartbeat Complete[/]" if failed_count == 0 else "[bold yellow]⚠ Heartbeat Complete (with issues)[/]",
+                subtitle=f"[dim]Next: {self.config.interval_minutes}min[/]" if not is_startup else "[dim]Startup optimization complete[/]"
+            )
+            console.print(completion_panel)
+            console.print()
+            
+        except ImportError:
+            logger.info(f"Heartbeat complete: {success_count}/{len(results)} tasks successful "
+                      f"({total_duration:.2f}s)")
         
         return {
             'cycle_id': cycle_id,
             'tasks_executed': len(results),
             'results': results,
+            'total_duration': total_duration,
+            'is_startup': is_startup,
         }
     
     def _should_run_task(self, task: MaintenanceTask) -> bool:

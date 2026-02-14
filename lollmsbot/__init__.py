@@ -60,6 +60,15 @@ from lollmsbot.agent.identity import IdentityDetector
 from lollmsbot.agent.llm import PromptBuilder
 from lollmsbot.agent.tools import ToolParser, FileGenerator
 from lollmsbot.agent.logging import AgentLogger
+from lollmsbot.agent.rlm.manager import (
+    RLMMemoryManager,
+    MemoryMap,
+)
+from lollmsbot.agent.rlm.memory_map import (
+    MemoryCategorySummary,
+    MemoryAnchor,
+    KnowledgeGap
+)
 
 __all__ = [
     # Version
@@ -110,4 +119,11 @@ __all__ = [
     "ToolParser",
     "FileGenerator",
     "AgentLogger",
+    
+    # RLM Memory
+    "RLMMemoryManager",
+    "MemoryMap",
+    "MemoryCategorySummary",
+    "MemoryAnchor",
+    "KnowledgeGap",
 ]

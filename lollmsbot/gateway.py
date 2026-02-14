@@ -38,7 +38,9 @@ from lollmsbot.tools.shell import ShellTool
 # Import document management
 from lollmsbot.document_manager import create_document_manager, DocumentManager
 from lollmsbot.writing_tools import get_writing_tools
+import logging
 
+logger = logging.getLogger("lollmsbot.guardian")
 console = Console()
 app = FastAPI(title="lollmsBot API")
 
@@ -92,15 +94,22 @@ async def get_agent() -> Agent:
                         memory_manager=_agent._memory,
                     )
                     
-                    # Register writing tools
+                    # Register writing tools - CRITICAL: Do this BEFORE base tools
+                    # so they're available in the tool list
                     writing_tools = get_writing_tools(_document_manager)
                     for tool in writing_tools:
                         try:
                             await _agent.register_tool(tool)
-                        except ValueError:
-                            pass  # Already registered
+                            console.print(f"[green]  ✓ Writing tool: {tool.name}[/]")
+                        except ValueError as e:
+                            console.print(f"[yellow]  • Writing tool {tool.name} already registered: {e}[/]")
                     
                     console.print(f"[green]✅ Document management initialized with {len(writing_tools)} writing tools[/]")
+                    console.print(f"[dim]   Available tools: {', '.join(t.name for t in writing_tools)}[/]")
+                
+                # Log all registered tools
+                console.print(f"[dim]   Total agent tools: {len(_agent.tools)}[/]")
+                console.print(f"[dim]   Tool names: {', '.join(_agent.tools.keys())}[/]")
                 
                 console.print(f"[green]✅ Agent initialized: {_agent.name}[/]")
                 console.print(f"[dim]   Environment: {_agent._environment_detector.get_summary() if _agent.environment_info else 'unknown'}[/]")
@@ -162,6 +171,19 @@ DISCORD_BLOCKED_USERS = _get_config("discord", "blocked_users", "DISCORD_BLOCKED
 DISCORD_REQUIRE_MENTION_GUILD = _get_config("discord", "require_mention_guild", "DISCORD_REQUIRE_MENTION_GUILD", "true")
 DISCORD_REQUIRE_MENTION_DM = _get_config("discord", "require_mention_dm", "DISCORD_REQUIRE_MENTION_DM", "false")
 TELEGRAM_TOKEN = _get_config("telegram", "bot_token", "TELEGRAM_BOT_TOKEN", None)
+
+# WhatsApp configuration
+WHATSAPP_BACKEND = _get_config("whatsapp", "backend", "WHATSAPP_BACKEND", None)
+WHATSAPP_WEB_JS_PATH = _get_config("whatsapp", "web_js_path", "WHATSAPP_WEB_JS_PATH", None)
+WHATSAPP_ACCOUNT_SID = _get_config("whatsapp", "account_sid", "WHATSAPP_ACCOUNT_SID", None)
+WHATSAPP_AUTH_TOKEN = _get_config("whatsapp", "auth_token", "WHATSAPP_AUTH_TOKEN", None)
+WHATSAPP_FROM_NUMBER = _get_config("whatsapp", "from_number", "WHATSAPP_FROM_NUMBER", None)
+WHATSAPP_API_TOKEN = _get_config("whatsapp", "api_token", "WHATSAPP_API_TOKEN", None)
+WHATSAPP_WEBHOOK_SECRET = _get_config("whatsapp", "webhook_secret", "WHATSAPP_WEBHOOK_SECRET", None)
+WHATSAPP_WEBHOOK_PORT = int(_get_config("whatsapp", "webhook_port", "WHATSAPP_WEBHOOK_PORT", "8081"))
+WHATSAPP_ALLOWED_NUMBERS = _get_config("whatsapp", "allowed_numbers", "WHATSAPP_ALLOWED_NUMBERS", None)
+WHATSAPP_BLOCKED_NUMBERS = _get_config("whatsapp", "blocked_numbers", "WHATSAPP_BLOCKED_NUMBERS", None)
+WHATSAPP_REQUIRE_CONFIRMATION = _get_config("whatsapp", "require_confirmation", "WHATSAPP_REQUIRE_CONFIRMATION", "true")
 
 _active_channels: Dict[str, Any] = {}
 _channel_tasks: List[asyncio.Task] = []
@@ -470,6 +492,14 @@ async def root():
         docs = _document_manager.list_documents()
         doc_status = f"{len(docs)} documents indexed"
     
+    # Get all tool names
+    all_tools = list(agent.tools.keys()) if hasattr(agent, 'tools') else []
+    writing_tools = [t for t in all_tools if t in [
+        "ingest_document", "create_book_project", "create_outline",
+        "get_document_context", "write_section", "submit_written_content",
+        "search_references", "get_writing_progress"
+    ]]
+    
     response = {
         "api": f"http://{HOST}:{PORT}",
         "docs": "/docs",
@@ -478,7 +508,8 @@ async def root():
         "agent": {
             "name": agent.name,
             "state": agent.state.name,
-            "tools": list(agent.tools.keys()),
+            "tools": all_tools,
+            "writing_tools": writing_tools,
         },
         "lollms": {
             "connected": lollms_ok,
@@ -548,17 +579,30 @@ async def health():
     if _document_manager:
         doc_count = len(_document_manager.list_documents())
     
+    # Get tool counts
+    all_tools = list(agent.tools.keys()) if hasattr(agent, 'tools') else []
+    writing_tools = [t for t in all_tools if t in [
+        "ingest_document", "create_book_project", "create_outline",
+        "get_document_context", "write_section", "submit_written_content",
+        "search_references", "get_writing_progress"
+    ]]
+    
     response = {
         "status": "ok",
         "url": f"http://{HOST}:{PORT}",
         "discord": discord_status,
         "telegram": telegram_status,
+        "whatsapp": "active" if "whatsapp" in _active_channels else "disabled",
         "lollms": {
             "connected": lollms_ok,
             "host": LollmsSettings.from_env().host_address,
         },
         "agent": agent.state.name,
-        "tools": list(agent.tools.keys()),
+        "tools": {
+            "total": len(all_tools),
+            "all": all_tools,
+            "writing": writing_tools,
+        },
         "security": {
             "mode": "local" if HOST in ("127.0.0.1", "localhost", "::1") else "network",
             "auth_enabled": API_KEY is not None,
@@ -571,11 +615,7 @@ async def health():
         },
         "documents": {
             "indexed": doc_count,
-            "writing_tools": sum(1 for t in agent.tools.keys() if t in [
-                "ingest_document", "create_book_project", "create_outline",
-                "get_document_context", "write_section", "submit_written_content",
-                "search_references", "get_writing_progress"
-            ]) if hasattr(agent, 'tools') else 0,
+            "writing_tools_available": len(writing_tools),
         },
         "environment": env_summary,
     }
@@ -946,47 +986,51 @@ async def lifespan(app_: FastAPI):
         ))
     
     # Initialize shared Agent (this triggers async initialization with env detection)
-    # This also initializes document manager
+    # This also initializes document manager and ALL tools including writing tools
     agent = await get_agent()
+
+    # Execute heartbeat once at startup to optimize memory
+    try:
+        from lollmsbot.heartbeat import get_heartbeat
+        heartbeat = get_heartbeat()
+        if heartbeat.config.enabled:
+            # Pass is_startup=True for rich event logging
+            heartbeat_result = await heartbeat.run_once(is_startup=True)
+
+            # Results are now logged by run_once() with rich formatting
+            # Just log the summary here
+            tasks_run = heartbeat_result.get('tasks_executed', 0)
+            total_duration = heartbeat_result.get('total_duration', 0)
+            logger.info(f"Startup heartbeat: {tasks_run} tasks in {total_duration:.2f}s")
+        else:
+            console.print(Panel(
+                "[dim]💓 Heartbeat is disabled[/dim]\n"
+                "Enable in settings for automatic memory optimization",
+                title="[yellow]Heartbeat Skipped[/yellow]",
+                border_style="yellow"
+            ))
+    except Exception as e:
+        console.print(Panel(
+            f"[yellow]⚠️ Startup heartbeat failed[/yellow]\n"
+            f"[dim]{str(e)[:200]}[/dim]\n"
+            "This is non-critical - the gateway will continue starting",
+            title="[yellow]Heartbeat Error[/yellow]",
+            border_style="yellow"
+        ))
+        logger.warning(f"Startup heartbeat error: {e}")
+
     lollms_client = get_lollms_client()
-    
-    # Register tools (single source of truth for tool registration)
-    async def register_tools():
-        tools_registered = []
-        tools_failed = []
-        
-        tools_to_register = [
-            ("filesystem", FilesystemTool()),
-            ("http", HttpTool()),
-            ("calendar", CalendarTool()),
-        ]
-        
-        # Shell tool - more dangerous, only register if explicitly enabled
-        if os.getenv("LOLLMSBOT_ENABLE_SHELL", "").lower() in ("true", "1", "yes"):
-            tools_to_register.append(("shell", ShellTool()))
-        
-        for name, tool in tools_to_register:
-            try:
-                # Check if already registered to avoid errors
-                if name not in agent.tools:
-                    await agent.register_tool(tool)
-                    tools_registered.append(name)
-                    console.print(f"[green]  • {tool.__class__.__name__} registered[/]")
-                else:
-                    console.print(f"[dim]  • {tool.__class__.__name__} already registered[/]")
-            except Exception as e:
-                tools_failed.append((name, str(e)))
-                if "already registered" not in str(e).lower():
-                    console.print(f"[yellow]  • {tool.__class__.__name__} failed: {e}[/]")
-        
-        # Log summary
-        if tools_registered:
-            console.print(f"[dim]  Registered: {', '.join(tools_registered)}[/]")
-        if tools_failed and not all("already registered" in str(e).lower() for _, e in tools_failed):
-            console.print(f"[yellow]  Some tools failed to register[/]")
-    
-    # Register tools during startup
-    await register_tools()
+
+    # Summary of registered tools
+    console.print(f"[bold cyan]🔧 Registered Tools ({len(agent.tools)}):[/]")
+    for name, tool in sorted(agent.tools.items()):
+        tool_type = "writing" if name in [
+            "ingest_document", "create_book_project", "create_outline",
+            "get_document_context", "write_section", "submit_written_content",
+            "search_references", "get_writing_progress"
+        ] else "base"
+        icon = "📚" if tool_type == "writing" else "🔧"
+        console.print(f"[dim]  {icon} {name}[/]")
     
     # Show environment info
     if agent.environment_info:
@@ -1088,6 +1132,61 @@ async def lifespan(app_: FastAPI):
             console.print(f"[red]❌ Telegram failed: {e}[/]")
     else:
         console.print("[dim]ℹ️  Telegram disabled (no TELEGRAM_BOT_TOKEN)[/]")
+    
+    # WhatsApp
+    if WHATSAPP_BACKEND:
+        try:
+            from lollmsbot.channels.whatsapp import WhatsAppChannel
+            
+            # Parse allowed/blocked numbers
+            def parse_number_list(val: Optional[str]) -> Optional[Set[str]]:
+                if not val:
+                    return None
+                try:
+                    return set(n.strip() for n in val.split(",") if n.strip())
+                except ValueError:
+                    return None
+            
+            allowed_numbers = parse_number_list(WHATSAPP_ALLOWED_NUMBERS)
+            blocked_numbers = parse_number_list(WHATSAPP_BLOCKED_NUMBERS)
+            
+            channel = WhatsAppChannel(
+                agent=agent,
+                backend=WHATSAPP_BACKEND,
+                web_js_path=WHATSAPP_WEB_JS_PATH,
+                account_sid=WHATSAPP_ACCOUNT_SID,
+                auth_token=WHATSAPP_AUTH_TOKEN,
+                from_number=WHATSAPP_FROM_NUMBER,
+                api_token=WHATSAPP_API_TOKEN,
+                webhook_secret=WHATSAPP_WEBHOOK_SECRET,
+                webhook_port=WHATSAPP_WEBHOOK_PORT,
+                allowed_numbers=allowed_numbers,
+                blocked_numbers=blocked_numbers,
+                require_confirmation=WHATSAPP_REQUIRE_CONFIRMATION.lower() in ("true", "1", "yes"),
+            )
+            _active_channels["whatsapp"] = channel
+            
+            task = asyncio.create_task(channel.start())
+            _channel_tasks.append(task)
+            
+            # Wait a moment for initialization
+            async def wait_whatsapp():
+                await asyncio.sleep(2)  # Give time for QR code or webhook setup
+                console.print("[green]✅ WhatsApp started[/]")
+                console.print(f"[dim]   Backend: {WHATSAPP_BACKEND}[/]")
+                if WHATSAPP_BACKEND == "web_js":
+                    console.print("[dim]   Scan QR code with your phone to authenticate[/]")
+                elif WHATSAPP_BACKEND in ("twilio", "business_api"):
+                    console.print(f"[dim]   Webhook port: {WHATSAPP_WEBHOOK_PORT}[/]")
+            
+            asyncio.create_task(wait_whatsapp())
+            
+        except Exception as e:
+            console.print(f"[red]❌ WhatsApp failed: {e}[/]")
+            import traceback
+            traceback.print_exc()
+    else:
+        console.print("[dim]ℹ️  WhatsApp disabled (no WHATSAPP_BACKEND configured)[/]")
     
     # Summary
     console.print(f"[bold green]📊 Active channels: {len(_active_channels)}[/]")

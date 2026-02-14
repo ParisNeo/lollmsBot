@@ -472,6 +472,7 @@ class Wizard:
                     Choice("🔗 AI Backend (Select Binding First)", "lollms"),
                     Choice("🤖 Discord Channel", "discord"),
                     Choice("✈️ Telegram Channel", "telegram"),
+                    Choice("💬 WhatsApp Channel", "whatsapp"),
                     Choice("🧬 Soul (Personality & Identity)", "soul"),
                     Choice("💓 Heartbeat (Self-Maintenance)", "heartbeat"),
                     Choice("🧠 Memory (Storage & Retention)", "memory"),
@@ -490,6 +491,8 @@ class Wizard:
                 self.configure_service("discord")
             elif action == "telegram":
                 self.configure_service("telegram")
+            elif action == "whatsapp":
+                self.configure_service("whatsapp")
             elif action == "soul":
                 self.configure_soul()
             elif action == "heartbeat":
@@ -520,11 +523,16 @@ class Wizard:
         
         # Core services
         services = tree.add("[bold]Services[/]")
-        for key in ["lollms", "discord", "telegram"]:
+        for key in ["lollms", "discord", "telegram", "whatsapp"]:
             configured = key in self.config and self.config[key]
             status = "✅" if configured else "⭕"
             color = "green" if configured else "dim"
-            display_name = "AI Backend" if key == "lollms" else key.title()
+            display_name = {
+                "lollms": "AI Backend",
+                "discord": "Discord",
+                "telegram": "Telegram",
+                "whatsapp": "WhatsApp",
+            }.get(key, key.title())
             services.add(f"[{color}]{status} {display_name}[/{color}]")
         
         # Show current binding if configured
@@ -794,7 +802,7 @@ class Wizard:
 
     # Legacy method - kept for backward compatibility but not used in main flow
     def configure_service(self, service_name: str) -> None:
-        """Configure a non-backend service (Discord, Telegram)."""
+        """Configure a non-backend service (Discord, Telegram, WhatsApp)."""
         if service_name == "lollms":
             # Redirect to new binding-first configuration
             return self.configure_backend()
@@ -827,7 +835,17 @@ class Wizard:
 2. Send /newbot and follow instructions
 3. Copy the HTTP API token provided""",
             },
+            "whatsapp": {
+                "title": "💬 WhatsApp Integration",
+                "fields": [],  # Custom handling below
+                "setup_instructions": "",  # Custom handling below
+            },
         }
+        
+        # Special handling for WhatsApp
+        if service_name == "whatsapp":
+            self._configure_whatsapp()
+            return
         
         service = SERVICES_CONFIG.get(service_name)
         if not service:
@@ -1519,6 +1537,220 @@ class Wizard:
 
         console.print(table)
 
+    def _configure_whatsapp(self) -> None:
+        """Configure WhatsApp integration with backend selection."""
+        console.print("\n[bold green]💬 WhatsApp Configuration[/]")
+        
+        # Select backend
+        backend = questionary.select(
+            "Choose WhatsApp backend:",
+            choices=[
+                Choice("📱 whatsapp-web.js (free, local, requires Node.js)", "web_js"),
+                Choice("☁️ Twilio API (cloud, requires account)", "twilio"),
+                Choice("🏢 WhatsApp Business API (official, webhook-based)", "business_api"),
+            ],
+            use_indicator=True,
+        ).ask()
+        
+        wa_config = self.config.setdefault("whatsapp", {})
+        wa_config["backend"] = backend
+        
+        console.print(f"\n[bold]Configuring {backend} backend...[/]")
+        
+        if backend == "web_js":
+            console.print(Panel(
+                """📱 whatsapp-web.js Setup:
+
+1. Install Node.js from https://nodejs.org/ (LTS version)
+2. The wizard will create a bridge script automatically
+3. On first run, scan the QR code with WhatsApp on your phone
+4. Your phone must stay connected to the internet
+
+[bold]Requirements:[/]
+• Node.js 16+ installed on this machine
+• WhatsApp on your phone (not WhatsApp Business necessarily)
+• Phone must remain online (not just for QR scan)""",
+                title="Setup Instructions",
+                border_style="blue"
+            ))
+            
+            # Path configuration
+            default_path = str(Path.home() / ".lollmsbot" / "whatsapp-bridge")
+            current_path = wa_config.get("web_js_path", default_path)
+            web_js_path = questionary.text(
+                "Bridge script directory",
+                default=current_path
+            ).ask()
+            wa_config["web_js_path"] = web_js_path
+            
+            # User restrictions
+            self._configure_whatsapp_users(wa_config)
+            
+            # Confirmation requirement
+            wa_config["require_confirmation"] = questionary.confirm(
+                "Require users to confirm before chatting? (sends welcome message)",
+                default=wa_config.get("require_confirmation", True)
+            ).ask()
+            
+        elif backend == "twilio":
+            console.print(Panel(
+                """☁️ Twilio WhatsApp Setup:
+
+1. Create a Twilio account at https://www.twilio.com/
+2. Get a WhatsApp-enabled number from Twilio Console
+3. Find your Account SID and Auth Token in Console Dashboard
+4. Configure webhook URL in Twilio Console (after starting gateway)
+
+[bold]Note:[/] Twilio has usage costs but is reliable and cloud-based""",
+                title="Setup Instructions",
+                border_style="blue"
+            ))
+            
+            # Credentials
+            current_sid = wa_config.get("account_sid", "")
+            account_sid = questionary.text("Twilio Account SID", default=current_sid).ask()
+            wa_config["account_sid"] = account_sid
+            
+            current_token = wa_config.get("auth_token", "")
+            auth_token = questionary.password("Twilio Auth Token", default=current_token).ask()
+            wa_config["auth_token"] = auth_token
+            
+            # WhatsApp number
+            current_from = wa_config.get("from_number", "")
+            from_number = questionary.text(
+                "Your Twilio WhatsApp Number (with +country code)",
+                default=current_from,
+                instruction="e.g., +14155238886"
+            ).ask()
+            wa_config["from_number"] = from_number
+            
+            # Webhook port
+            current_port = wa_config.get("webhook_port", 8081)
+            webhook_port = IntPrompt.ask("Webhook port for incoming messages", default=current_port)
+            wa_config["webhook_port"] = webhook_port
+            
+            self._configure_whatsapp_users(wa_config)
+            
+        elif backend == "business_api":
+            console.print(Panel(
+                """🏢 WhatsApp Business API Setup:
+
+1. Create a Meta Developer account at https://developers.facebook.com/
+2. Set up a WhatsApp Business account and get API token
+3. Configure webhook endpoint in Meta Dashboard
+4. Verify webhook with secret token
+
+[bold]Note:[/] This is the official API, best for production use""",
+                title="Setup Instructions",
+                border_style="blue"
+            ))
+            
+            # API credentials
+            current_token = wa_config.get("api_token", "")
+            api_token = questionary.password("WhatsApp Business API Token", default=current_token).ask()
+            wa_config["api_token"] = api_token
+            
+            # Phone number ID
+            current_phone_id = wa_config.get("from_number", "")
+            phone_id = questionary.text(
+                "WhatsApp Business Phone Number ID",
+                default=current_phone_id
+            ).ask()
+            wa_config["from_number"] = phone_id
+            
+            # Webhook configuration
+            current_secret = wa_config.get("webhook_secret", "")
+            webhook_secret = questionary.password(
+                "Webhook Verify Token (for Meta verification)",
+                default=current_secret
+            ).ask()
+            wa_config["webhook_secret"] = webhook_secret
+            
+            current_port = wa_config.get("webhook_port", 8081)
+            webhook_port = IntPrompt.ask("Webhook port", default=current_port)
+            wa_config["webhook_port"] = webhook_port
+            
+            self._configure_whatsapp_users(wa_config)
+        
+        self._configured.add("whatsapp")
+        console.print("[green]✅ WhatsApp configured![/]")
+        
+        # Show summary
+        self._show_whatsapp_summary(wa_config)
+    
+    def _configure_whatsapp_users(self, wa_config: Dict[str, Any]) -> None:
+        """Configure allowed/blocked users for WhatsApp."""
+        # Allowed numbers
+        current_allowed = wa_config.get("allowed_numbers", [])
+        allowed_str = ",".join(current_allowed) if current_allowed else ""
+        
+        allowed_input = questionary.text(
+            "Allowed phone numbers (comma-separated, optional - empty = allow all)",
+            default=allowed_str,
+            instruction="Format: +1234567890, +441234567890"
+        ).ask()
+        
+        if allowed_input.strip():
+            wa_config["allowed_numbers"] = [
+                n.strip() for n in allowed_input.split(",") if n.strip()
+            ]
+        else:
+            wa_config["allowed_numbers"] = []
+        
+        # Blocked numbers
+        current_blocked = wa_config.get("blocked_numbers", [])
+        blocked_str = ",".join(current_blocked) if current_blocked else ""
+        
+        blocked_input = questionary.text(
+            "Blocked phone numbers (comma-separated, optional)",
+            default=blocked_str
+        ).ask()
+        
+        if blocked_input.strip():
+            wa_config["blocked_numbers"] = [
+                n.strip() for n in blocked_input.split(",") if n.strip()
+            ]
+        else:
+            wa_config["blocked_numbers"] = []
+    
+    def _show_whatsapp_summary(self, wa_config: Dict[str, Any]) -> None:
+        """Show WhatsApp configuration summary."""
+        table = Table(title="WhatsApp Configuration Summary")
+        table.add_column("Setting", style="cyan")
+        table.add_column("Value", style="green")
+        
+        backend = wa_config.get("backend", "unknown")
+        backend_display = {
+            "web_js": "📱 whatsapp-web.js (local)",
+            "twilio": "☁️ Twilio (cloud)",
+            "business_api": "🏢 Business API (official)",
+        }.get(backend, backend)
+        
+        table.add_row("Backend", backend_display)
+        
+        if backend == "web_js":
+            table.add_row("Bridge Path", wa_config.get("web_js_path", "Not set"))
+        elif backend == "twilio":
+            has_sid = bool(wa_config.get("account_sid"))
+            has_token = bool(wa_config.get("auth_token"))
+            table.add_row("Account SID", "✅ Set" if has_sid else "❌ Not set")
+            table.add_row("Auth Token", "✅ Set" if has_token else "❌ Not set")
+            table.add_row("From Number", wa_config.get("from_number", "Not set") or "Not set")
+            table.add_row("Webhook Port", str(wa_config.get("webhook_port", 8081)))
+        elif backend == "business_api":
+            has_token = bool(wa_config.get("api_token"))
+            table.add_row("API Token", "✅ Set" if has_token else "❌ Not set")
+            table.add_row("Phone Number ID", wa_config.get("from_number", "Not set") or "Not set")
+            table.add_row("Webhook Port", str(wa_config.get("webhook_port", 8081)))
+        
+        allowed = wa_config.get("allowed_numbers", [])
+        blocked = wa_config.get("blocked_numbers", [])
+        table.add_row("Allowed Numbers", str(len(allowed)) if allowed else "All")
+        table.add_row("Blocked Numbers", str(len(blocked)))
+        table.add_row("Require Confirmation", "Yes" if wa_config.get("require_confirmation") else "No")
+        
+        console.print(table)
+    
     def _test_single(self, service_name: str, config: Dict[str, Any]) -> tuple[str, str]:
         """Test a single service connection."""
         try:
@@ -1557,6 +1789,32 @@ class Wizard:
                     "🔍 CONFIGURED" if has_token else "⭕ NO TOKEN",
                     f"Token: {'✅' if has_token else '❌'}"
                 )
+            
+            elif service_name == "whatsapp":
+                backend = config.get("backend", "unknown")
+                if backend == "web_js":
+                    has_path = bool(config.get("web_js_path"))
+                    return (
+                        "🔍 CONFIGURED" if has_path else "⭕ INCOMPLETE",
+                        f"Backend: {backend}, Path: {'✅' if has_path else '❌'}"
+                    )
+                elif backend == "twilio":
+                    has_creds = all([
+                        config.get("account_sid"),
+                        config.get("auth_token"),
+                        config.get("from_number")
+                    ])
+                    return (
+                        "🔍 CONFIGURED" if has_creds else "⭕ INCOMPLETE",
+                        f"Backend: {backend}, Creds: {'✅' if has_creds else '❌'}"
+                    )
+                elif backend == "business_api":
+                    has_token = bool(config.get("api_token"))
+                    return (
+                        "🔍 CONFIGURED" if has_token else "⭕ INCOMPLETE",
+                        f"Backend: {backend}, Token: {'✅' if has_token else '❌'}"
+                    )
+                return ("⭕ NO BACKEND", "Backend not selected")
                 
             return ("❓ SKIP", "-")
             

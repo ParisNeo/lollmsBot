@@ -10,13 +10,26 @@ from lollmsbot.channels.http_api import HttpApiChannel
 # Telegram is optional - import if available
 try:
     from lollmsbot.channels.telegram import TelegramChannel
-    __all__ = [
-        "DiscordChannel",
-        "TelegramChannel",
-        "HttpApiChannel",
-    ]
+    TELEGRAM_AVAILABLE = True
 except ImportError:
-    __all__ = [
-        "DiscordChannel",
-        "HttpApiChannel",
-    ]
+    TELEGRAM_AVAILABLE = False
+    TelegramChannel = None  # type: ignore
+
+# WhatsApp is optional - import if dependencies available
+try:
+    from lollmsbot.channels.whatsapp import WhatsAppChannel
+    WHATSAPP_AVAILABLE = True
+except ImportError:
+    WHATSAPP_AVAILABLE = False
+    WhatsAppChannel = None  # type: ignore
+
+__all__ = [
+    "DiscordChannel",
+    "HttpApiChannel",
+]
+
+if TELEGRAM_AVAILABLE:
+    __all__.append("TelegramChannel")
+
+if WHATSAPP_AVAILABLE:
+    __all__.append("WhatsAppChannel")

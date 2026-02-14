@@ -278,132 +278,310 @@ class Agent:
         query: str,
     ) -> List[Dict[str, Any]]:
         """
-        Search for relevant memories and return loaded content.
-        PRIORITIZES web_content chunks with substantive content.
+        Multi-step memory retrieval with progressive refinement.
+        
+        Performs multiple "inner turns" of memory searching:
+        1. Initial broad search for context
+        2. Follow-up targeted searches based on initial findings
+        3. Deep loading of high-relevance content
+        4. Cross-referencing related memories
+        
+        Returns rich memory context for the LLM to reason about.
         """
-        loaded_content = []
-        seen_chunks = set()
+        loaded_content: List[Dict[str, Any]] = []
+        seen_chunks: Set[str] = set()
+        search_iterations: int = 0
+        max_iterations: int = 3  # Allow multiple search passes
         
-        # Extract key terms from query for better searching
-        key_terms = self._extract_key_terms(query)
-        self._logger.log(f"🔍 Searching for: '{query}' (terms: {key_terms})", "cyan")
+        # Start with the original query
+        current_queries: List[str] = [query]
+        extracted_entities: Set[str] = set()
         
-        # CRITICAL: Search WITHOUT type restrictions first to get ALL relevant content
-        # The database search searches in summary, tags, load_hints AND content preview
-        all_results = await memory.search_ems(
-            query=query,
-            limit=20,
-        )
+        self._logger.log(f"🔍 Starting multi-step memory retrieval for: '{query}'", "cyan")
         
-        self._logger.log(f"🔍 Found {len(all_results)} total chunks", "cyan")
-        
-        # Also search with key terms
-        if len(key_terms) > 0:
-            key_term_query = " ".join(key_terms)
-            key_results = await memory.search_ems(
-                query=key_term_query,
-                limit=15,
-            )
-            # Merge and deduplicate
-            for chunk, score in key_results:
-                found = False
-                for existing_chunk, existing_score in all_results:
-                    if existing_chunk.chunk_id == chunk.chunk_id:
-                        found = True
-                        break
-                if not found:
-                    all_results.append((chunk, score))
-        
-        self._logger.log(f"🔍 Total after key term search: {len(all_results)} chunks", "cyan")
-        
-        # Sort by score descending
-        all_results.sort(key=lambda x: -x[1])
-        
-        # Process results - prioritize web content
-        web_content_loaded = 0
-        other_content_loaded = 0
-        
-        for chunk, score in all_results:
-            if chunk.chunk_id in seen_chunks:
-                continue
-            seen_chunks.add(chunk.chunk_id)
+        while search_iterations < max_iterations and current_queries:
+            search_iterations += 1
+            self._logger.log(f"🔍 Memory iteration {search_iterations}: {len(current_queries)} queries", "cyan")
             
-            try:
-                content = chunk.decompress_content()
+            iteration_results: List[tuple[Any, float]] = []
+            
+            # Search with all current queries
+            for q in current_queries:
+                # Extract key terms for this query
+                key_terms = self._extract_key_terms(q)
                 
-                # Skip if too short
-                if len(content) < 100:
-                    continue
+                # Primary search
+                results = await memory.search_ems(query=q, limit=15)
+                iteration_results.extend(results)
                 
-                # Prioritize web content
-                if chunk.chunk_type == MemoryChunkType.WEB_CONTENT and web_content_loaded < 3:
-                    # For web content, we want substantial excerpts
-                    # But limit to avoid overwhelming the context
-                    excerpt = content[:15000] if len(content) > 15000 else content
+                # Secondary search with key terms
+                if key_terms:
+                    key_query = " ".join(key_terms[:5])  # Top 5 terms
+                    key_results = await memory.search_ems(query=key_query, limit=10)
+                    iteration_results.extend(key_results)
                     
-                    loaded_content.append({
+                    # Extract entities for follow-up searches
+                    for term in key_terms:
+                        if len(term) > 3 and not term.isdigit():
+                            extracted_entities.add(term)
+            
+            # Sort and deduplicate results
+            iteration_results.sort(key=lambda x: -x[1])
+            unique_results: List[tuple[Any, float]] = []
+            for chunk, score in iteration_results:
+                if chunk.chunk_id not in seen_chunks:
+                    seen_chunks.add(chunk.chunk_id)
+                    unique_results.append((chunk, score))
+            
+            self._logger.log(f"🔍 Iteration {search_iterations}: {len(unique_results)} unique results", "cyan")
+            
+            # Determine which chunks to load deeply
+            # Load top results and anything scoring above threshold
+            load_candidates = [
+                (chunk, score) for chunk, score in unique_results[:10]  # Top 10
+                if score > 3.0 or chunk.memory_importance > 5.0  # Or high importance
+            ]
+            
+            # Load content from candidates
+            new_entities_from_content: Set[str] = set()
+            
+            for chunk, score in load_candidates:
+                try:
+                    content = chunk.decompress_content()
+                    
+                    # Skip very short content
+                    if len(content) < 50:
+                        continue
+                    
+                    # Check if we already have similar content
+                    is_duplicate = False
+                    for existing in loaded_content:
+                        # Simple similarity check - avoid near-duplicates
+                        if self._content_similarity(content, existing["content"]) > 0.85:
+                            is_duplicate = True
+                            break
+                    
+                    if is_duplicate:
+                        continue
+                    
+                    # Extract additional entities from content for next iteration
+                    content_entities = self._extract_entities_from_text(content)
+                    new_entities_from_content.update(content_entities)
+                    
+                    # Determine how much to load based on content type and score
+                    load_size = self._determine_load_size(chunk, score)
+                    
+                    # Build rich content object
+                    content_obj = {
                         "chunk_id": chunk.chunk_id,
-                        "type": "web_content",
-                        "title": chunk.summary or "Web content",
-                        "content": excerpt,
+                        "type": chunk.chunk_type.name.lower(),
+                        "title": chunk.summary or f"Memory from {chunk.source or 'unknown'}",
+                        "content": content[:load_size] if len(content) > load_size else content,
                         "full_length": len(content),
                         "score": score,
-                    })
+                        "importance": chunk.memory_importance,
+                        "tags": chunk.tags or [],
+                        "source": chunk.source,
+                        "created_at": chunk.created_at.isoformat() if chunk.created_at else None,
+                    }
                     
+                    # Add full content to anchor cache for potential follow-up
                     self._anchor_cache[chunk.chunk_id] = content
+                    
+                    # Load into RCB so it's immediately available
+                    await memory.load_from_ems(chunk.chunk_id, add_to_rcb=True)
                     self._loaded_anchors.add(chunk.chunk_id)
-                    web_content_loaded += 1
+                    
+                    loaded_content.append(content_obj)
                     
                     self._logger.log(
-                        f"📥 Loaded web content: {chunk.chunk_id[:20]}... ({len(content)} chars, score={score:.1f})",
+                        f"📥 Loaded: {chunk.chunk_id[:16]}... ({content_obj['type']}, "
+                        f"score={score:.1f}, imp={chunk.memory_importance:.1f}, {len(content)} chars)",
                         "green"
                     )
                     
-                elif chunk.chunk_type == MemoryChunkType.FACT and other_content_loaded < 2:
-                    loaded_content.append({
-                        "chunk_id": chunk.chunk_id,
-                        "type": "fact",
-                        "title": "User information",
-                        "content": content[:2000],
-                        "full_length": len(content),
-                        "score": score,
-                    })
-                    self._anchor_cache[chunk.chunk_id] = content
-                    other_content_loaded += 1
-                    
-                elif chunk.chunk_type == MemoryChunkType.CONVERSATION and other_content_loaded < 2:
-                    # Parse conversation
-                    try:
-                        conv_data = json.loads(content)
-                        user_msg = conv_data.get("user_message", "")
-                        agent_resp = conv_data.get("agent_response", "")
-                        
-                        if len(user_msg) > 20:
-                            loaded_content.append({
-                                "chunk_id": chunk.chunk_id,
-                                "type": "conversation",
-                                "title": "Previous conversation",
-                                "content": f"User: {user_msg}\nAssistant: {agent_resp[:1000]}",
-                                "full_length": len(content),
-                                "score": score,
-                            })
-                            other_content_loaded += 1
-                    except:
-                        pass
+                except Exception as e:
+                    self._logger.log(f"Failed to load {chunk.chunk_id}: {e}", "yellow")
+            
+            # Prepare next iteration queries
+            if search_iterations < max_iterations:
+                # Generate follow-up queries from new entities
+                next_queries: List[str] = []
                 
-                # Stop once we have enough content
-                if web_content_loaded >= 2 and other_content_loaded >= 1:
+                # Combine extracted entities in various ways
+                entity_list = list(new_entities_from_content - extracted_entities)
+                extracted_entities.update(new_entities_from_content)
+                
+                if len(entity_list) >= 2:
+                    # Pairwise combinations for deeper search
+                    for i in range(min(3, len(entity_list))):
+                        for j in range(i+1, min(5, len(entity_list))):
+                            combined = f"{entity_list[i]} {entity_list[j]}"
+                            if len(combined) < 100:
+                                next_queries.append(combined)
+                
+                # Add individual high-value entities
+                for entity in entity_list[:3]:
+                    if len(entity) > 4:
+                        next_queries.append(entity)
+                
+                # Limit and deduplicate next queries
+                current_queries = list(set(next_queries))[:5]
+                
+                if not current_queries:
+                    self._logger.log("🔍 No new entities to explore, stopping early", "cyan")
                     break
-                    
-            except Exception as e:
-                self._logger.log(f"Failed to load {chunk.chunk_id}: {e}", "yellow")
+            else:
+                current_queries = []
+        
+        # Final enrichment: find related memories for loaded content
+        if loaded_content:
+            await self._enrich_with_related_memories(memory, loaded_content, seen_chunks)
         
         self._logger.log(
-            f"✅ Loaded {web_content_loaded} web content + {other_content_loaded} other = {len(loaded_content)} total",
-            "green" if web_content_loaded > 0 else "yellow"
+            f"✅ Memory retrieval complete: {len(loaded_content)} chunks after {search_iterations} iterations",
+            "green" if loaded_content else "yellow"
         )
         
+        # Log what's available for debugging
+        content_summary = ", ".join([
+            f"{c['type']}:{c['chunk_id'][:8]}" for c in loaded_content[:5]
+        ])
+        self._logger.log(f"📋 Available: {content_summary}", "cyan")
+        
         return loaded_content
+    
+    def _content_similarity(self, text1: str, text2: str) -> float:
+        """Simple Jaccard similarity for deduplication."""
+        words1 = set(text1.lower().split())
+        words2 = set(text2.lower().split())
+        
+        if not words1 or not words2:
+            return 0.0
+        
+        intersection = words1 & words2
+        union = words1 | words2
+        
+        return len(intersection) / len(union) if union else 0.0
+    
+    def _extract_entities_from_text(self, text: str) -> Set[str]:
+        """Extract potential entities (names, key terms) from text."""
+        entities: Set[str] = set()
+        
+        # Look for quoted phrases
+        quoted = re.findall(r'"([^"]{3,50})"', text)
+        entities.update(quoted)
+        
+        # Capitalized phrases (potential names/titles)
+        capitalized = re.findall(r'\b[A-Z][a-zA-Z\s]{2,30}[a-z]\b', text)
+        entities.update([c.strip() for c in capitalized if len(c.strip()) > 3])
+        
+        # Technical terms with special chars
+        technical = re.findall(r'\b\w+[-_]\w+\b', text)
+        entities.update([t for t in technical if len(t) > 4])
+        
+        # URLs/domains
+        urls = re.findall(r'https?://[^\s]+', text)
+        for url in urls:
+            # Extract domain as entity
+            try:
+                from urllib.parse import urlparse
+                parsed = urlparse(url)
+                if parsed.netloc:
+                    entities.add(parsed.netloc)
+            except:
+                pass
+        
+        return entities
+    
+    def _determine_load_size(self, chunk: Any, score: float) -> int:
+        """Determine how much content to load based on relevance and type."""
+        base_size = 5000
+        
+        # Higher score = more content
+        if score > 8.0:
+            base_size = 20000  # Very relevant - load lots
+        elif score > 5.0:
+            base_size = 15000  # Quite relevant
+        elif score > 3.0:
+            base_size = 10000  # Moderately relevant
+        
+        # Web content gets more for creative works
+        from lollmsbot.agent.rlm.models import MemoryChunkType
+        if chunk.chunk_type == MemoryChunkType.WEB_CONTENT:
+            # Check if it looks like a creative work
+            summary_lower = (chunk.summary or "").lower()
+            if any(term in summary_lower for term in ["novel", "book", "story", "fiction", "creative"]):
+                base_size = min(base_size * 2, 50000)  # Up to 50K for creative works
+        
+        # High importance memories get full load
+        if chunk.memory_importance > 8.0:
+            base_size = max(base_size, 30000)
+        
+        return base_size
+    
+    async def _enrich_with_related_memories(
+        self,
+        memory: RLMMemoryManager,
+        loaded_content: List[Dict[str, Any]],
+        seen_chunks: Set[str],
+    ) -> None:
+        """Find memories related to already-loaded content for cross-referencing."""
+        # Extract key terms from loaded content
+        all_text = " ".join([c["content"][:500] for c in loaded_content])
+        key_terms = self._extract_key_terms(all_text)
+        
+        if len(key_terms) < 2:
+            return
+        
+        # Search for related content with combined terms
+        related_query = " ".join(key_terms[:4])
+        
+        try:
+            related = await memory.search_ems(
+                query=related_query,
+                limit=8,
+            )
+            
+            added = 0
+            for chunk, score in related:
+                if chunk.chunk_id in seen_chunks:
+                    continue
+                
+                # Only add if strongly related
+                if score < 4.0:
+                    continue
+                
+                try:
+                    content = chunk.decompress_content()
+                    if len(content) < 100:
+                        continue
+                    
+                    # Add as "related" reference
+                    loaded_content.append({
+                        "chunk_id": chunk.chunk_id,
+                        "type": "related",
+                        "title": f"Related: {chunk.summary or 'memory'}"[:50],
+                        "content": content[:3000],  # Smaller excerpt for related
+                        "full_length": len(content),
+                        "score": score,
+                        "relation_note": f"Related to main query (score: {score:.1f})",
+                    })
+                    
+                    seen_chunks.add(chunk.chunk_id)
+                    added += 1
+                    
+                    if added >= 2:  # Limit related memories
+                        break
+                        
+                except Exception:
+                    continue
+            
+            if added > 0:
+                self._logger.log(f"📎 Added {added} related memories for cross-reference", "cyan")
+                
+        except Exception as e:
+            self._logger.log(f"Related memory enrichment failed: {e}", "yellow")
     
     def _extract_key_terms(self, query: str) -> List[str]:
         """Extract meaningful key terms from query for searching."""
@@ -827,6 +1005,14 @@ class Agent:
         # CRITICAL: Search and load relevant memories
         loaded_memories = await self._search_and_load_memories(memory, user_id, message)
         
+        # Get memory structure for LLM introspection
+        memory_structure = ""
+        if self._memory:
+            try:
+                memory_structure = await self._memory.get_memory_structure_for_prompt(max_length=3000)
+            except Exception as e:
+                self._logger.log(f"Failed to generate memory structure: {e}", "yellow")
+        
         # Build prompt with loaded content
         soul = self._ensure_soul()
         system_prompt = self._build_system_prompt(
@@ -835,6 +1021,7 @@ class Agent:
             conversation_history=conversation_history,
             loaded_memories=loaded_memories,
             is_file_request=is_file_request,
+            memory_structure=memory_structure,
         )
         
         # CRITICAL DEBUG: Log the actual memory content being sent
@@ -910,77 +1097,125 @@ class Agent:
         conversation_history: List[ConversationTurn],
         loaded_memories: List[Dict[str, Any]],
         is_file_request: bool,
+        memory_structure: str = "",
     ) -> str:
-        """Build system prompt with loaded memories integrated naturally."""
+        """Build system prompt with multi-step memory reasoning instructions."""
         
         # Start with soul identity
         if soul:
             base_prompt = soul.generate_system_prompt(context)
         else:
-            base_prompt = f"You are {self.name}, a helpful AI assistant."
+            base_prompt = f"You are {self.name}, a helpful AI assistant with persistent memory."
         
         parts = [base_prompt]
+        
+        # Add memory structure awareness (NEW)
+        if memory_structure:
+            parts.append(memory_structure)
+            parts.append("")  # Separator
         
         # Add conversation history
         if conversation_history:
             parts.append(self._format_history_for_prompt(conversation_history))
         
-        # CRITICAL: Add loaded memories with FULL CONTENT - this is the key fix
+        # CRITICAL: Multi-step memory reasoning section
         if loaded_memories:
-            # Sort by type: web_content first, then others
-            web_memories = [m for m in loaded_memories if m.get("type") == "web_content"]
-            other_memories = [m for m in loaded_memories if m.get("type") != "web_content"]
-            sorted_memories = web_memories + other_memories
+            # Sort memories by relevance and type
+            sorted_memories = self._prioritize_memories(loaded_memories)
             
             memory_parts = []
             
-            # Add a very clear header
+            # Section header
             memory_parts.append("")
             memory_parts.append("=" * 80)
-            memory_parts.append("BELOW IS THE FULL CONTENT OF RELEVANT MEMORIES FROM LONG-TERM STORAGE")
+            memory_parts.append("YOUR MEMORY - MULTI-STEP REASONING REQUIRED")
             memory_parts.append("=" * 80)
             memory_parts.append("")
-            memory_parts.append("⚠️  IMPORTANT: Read this content carefully and use it to answer the user's question.")
-            memory_parts.append("⚠️  The user is asking about something you've discussed before - it's RIGHT BELOW.")
-            memory_parts.append("⚠️  DO NOT say you don't remember or don't have access - you DO have it below!")
+            memory_parts.append("You have retrieved the following information from your long-term memory.")
+            memory_parts.append("BEFORE answering, you MUST engage in explicit reasoning about what you found.")
             memory_parts.append("")
             
-            for i, mem in enumerate(sorted_memories[:3], 1):  # Top 3 max
+            # Step 1: What was retrieved
+            memory_parts.append("STEP 1 - MEMORY INVENTORY:")
+            memory_parts.append("Review each memory and assess its relevance to the user's question.")
+            memory_parts.append("")
+            
+            for i, mem in enumerate(sorted_memories[:5], 1):  # Top 5 memories
                 mem_type = mem.get("type", "unknown")
                 title = mem.get("title", "Memory")
-                content = mem.get("content", "")
+                content = mem.get("content", "")[:10000]  # Limit individual chunks but show substantial content
+                score = mem.get("score", 0)
+                importance = mem.get("importance", 1.0)
                 
-                memory_parts.append(f"{'='*80}")
-                memory_parts.append(f"MEMORY {i}: {title}")
-                memory_parts.append(f"Type: {mem_type} | Full length: {mem.get('full_length', len(content))} chars")
-                memory_parts.append(f"{'='*80}")
-                memory_parts.append("CONTENT:")
-                memory_parts.append(content)  # FULL content, no truncation here
-                memory_parts.append("")
-                memory_parts.append(f"--- END MEMORY {i} ---")
+                memory_parts.append(f"{'='*60}")
+                memory_parts.append(f"[{i}] {title}")
+                memory_parts.append(f"Relevance: {score:.1f}/10 | Importance: {importance:.1f}/10 | Type: {mem_type}")
+                
+                # Show tags if available
+                tags = mem.get("tags", [])
+                if tags:
+                    memory_parts.append(f"Tags: {', '.join(tags[:5])}")
+                
+                # Show source if relevant
+                source = mem.get("source", "")
+                if source and "http" in source:
+                    memory_parts.append(f"Source: {source[:100]}")
+                
+                memory_parts.append(f"{'='*60}")
+                memory_parts.append(content)
                 memory_parts.append("")
             
-            memory_parts.append("=" * 80)
-            memory_parts.append("END OF LOADED MEMORIES")
-            memory_parts.append("=" * 80)
+            # Step 2: Instructions for inner reasoning
             memory_parts.append("")
-            memory_parts.append("INSTRUCTIONS:")
-            memory_parts.append("1. Use the information ABOVE to answer the user's question.")
-            memory_parts.append("2. DO NOT mention 'memory', 'stored', 'database', 'loaded', or technical terms.")
-            memory_parts.append("3. DO NOT say 'According to my memory...' - just answer naturally.")
-            memory_parts.append("4. If the user asks about a novel/story above, DESCRIBE IT from the content.")
-            memory_parts.append("5. Speak as if you personally remember this, not as if you're reading a file.")
+            memory_parts.append("STEP 2 - INNER REASONING (Think Before You Answer):")
+            memory_parts.append("Before responding, you MUST ask yourself:")
+            memory_parts.append("")
+            memory_parts.append("Q1: What specific information in the memories above answers the user's question?")
+            memory_parts.append("Q2: Is there conflicting information? If so, which source is more reliable?")
+            memory_parts.append("Q3: What gaps remain? Do I need to ask clarifying questions?")
+            memory_parts.append("Q4: How does this relate to our previous conversations?")
+            memory_parts.append("Q5: Is there a specific quote or detail I should reference?")
+            memory_parts.append("")
+            memory_parts.append("Write your reasoning process (this won't be shown to the user):")
+            memory_parts.append("<thinking>")
+            memory_parts.append("[Your analysis of the memories and how they relate to the question]")
+            memory_parts.append("</thinking>")
+            memory_parts.append("")
+            
+            # Step 3: Answer synthesis instructions
+            memory_parts.append("STEP 3 - SYNTHESIZE YOUR ANSWER:")
+            memory_parts.append("Based on your reasoning above, now compose your response.")
+            memory_parts.append("IMPORTANT RULES:")
+            memory_parts.append("- DO NOT mention 'memory', 'database', 'retrieved', or 'stored'")
+            memory_parts.append("- DO NOT say 'According to my memory...' - just share what you know")
+            memory_parts.append("- Reference specific details from the content above naturally")
+            memory_parts.append("- If you found relevant information, use it confidently")
+            memory_parts.append("- If memories don't answer the question, say so honestly")
+            memory_parts.append("")
+            
+            # Handle related memories specially
+            related = [m for m in sorted_memories if m.get("type") == "related"]
+            if related:
+                memory_parts.append("ADDITIONAL CONTEXT (Related Memories):")
+                for mem in related[:2]:
+                    memory_parts.append(f"- {mem.get('title', 'Related memory')}: {mem.get('content', '')[:200]}...")
+                memory_parts.append("")
             
             parts.append("\n".join(memory_parts))
         else:
             # No memories found
             parts.append("")
             parts.append("=" * 80)
-            parts.append("NO RELEVANT MEMORIES FOUND")
+            parts.append("MEMORY SEARCH RESULTS")
             parts.append("=" * 80)
             parts.append("")
-            parts.append("I don't have specific information about this topic in my memory.")
-            parts.append("I'll answer based on my general knowledge or ask for clarification.")
+            parts.append("I searched my memory but found no directly relevant information.")
+            parts.append("<thinking>")
+            parts.append("No memories match this query. I should answer based on:")
+            parts.append("- The current conversation context")
+            parts.append("- My general knowledge")
+            parts.append("- Asking for clarification if needed")
+            parts.append("</thinking>")
         
         # Add tool instructions
         parts.append("")
@@ -993,16 +1228,20 @@ class Agent:
         if is_file_request:
             parts.append("FILE GENERATION: Use filesystem tool to create files when requested.")
         
-        # Final reminder
+        # Final synthesis instruction
         parts.append("")
-        parts.append("FINAL REMINDER: Answer based on the MEMORY CONTENT shown above if available.")
-        parts.append("Speak naturally - DO NOT reference memory IDs or technical storage terms.")
+        parts.append("=" * 60)
+        parts.append("RESPONSE PROTOCOL")
+        parts.append("=" * 60)
+        parts.append("1. First, analyze your memories in <thinking> tags (not shown to user)")
+        parts.append("2. Then provide your actual response")
+        parts.append("3. If you found relevant information, use it naturally")
+        parts.append("4. Never reveal technical details about your memory system")
         
         if context:
             channel = context.get("channel", "unknown")
-            parts.append(f"Channel: {channel}")
+            parts.append(f"\nChannel: {channel}")
             
-            # Add document contexts if present
             doc_contexts = context.get("document_contexts")
             if doc_contexts:
                 parts.append("")
@@ -1014,11 +1253,29 @@ class Agent:
                     parts.append(doc_ctx)
         
         final_prompt = "\n".join(parts)
-        
-        # Log prompt length for debugging
-        self._logger.log(f"📝 System prompt length: {len(final_prompt)} characters", "cyan")
+        self._logger.log(f"📝 System prompt: {len(final_prompt)} chars, {len(loaded_memories)} memories", "cyan")
         
         return final_prompt
+    
+    def _prioritize_memories(self, memories: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Sort memories by relevance, importance, and recency."""
+        def score_memory(mem: Dict[str, Any]) -> float:
+            base_score = mem.get("score", 0)
+            importance = mem.get("importance", 1.0)
+            
+            # Boost certain types
+            mem_type = mem.get("type", "")
+            type_boost = 1.0
+            if mem_type == "web_content":
+                type_boost = 1.2  # Web content often has detailed info
+            elif mem_type == "fact":
+                type_boost = 1.3  # Explicit facts are important
+            elif mem_type == "related":
+                type_boost = 0.8  # Related is slightly less direct
+            
+            return base_score * importance * type_boost
+        
+        return sorted(memories, key=score_memory, reverse=True)
     
     async def _handle_informational_query(
         self,

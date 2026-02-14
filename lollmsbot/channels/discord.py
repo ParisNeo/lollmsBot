@@ -5,12 +5,12 @@ import subprocess
 from datetime import datetime
 from typing import Optional, Set, Dict, Any, List
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import discord
 from discord import Embed, Color, File
 
 from lollmsbot.agent import Agent, PermissionLevel
-from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -269,6 +269,164 @@ class DiscordChannel:
                 pass
         return None
 
+    async def _handle_file_attachment(self, message: discord.Message) -> None:
+        """Handle file attachments in DMs - store and create memory entry."""
+        if not message.attachments:
+            return
+        
+        user_id = self._get_user_id(message)
+        discord_id = message.author.id
+        
+        # Get filesystem tool from agent
+        fs_tool = self.agent.tools.get("filesystem")
+        if not fs_tool:
+            logger.warning("Filesystem tool not available for file storage")
+            await message.reply("⚠️ File storage is currently unavailable.")
+            return
+        
+        # Create user-specific directory
+        user_dir = fs_tool.output_dir / "discord_uploads" / str(discord_id)
+        user_dir.mkdir(parents=True, exist_ok=True)
+        
+        stored_files = []
+        
+        for attachment in message.attachments:
+            try:
+                # Validate file
+                if attachment.size > 25 * 1024 * 1024:  # 25MB limit
+                    await message.reply(f"❌ File '{attachment.filename}' too large (max 25MB)")
+                    continue
+                
+                # Check file type
+                allowed_extensions = {'.txt', '.md', '.py', '.js', '.html', '.css', '.json', 
+                                    '.csv', '.pdf', '.doc', '.docx', '.png', '.jpg', '.jpeg', 
+                                    '.gif', '.zip', '.tar', '.gz', '.xml', '.yaml', '.yml'}
+                file_ext = Path(attachment.filename).suffix.lower()
+                
+                if file_ext not in allowed_extensions:
+                    await message.reply(f"⚠️ File type '{file_ext}' not allowed. Skipping '{attachment.filename}'")
+                    continue
+                
+                # Download file
+                file_path = user_dir / attachment.filename
+                
+                # Use aiohttp for async download
+                import aiohttp
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(attachment.url) as resp:
+                        if resp.status == 200:
+                            content = await resp.read()
+                            file_path.write_bytes(content)
+                        else:
+                            logger.error(f"Failed to download {attachment.filename}: HTTP {resp.status}")
+                            continue
+                
+                stored_files.append({
+                    "filename": attachment.filename,
+                    "path": str(file_path),
+                    "size": len(content),
+                    "content_type": attachment.content_type or "unknown",
+                })
+                
+                logger.info(f"Stored file for user {discord_id}: {attachment.filename} ({len(content)} bytes)")
+                
+            except Exception as e:
+                logger.error(f"Failed to process attachment {attachment.filename}: {e}")
+                await message.reply(f"❌ Failed to store '{attachment.filename}': {str(e)[:100]}")
+                continue
+        
+        # Create memory entry for stored files
+        if stored_files and self.agent._memory:
+            try:
+                from lollmsbot.agent.rlm.models import MemoryChunkType
+                
+                # Build memory content
+                file_list = ", ".join([f["filename"] for f in stored_files])
+                memory_content = f"""User shared files via Discord DM:
+Files: {file_list}
+Location: {user_dir}
+Timestamp: {datetime.now().isoformat()}
+
+These files are stored and available for future reference. The user can ask me to:
+- Read and analyze these files
+- Use them as reference material
+- Process or transform them
+- Include them in projects or workflows
+"""
+                
+                # Store in RLM with high importance
+                memory_tags = ["file_upload", "discord_dm", f"user_{user_id}", "user_shared"]
+                for f in stored_files:
+                    # Add file-specific tags
+                    ext = Path(f["filename"]).suffix.lower()
+                    if ext in {'.py', '.js', '.html', '.css'}:
+                        memory_tags.append("code_file")
+                    elif ext in {'.txt', '.md', '.pdf', '.doc', '.docx'}:
+                        memory_tags.append("document")
+                    elif ext in {'.png', '.jpg', '.jpeg', '.gif'}:
+                        memory_tags.append("image")
+                    elif ext in {'.csv', '.json', '.xml', '.yaml'}:
+                        memory_tags.append("data_file")
+                
+                chunk_id = await self.agent._memory.store_in_ems(
+                    content=memory_content,
+                    chunk_type=MemoryChunkType.FACT,
+                    importance=8.5,  # High importance for user-shared files
+                    tags=memory_tags,
+                    summary=f"User {discord_id} shared {len(stored_files)} file(s): {file_list[:100]}",
+                    load_hints=[f["filename"] for f in stored_files] + ["file", "upload", "discord", "shared"],
+                    source=f"discord_dm_file_upload:{user_id}",
+                )
+                
+                # Also store individual file references
+                for file_info in stored_files:
+                    file_memory = f"""File: {file_info['filename']}
+Path: {file_info['path']}
+Size: {file_info['size']} bytes
+Type: {file_info['content_type']}
+Uploaded by: {user_id} via Discord DM
+Available for: reading, analysis, processing
+"""
+                    await self.agent._memory.store_in_ems(
+                        content=file_memory,
+                        chunk_type=MemoryChunkType.FACT,
+                        importance=7.5,
+                        tags=["file_reference", "discord_upload", f"user_{user_id}", Path(file_info['filename']).suffix.lower()],
+                        summary=f"File reference: {file_info['filename']} ({file_info['size']} bytes)",
+                        load_hints=[file_info['filename'], "file", "read", "analyze"],
+                        source=f"file:{file_info['path']}",
+                    )
+                
+                logger.info(f"Created memory entry for file upload: {chunk_id}")
+                
+            except Exception as e:
+                logger.error(f"Failed to create memory entry for files: {e}")
+        
+        # Confirm to user
+        if stored_files:
+            file_count = len(stored_files)
+            file_names = ", ".join([f["filename"] for f in stored_files])
+            
+            confirmation = (
+                f"📁 **{file_count} file(s) stored successfully!**\n\n"
+                f"Files: `{file_names}`\n\n"
+                f"I've saved these to your personal storage and created a memory entry. "
+                f"You can now ask me to:\n"
+                f"• Read and analyze the content\n"
+                f"• Use them in projects or tasks\n"
+                f"• Reference them in future conversations\n\n"
+                f"Just mention the filename when you want to work with them!"
+            )
+            
+            await message.reply(confirmation[:2000])  # Discord limit
+            
+            # Notify about memory
+            if self.agent._memory:
+                await message.reply(
+                    "🧠 *I've also recorded this in my memory so I'll remember you shared these files.*",
+                    delete_after=10  # Auto-delete after 10 seconds
+                )
+
     def _markdown_to_discord(self, text: str) -> str:
         """Convert standard markdown to Discord markdown.
         
@@ -440,6 +598,11 @@ class DiscordChannel:
         if not can_interact:
             logger.debug(f"Ignoring: {reason}")
             return
+        
+        # Check for file attachments in DMs
+        if message.guild is None and message.attachments:
+            await self._handle_file_attachment(message)
+            # Continue to process any text content as well
         
         clean_content = self._extract_clean_content(message)
         if not clean_content:

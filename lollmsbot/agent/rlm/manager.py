@@ -16,11 +16,12 @@ import logging
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Coroutine, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Coroutine, Dict, List, Optional, Awaitable, Tuple
 
 from lollmsbot.agent.rlm.database import RLMDatabase
 from lollmsbot.agent.rlm.models import MemoryChunk, MemoryChunkType, RCBEntry, CompressionStats
 from lollmsbot.agent.rlm.sanitizer import PromptInjectionSanitizer
+from lollmsbot.agent.rlm.memory_map import MemoryMap
 
 
 logger = logging.getLogger(__name__)
@@ -76,11 +77,60 @@ class RLMMemoryManager:
         self._memory_load_callbacks: List[Callable[[str, MemoryChunk], Awaitable[None]]] = []
         self._injection_detected_callbacks: List[Callable[[Dict[str, Any]], Awaitable[None]]] = []
         
+
         # Initialization flag
         self._initialized = False
         self._initialization_lock: asyncio.Lock = asyncio.Lock()
+        
+        # Memory map for LLM introspection
+        self._memory_map: Optional[MemoryMap] = None
+        
+        # Cache for formatted memory structure
+        self._memory_structure_cache: Optional[str] = None
+        self._memory_structure_timestamp: Optional[datetime] = None
+        self._memory_structure_ttl: float = 30.0  # Seconds
     
-    # ========== Event Callbacks ==========
+    def get_memory_map(self) -> MemoryMap:
+        """Get or create the memory map for introspection."""
+        if self._memory_map is None:
+            self._memory_map = MemoryMap(self)
+        return self._memory_map
+    
+    async def get_memory_structure_for_prompt(self, max_length: int = 4000) -> str:
+        """
+        Get formatted memory structure for LLM system prompt.
+        
+        This gives the LLM awareness of what it knows and how to access it.
+        """
+        # Check cache
+        if (self._memory_structure_cache and 
+            self._memory_structure_timestamp and
+            (datetime.now() - self._memory_structure_timestamp).total_seconds() < self._memory_structure_ttl):
+            return self._memory_structure_cache
+        
+        # Generate fresh
+        memory_map = await self.get_memory_map().generate()
+        formatted = self.get_memory_map().format_for_prompt(memory_map, max_length)
+        
+        # Cache
+        self._memory_structure_cache = formatted
+        self._memory_structure_timestamp = datetime.now()
+        
+        return formatted
+    
+    async def get_memory_summary(self) -> str:
+        """Get brief summary of memory state."""
+        memory_map = await self.get_memory_map().generate()
+        return self.get_memory_map().get_quick_summary(memory_map)
+    
+    def invalidate_memory_structure(self) -> None:
+        """Call when memory changes significantly."""
+        self._memory_structure_cache = None
+        self._memory_structure_timestamp = None
+        if self._memory_map:
+            self._memory_map.invalidate_cache()
+    
+    # ========== Event Callbacks ==================== Event Callbacks ==========
     
     def on_memory_load(self, callback: Callable[[str, MemoryChunk], Awaitable[None]]) -> None:
         """Register callback for when memory is loaded from EMS to RCB."""
@@ -317,6 +367,9 @@ The actual content will be provided in your context automatically."""
             )
             logger.error(error_msg)
             raise RuntimeError(error_msg)
+        
+        # Invalidate memory structure cache (new content added)
+        self.invalidate_memory_structure()
         
         logger.info(f"Successfully stored and verified chunk {chunk_id} of type {chunk_type.name} with importance {importance}")
         return chunk_id

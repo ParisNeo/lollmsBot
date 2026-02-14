@@ -15,6 +15,7 @@ from lollmsbot.agent.rlm.models import (
     CompressionStats,
 )
 from lollmsbot.agent.rlm.sanitizer import PromptInjectionSanitizer
+from lollmsbot.agent.rlm.memory_map import MemoryMap, MemoryCategorySummary, MemoryAnchor, KnowledgeGap
 
 __all__ = [
     "RLMDatabase",
@@ -24,4 +25,8 @@ __all__ = [
     "RCBEntry",
     "CompressionStats",
     "PromptInjectionSanitizer",
+    "MemoryMap",
+    "MemoryCategorySummary",
+    "MemoryAnchor",
+    "KnowledgeGap",
 ]
