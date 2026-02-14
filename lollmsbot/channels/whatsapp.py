@@ -28,6 +28,8 @@ try:
 except ImportError:
     AIOHTTP_AVAILABLE = False
 
+import os
+
 from lollmsbot.agent import Agent, PermissionLevel
 
 
@@ -134,11 +136,14 @@ class WhatsAppChannel:
             )
             if result.returncode == 0:
                 self.WEB_JS_AVAILABLE = True
-                logger.info(f"Node.js available: {result.stdout.strip()}")
+                logger.info(f"✅ Node.js available: {result.stdout.strip()}")
             else:
-                logger.warning("Node.js not available for whatsapp-web.js backend")
-        except (subprocess.SubprocessError, FileNotFoundError):
-            logger.warning("Node.js not found. Install from https://nodejs.org/")
+                logger.warning("⚠️  Node.js returned error code")
+                self.WEB_JS_AVAILABLE = False
+        except (subprocess.SubprocessError, FileNotFoundError) as e:
+            logger.warning(f"⚠️  Node.js not found: {e}")
+            logger.warning("   Install from: https://nodejs.org/")
+            self.WEB_JS_AVAILABLE = False
     
     def _check_twilio_available(self) -> None:
         """Check if Twilio SDK is available."""
@@ -154,77 +159,172 @@ class WhatsAppChannel:
     
     def _can_interact(self, phone_number: str, is_first_message: bool = False) -> tuple[bool, str]:
         """Check if user can interact with bot."""
+        # Log raw incoming number for debugging
+        logger.debug(f"Checking interaction for raw: '{phone_number}'")
+        
         # Normalize phone number
         normalized = self._normalize_number(phone_number)
+        logger.debug(f"  Normalized to: '{normalized}'")
+        logger.debug(f"  Allowed numbers configured: {self.allowed_numbers}")
         
         if normalized in self.blocked_numbers:
+            logger.debug(f"  -> BLOCKED: number in blocked list")
             return False, "number blocked"
         
         if self.allowed_numbers and normalized not in self.allowed_numbers:
+            logger.info(f"  -> BLOCKED: {normalized} not in allowed list {self.allowed_numbers}")
+            # Also check if raw format matches any allowed (for debugging)
+            for allowed in self.allowed_numbers:
+                if allowed in phone_number or phone_number in allowed:
+                    logger.info(f"     (Note: partial match with {allowed})")
             return False, "not in allowed numbers"
         
         # Check confirmation requirement
         if self.require_confirmation and is_first_message and normalized not in self._confirmed_users:
             return False, "confirmation_required"
         
+        logger.debug(f"  -> ALLOWED")
         return True, ""
     
     def _normalize_number(self, number: str) -> str:
-        """Normalize phone number to E.164 format."""
-        # Remove spaces, dashes, and leading +
-        cleaned = number.replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
+        """Normalize phone number to E.164 format.
+        
+        Handles WhatsApp contact IDs like:
+        - 1234567890@c.us (standard user)
+        - 1234567890@lid (WhatsApp Business/Enterprise)
+        - 1234567890@g.us (group)
+        - +1234567890 (already normalized)
+        """
+        # First, extract number from WhatsApp contact ID
+        if "@" in number:
+            # Extract the part before @ (the phone number or internal ID)
+            number_part = number.split("@")[0]
+            
+            # @lid sometimes contains non-numeric identifiers
+            # Try to extract digits only, or use as-is if it looks like a number
+            if number_part.isdigit():
+                cleaned = number_part
+            else:
+                # For @lid or other formats, extract digits or use raw
+                import re
+                digits_only = re.sub(r'\D', '', number_part)
+                if digits_only:
+                    cleaned = digits_only
+                else:
+                    # Can't extract number, return as-is for logging/debugging
+                    return number
+        else:
+            cleaned = number
+        
+        # Remove formatting characters
+        cleaned = cleaned.replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
+        
+        # Ensure it starts with +
         if not cleaned.startswith("+"):
-            # Assume US if no country code (add your logic)
+            # If it's 10 digits, assume US (+1)
             if len(cleaned) == 10:
                 cleaned = "+1" + cleaned
-            else:
+            # If it's more than 10 digits, probably has country code
+            elif len(cleaned) > 10:
                 cleaned = "+" + cleaned
+            else:
+                # Short number, add + anyway
+                cleaned = "+" + cleaned
+        
         return cleaned
     
     def _get_user_id(self, phone_number: str) -> str:
         """Generate consistent user ID for Agent."""
+        # Use raw identifier if we can't normalize properly (for logging/debugging)
         normalized = self._normalize_number(phone_number)
+        # If normalization failed (returned original with @), use a fallback
+        if "@" in normalized:
+            # Extract what we can for a stable ID
+            safe_id = normalized.replace("@", "_").replace(".", "_")
+            return f"whatsapp:{safe_id}"
         return f"whatsapp:{normalized}"
     
     async def start(self) -> None:
         """Start the WhatsApp channel."""
+        logger.info("=" * 60)
+        logger.info("📱 WhatsApp Channel Starting...")
+        logger.info(f"   Backend: {self.backend}")
+        logger.info(f"   Web JS Path: {self.web_js_path}")
+        logger.info(f"   Allowed numbers: {len(self.allowed_numbers)}")
+        logger.info(f"   Blocked numbers: {len(self.blocked_numbers)}")
+        logger.info("=" * 60)
+        
         if self._is_running:
             logger.warning("WhatsApp channel is already running")
             return
         
-        if self.backend == "web_js":
-            await self._start_web_js_backend()
-        elif self.backend == "twilio":
-            await self._start_twilio_backend()
-        elif self.backend == "business_api":
-            await self._start_business_api_backend()
-        else:
-            raise ValueError(f"Unknown backend: {self.backend}")
-        
-        self._is_running = True
-        logger.info(f"WhatsApp channel started with {self.backend} backend")
+        try:
+            if self.backend == "web_js":
+                logger.info("🔧 Initializing web.js backend...")
+                await self._start_web_js_backend()
+            elif self.backend == "twilio":
+                logger.info("🔧 Initializing Twilio backend...")
+                await self._start_twilio_backend()
+            elif self.backend == "business_api":
+                logger.info("🔧 Initializing Business API backend...")
+                await self._start_business_api_backend()
+            else:
+                raise ValueError(f"Unknown backend: {self.backend}")
+            
+            self._is_running = True
+            logger.info(f"✅ WhatsApp channel started successfully with {self.backend} backend")
+            
+        except Exception as e:
+            logger.error(f"❌ WhatsApp channel failed to start: {e}")
+            logger.error(f"   Exception type: {type(e).__name__}")
+            import traceback
+            logger.error(f"   Traceback: {traceback.format_exc()}")
+            raise
     
     async def _start_web_js_backend(self) -> None:
         """Start the whatsapp-web.js bridge."""
-        if not self.WEB_JS_AVAILABLE:
-            raise RuntimeError(
-                "whatsapp-web.js backend requires Node.js. "
-                "Install Node.js from https://nodejs.org/ "
-                "Then run: npm install whatsapp-web.js qrcode-terminal"
-            )
+        logger.info("🔍 Step 1: Checking Node.js availability...")
         
-        # Ensure bridge script exists
+        # Double-check Node.js is actually available
+        try:
+            result = subprocess.run(
+                ["node", "--version"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode != 0:
+                raise RuntimeError("Node.js not working properly")
+            logger.info(f"✅ Node.js detected: {result.stdout.strip()}")
+        except Exception as e:
+            logger.error("╔════════════════════════════════════════════════════════════╗")
+            logger.error("║  ❌ NODE.JS NOT FOUND                                      ║")
+            logger.error("║                                                            ║")
+            logger.error("║  WhatsApp web.js backend requires Node.js.                 ║")
+            logger.error("║  Install from: https://nodejs.org/ (LTS version)          ║")
+            logger.error("╚════════════════════════════════════════════════════════════╝")
+            raise RuntimeError(f"Node.js required but not found: {e}")
+        
+        # Ensure bridge script exists (DEFINE bridge_js FIRST)
+        logger.info("🔍 Step 2: Setting up bridge script...")
         bridge_js = Path(self.web_js_path) / "bridge.js"
         bridge_js.parent.mkdir(parents=True, exist_ok=True)
+        logger.info(f"   Bridge directory: {bridge_js.parent}")
         
         if not bridge_js.exists():
-            # Create the bridge script
+            logger.info("   Creating bridge.js script...")
             bridge_js.write_text(self._get_bridge_script())
-            logger.info(f"Created whatsapp-web.js bridge at {bridge_js}")
+            logger.info(f"✅ Created whatsapp-web.js bridge at {bridge_js}")
+        else:
+            logger.info(f"   Bridge script exists: {bridge_js}")
         
-        # Install dependencies if needed
+        # Check if dependencies are already installed (skip npm check if they are)
+        logger.info("🔍 Step 3: Checking dependencies...")
+        node_modules = bridge_js.parent / "node_modules"
         package_json = bridge_js.parent / "package.json"
+        
         if not package_json.exists():
+            logger.info("   Creating package.json...")
             package_json.write_text(json.dumps({
                 "name": "lollmsbot-whatsapp-bridge",
                 "version": "1.0.0",
@@ -232,40 +332,196 @@ class WhatsAppChannel:
                     "whatsapp-web.js": "^1.23.0",
                     "qrcode-terminal": "^0.12.0"
                 }
-            }))
-            # Run npm install
-            logger.info("Installing whatsapp-web.js dependencies...")
-            proc = await asyncio.create_subprocess_exec(
-                "npm", "install",
-                cwd=str(bridge_js.parent),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await proc.communicate()
-            if proc.returncode != 0:
-                raise RuntimeError(f"npm install failed: {stderr.decode()}")
+            }, indent=2))
+        
+        # Check if dependencies already exist
+        if node_modules.exists():
+            logger.info(f"✅ Dependencies already installed at: {node_modules}")
+            logger.info("   Skipping npm check - using existing dependencies")
+            skip_npm_check = True
+        else:
+            skip_npm_check = False
+        
+        # Only check npm if we need to install
+        npm_cmd = "npm"
+        if not skip_npm_check:
+            logger.info("🔍 Checking npm availability...")
+            npm_found = False
+            
+            # Try multiple methods to find npm
+            try:
+                # Method 1: Try npm directly (might work if in PATH)
+                npm_result = subprocess.run(
+                    ["npm", "--version"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                if npm_result.returncode == 0:
+                    logger.info(f"✅ npm detected in PATH: {npm_result.stdout.strip()}")
+                    npm_found = True
+            except FileNotFoundError:
+                logger.info("   npm not in PATH, trying alternative methods...")
+            
+            # Method 2: Try common Windows paths
+            if not npm_found and os.name == 'nt':
+                possible_paths = [
+                    os.path.expandvars(r"%ProgramFiles%\nodejs\npm.cmd"),
+                    os.path.expandvars(r"%ProgramFiles(x86)%\nodejs\npm.cmd"),
+                    os.path.expandvars(r"%APPDATA%\npm\npm.cmd"),
+                    os.path.expandvars(r"%LOCALAPPDATA%\Programs\nodejs\npm.cmd"),
+                    r"C:\Program Files\nodejs\npm.cmd",
+                    r"C:\Program Files (x86)\nodejs\npm.cmd",
+                ]
+                for path in possible_paths:
+                    if os.path.exists(path):
+                        npm_cmd = path
+                        npm_found = True
+                        logger.info(f"✅ npm found at: {path}")
+                        break
+            
+            # Method 3: Try where command
+            if not npm_found:
+                try:
+                    where_result = subprocess.run(
+                        ["where", "npm"],
+                        capture_output=True,
+                        text=True,
+                        timeout=5
+                    )
+                    if where_result.returncode == 0 and where_result.stdout.strip():
+                        npm_cmd = where_result.stdout.strip().split('\n')[0].strip()
+                        npm_found = True
+                        logger.info(f"✅ npm found via 'where': {npm_cmd}")
+                except Exception:
+                    pass
+            
+            if not npm_found:
+                logger.warning("⚠️  npm not found in PATH, but will try to continue...")
+                logger.warning("   If dependencies are missing, you'll need to install them manually:")
+                logger.warning(f"   cd \"{bridge_js.parent}\"")
+                logger.warning("   npm install")
+                # Don't raise error - let it fail later if actually needed
+        
+        # Install dependencies if needed
+        if not node_modules.exists():
+            logger.info("📦 Dependencies not found, attempting to install...")
+            
+            try:
+                # Run npm install with visible output
+                proc = await asyncio.create_subprocess_exec(
+                    npm_cmd, "install",
+                    cwd=str(bridge_js.parent),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT
+                )
+                
+                # Stream npm output
+                npm_output = []
+                line_count = 0
+                while True:
+                    line = await proc.stdout.readline()
+                    if not line:
+                        break
+                    line_count += 1
+                    text = line.decode().strip()
+                    npm_output.append(text)
+                    if "error" in text.lower() or "ERR!" in text:
+                        logger.error(f"   npm: {text}")
+                    else:
+                        logger.info(f"   npm: {text[:80]}")
+                
+                await proc.wait()
+                
+                if proc.returncode != 0:
+                    raise RuntimeError(f"npm install failed with code {proc.returncode}")
+                
+                logger.info(f"✅ Dependencies installed successfully ({line_count} lines of output)")
+                
+            except FileNotFoundError:
+                logger.error("╔════════════════════════════════════════════════════════════╗")
+                logger.error("║  ❌ CANNOT RUN NPM                                         ║")
+                logger.error("║                                                            ║")
+                logger.error("║  npm not found. Please install dependencies manually:      ║")
+                logger.error(f"║  cd \"{bridge_js.parent}\"                                  ║")
+                logger.error("║  npm install                                               ║")
+                logger.error("╚════════════════════════════════════════════════════════════╝")
+                raise RuntimeError("npm not found and dependencies not installed")
+        else:
+            logger.info(f"   Using existing dependencies at: {node_modules}")
         
         # Start the bridge process
-        logger.info("Starting whatsapp-web.js bridge...")
-        logger.info("Scan the QR code with your phone to authenticate")
+        logger.info("")
+        logger.info("🔍 Step 4: Starting Node.js bridge process...")
+        logger.info("╔════════════════════════════════════════════════════════════╗")
+        logger.info("║  📱 WhatsApp Web Authentication                            ║")
+        logger.info("║                                                            ║")
+        logger.info("║  A QR code will appear BELOW this message shortly.         ║")
+        logger.info("║                                                            ║")
+        logger.info("║  To authenticate:                                          ║")
+        logger.info("║  1. Open WhatsApp on your phone                            ║")
+        logger.info("║  2. Go to: Settings → Linked Devices → Link a Device       ║")
+        logger.info("║  3. Point your camera at the QR code that appears          ║")
+        logger.info("║  4. Wait for 'Authenticated!' message                      ║")
+        logger.info("║                                                            ║")
+        logger.info("║  ⚠️  Your phone must stay connected to the internet       ║")
+        logger.info("║      for the bot to work (not just for QR scan)            ║")
+        logger.info("╚════════════════════════════════════════════════════════════╝")
+        logger.info("")
+        logger.info(f"🚀 Executing: node {bridge_js}")
+        logger.info(f"   Working directory: {bridge_js.parent}")
+        logger.info("   (QR code will appear as ASCII art below)")
+        logger.info("")
         
-        self._web_js_process = await asyncio.create_subprocess_exec(
-            "node", str(bridge_js),
-            cwd=str(bridge_js.parent),
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
+        try:
+            self._web_js_process = await asyncio.create_subprocess_exec(
+                "node", str(bridge_js),
+                cwd=str(bridge_js.parent),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT  # Merge to capture QR code
+            )
+            logger.info(f"✅ Node.js process started (PID: {self._web_js_process.pid})")
+        except Exception as e:
+            logger.error(f"❌ Failed to start Node.js process: {e}")
+            raise
         
         # Start reader tasks
+        logger.info("🔍 Step 5: Starting background tasks...")
         asyncio.create_task(self._read_web_js_output())
         asyncio.create_task(self._process_send_queue())
+        asyncio.create_task(self._monitor_process_health())
+        logger.info("✅ Background tasks started")
     
     def _get_bridge_script(self) -> str:
         """Get the Node.js bridge script for whatsapp-web.js."""
         return '''
 const { Client, LocalAuth } = require('whatsapp-web.js');
-const qrcode = require('qrcode-terminal');
+
+// Custom QR code display that works with subprocess capture
+function displayQR(qr) {
+    // Use qrcode-terminal with explicit stdout write
+    const qrcode = require('qrcode-terminal');
+    
+    // Force output to stdout with explicit flush
+    process.stdout.write('\\n');
+    process.stdout.write('╔════════════════════════════════════════════════════════════╗\\n');
+    process.stdout.write('║  📱 SCAN THIS QR CODE WITH YOUR PHONE                      ║\\n');
+    process.stdout.write('║                                                            ║\\n');
+    process.stdout.write('║  1. Open WhatsApp → Settings → Linked Devices             ║\\n');
+    process.stdout.write('║  2. Tap "Link a Device"                                    ║\\n');
+    process.stdout.write('║  3. Point camera at the QR code below                     ║\\n');
+    process.stdout.write('╚════════════════════════════════════════════════════════════╝\\n');
+    process.stdout.write('\\n');
+    
+    // Generate QR code - this writes directly to terminal
+    qrcode.generate(qr, { small: false });
+    
+    // Ensure output is flushed
+    process.stdout.write('\\n');
+    process.stdout.write('QR_RECEIVED\\n');
+    process.stdout.flush();
+}
 
 const client = new Client({
     authStrategy: new LocalAuth(),
@@ -276,12 +532,31 @@ const client = new Client({
 });
 
 client.on('qr', (qr) => {
-    qrcode.generate(qr, { small: true });
-    console.log('QR_RECEIVED');
+    displayQR(qr);
 });
 
 client.on('ready', () => {
-    console.log('READY');
+    process.stdout.write('\\n');
+    process.stdout.write('╔════════════════════════════════════════════════════════════╗\\n');
+    process.stdout.write('║  ✅ AUTHENTICATED! WhatsApp Web is ready                   ║\\n');
+    process.stdout.write('╚════════════════════════════════════════════════════════════╝\\n');
+    process.stdout.write('READY\\n');
+    process.stdout.flush();
+});
+
+client.on('authenticated', () => {
+    process.stdout.write('Authenticated! Session saved.\\n');
+    process.stdout.flush();
+});
+
+client.on('auth_failure', (msg) => {
+    process.stdout.write('ERROR:Authentication failed: ' + msg + '\\n');
+    process.stdout.flush();
+});
+
+client.on('disconnected', (reason) => {
+    process.stdout.write('ERROR:Disconnected: ' + reason + '\\n');
+    process.stdout.flush();
 });
 
 client.on('message', async (msg) => {
@@ -293,7 +568,8 @@ client.on('message', async (msg) => {
         isGroup: msg.from.includes('@g.us'),
         hasMedia: msg.hasMedia
     };
-    console.log('MSG:' + JSON.stringify(data));
+    process.stdout.write('MSG:' + JSON.stringify(data) + '\\n');
+    process.stdout.flush();
 });
 
 // Read commands from stdin
@@ -309,45 +585,113 @@ rl.on('line', (line) => {
         const cmd = JSON.parse(line);
         if (cmd.type === 'send') {
             client.sendMessage(cmd.to, cmd.body).then(() => {
-                console.log('SENT:' + cmd.id);
+                process.stdout.write('SENT:' + cmd.id + '\\n');
+                process.stdout.flush();
             }).catch((err) => {
-                console.log('ERROR:' + err.message);
+                process.stdout.write('ERROR:' + err.message + '\\n');
+                process.stdout.flush();
             });
         }
     } catch (e) {
-        console.log('PARSE_ERROR:' + e.message);
+        process.stdout.write('PARSE_ERROR:' + e.message + '\\n');
+        process.stdout.flush();
     }
 });
 
-client.initialize();
+// Log startup
+process.stdout.write('BRIDGE_STARTING\\n');
+process.stdout.flush();
+
+client.initialize().then(() => {
+    process.stdout.write('CLIENT_INITIALIZED\\n');
+    process.stdout.flush();
+}).catch((err) => {
+    process.stdout.write('INIT_ERROR:' + err.message + '\\n');
+    process.stdout.flush();
+});
 '''
     
     async def _read_web_js_output(self) -> None:
         """Read output from whatsapp-web.js process."""
         if not self._web_js_process:
+            logger.error("❌ No web.js process to read from")
             return
+        
+        qr_printed = False
+        line_count = 0
+        qr_lines = []  # Collect lines that might be QR code
+        
+        logger.info("📡 Reading from Node.js process...")
+        logger.info("   (QR code will appear below as ASCII art - look for black/white blocks)")
         
         while self._is_running and self._web_js_process:
             try:
                 line = await self._web_js_process.stdout.readline()
+                line_count += 1
+                
                 if not line:
+                    # EOF - process may have exited
+                    logger.warning(f"⚠️  Node.js process closed (read {line_count} lines)")
                     break
                 
-                text = line.decode().strip()
+                # Decode without stripping to preserve QR code structure
+                text = line.decode('utf-8', errors='replace')
+                stripped = text.strip()
                 
-                if text == "READY":
-                    logger.info("WhatsApp Web ready!")
-                elif text.startswith("MSG:"):
-                    data = json.loads(text[4:])
-                    await self._handle_incoming_message(data)
-                elif text.startswith("SENT:"):
-                    logger.debug(f"Message sent: {text[5:]}")
-                elif text.startswith("ERROR:"):
-                    logger.error(f"Send error: {text[6:]}")
+                # Print EVERYTHING to console for first 100 lines (not just debug)
+                if line_count <= 100:
+                    # Use print directly for QR code visibility
+                    if line_count == 1:
+                        print()  # New line before output
+                    print(text, end='')  # Preserve original line endings
+                
+                # Check for specific events in stripped text
+                if stripped == "READY":
+                    logger.info("✅ WhatsApp Web authenticated and ready!")
+                    
+                elif stripped == "QR_RECEIVED":
+                    if not qr_printed:
+                        logger.info("")
+                        logger.info("╔════════════════════════════════════════════════════════════╗")
+                        logger.info("║  📱 QR CODE WAS PRINTED ABOVE - SCROLL UP TO SEE IT!      ║")
+                        logger.info("║                                                            ║")
+                        logger.info("║  Look for the black and white square ASCII art above.      ║")
+                        logger.info("║  If you don't see it, check that your terminal window      ║")
+                        logger.info("║  is wide enough (80+ characters recommended).              ║")
+                        logger.info("╚════════════════════════════════════════════════════════════╝")
+                        logger.info("")
+                        qr_printed = True
+                        
+                elif stripped == "BRIDGE_STARTING":
+                    logger.info("🚀 Bridge script is starting...")
+                    
+                elif stripped == "CLIENT_INITIALIZED":
+                    logger.info("🔄 WhatsApp client initializing (this may take 10-30 seconds)...")
+                    
+                elif stripped.startswith("INIT_ERROR:"):
+                    logger.error(f"❌ Bridge initialization failed: {stripped[11:]}")
+                    
+                elif stripped.startswith("MSG:"):
+                    try:
+                        data = json.loads(stripped[4:])
+                        await self._handle_incoming_message(data)
+                    except json.JSONDecodeError as e:
+                        logger.error(f"   Failed to parse message: {e}")
+                        
+                elif stripped.startswith("SENT:"):
+                    logger.debug(f"   Message sent: {stripped[5:]}")
+                    
+                elif stripped.startswith("ERROR:"):
+                    logger.error(f"   WhatsApp error: {stripped[6:]}")
+                    
+                elif "Authenticated" in stripped or "authenticated" in stripped.lower():
+                    logger.info("🔓 WhatsApp session authenticated!")
                     
             except Exception as e:
-                logger.error(f"Error reading web.js output: {e}")
+                logger.error(f"   Error reading output: {e}")
                 await asyncio.sleep(1)
+        
+        logger.warning("📡 Node.js output reader stopped")
     
     async def _process_send_queue(self) -> None:
         """Process outgoing messages from queue."""
@@ -697,6 +1041,27 @@ client.initialize();
             logger.error(f"Business API send failed: {e}")
             return False
     
+    async def _monitor_process_health(self) -> None:
+        """Monitor if the Node.js process stays alive."""
+        await asyncio.sleep(5)  # Give it time to start
+        
+        if not self._web_js_process:
+            return
+        
+        for _ in range(3):  # Check a few times
+            await asyncio.sleep(2)
+            
+            if self._web_js_process.returncode is not None:
+                logger.error(f"❌ Node.js process exited with code: {self._web_js_process.returncode}")
+                logger.error("   The QR code may not have been generated.")
+                logger.error("   Common causes:")
+                logger.error("   • Node.js version too old (need 16+)")
+                logger.error("   • Puppeteer/Chromium failed to launch")
+                logger.error("   • Missing dependencies")
+                return
+        
+        logger.info("✅ Node.js process is running normally")
+    
     async def stop(self) -> None:
         """Stop the WhatsApp channel."""
         if not self._is_running:
@@ -706,10 +1071,13 @@ client.initialize();
         
         # Stop web.js process
         if self._web_js_process:
+            logger.info("Stopping Node.js process...")
             try:
                 self._web_js_process.terminate()
                 await asyncio.wait_for(self._web_js_process.wait(), timeout=5.0)
+                logger.info("✅ Node.js process stopped cleanly")
             except asyncio.TimeoutError:
+                logger.warning("⚠️  Node.js process didn't terminate, killing...")
                 self._web_js_process.kill()
             self._web_js_process = None
         

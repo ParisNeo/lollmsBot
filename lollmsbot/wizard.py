@@ -1541,6 +1541,43 @@ class Wizard:
         """Configure WhatsApp integration with backend selection."""
         console.print("\n[bold green]💬 WhatsApp Configuration[/]")
         
+        # Educational explanation first
+        console.print(Panel(
+            """[bold]How WhatsApp Integration Works[/bold]
+
+LollmsBot connects to WhatsApp using [cyan]whatsapp-web.js[/cyan], which is a 
+Node.js library that controls a real web browser (Chromium) and loads 
+web.whatsapp.com just like you would in Chrome.
+
+Here's what happens:
+
+[bold]1. Bridge Launch[/bold]
+   • Node.js starts a headless browser (no visible window)
+   • Browser navigates to web.whatsapp.com
+   • WhatsApp generates a unique QR code for pairing
+
+[bold]2. QR Code Display[/bold]
+   • The QR code appears as ASCII art in this terminal
+   • It's a big square made of █ and ░ characters
+   • You scan it with your phone's WhatsApp camera
+
+[bold]3. Session Pairing[/bold]
+   • Your phone links to the browser session
+   • WhatsApp Web session is established
+   • Session stays active as long as your phone is online
+
+[bold]4. Message Handling[/bold]
+   • Incoming messages trigger the bot's AI response
+   • Responses are sent back through the browser session
+   • Everything happens in real-time
+
+[bold]Important:[/] Your phone must stay connected to the internet.
+If your phone loses connection, the bot stops working.""",
+            title="📚 WhatsApp Web Architecture",
+            border_style="cyan",
+            padding=(1, 2)
+        ))
+        
         # Select backend
         backend = questionary.select(
             "Choose WhatsApp backend:",
@@ -1559,19 +1596,54 @@ class Wizard:
         
         if backend == "web_js":
             console.print(Panel(
-                """📱 whatsapp-web.js Setup:
+                """[bold]📱 whatsapp-web.js Setup Guide[/bold]
 
-1. Install Node.js from https://nodejs.org/ (LTS version)
-2. The wizard will create a bridge script automatically
-3. On first run, scan the QR code with WhatsApp on your phone
-4. Your phone must stay connected to the internet
+[cyan]Prerequisites:[/]
+• Node.js 16+ installed (download from https://nodejs.org/)
+• WhatsApp installed on your phone (iOS or Android)
+• Your phone must stay connected to the internet
 
-[bold]Requirements:[/]
-• Node.js 16+ installed on this machine
-• WhatsApp on your phone (not WhatsApp Business necessarily)
-• Phone must remain online (not just for QR scan)""",
-                title="Setup Instructions",
-                border_style="blue"
+[cyan]What will happen:[/]
+
+[bold]Step 1: Dependency Installation[/bold]
+   The wizard will automatically:
+   • Create a bridge script in ~/.lollmsbot/whatsapp-bridge/
+   • Run 'npm install' to download required packages
+   • This takes 1-2 minutes on first run
+
+[bold]Step 2: QR Code Generation[/bold]
+   When you start lollmsbot:
+   • A large ASCII QR code appears in the terminal
+   • It looks like a black/white square made of block characters
+   • You'll see messages: "BRIDGE_STARTING" → "CLIENT_INITIALIZED" → QR code
+
+[bold]Step 3: Scanning the QR Code[/bold]
+   [yellow]Important:[/] The QR code is ASCII art in the terminal, not an image!
+
+   1. Open WhatsApp on your phone
+   2. Go to: [bold]Settings → Linked Devices → Link a Device[/bold]
+   3. Point your phone's camera at the terminal screen
+   4. The QR code is the big square of █ and ░ characters
+   5. Hold steady until you see "Authenticated!" message
+
+[bold]Step 4: Confirmation[/bold]
+   • You'll see "✅ AUTHENTICATED!" in the terminal
+   • The bot is now connected to your WhatsApp
+   • You can send messages to the bot's number
+
+[cyan]Troubleshooting:[/]
+• [bold]QR code not visible?[/] Make terminal window wider (100+ chars)
+• [bold]Scan fails?[/] Try refreshing terminal or restarting lollmsbot
+• [bold]Connection drops?[/] Check your phone's internet connection
+• [bold]Session expires?[/] You'll need to scan QR code again
+
+[cyan]Security Note:[/]
+Your WhatsApp session is stored locally on this computer in:
+~/.lollmsbot/whatsapp-bridge/.wwebjs_auth/
+Only this lollmsbot instance can access your WhatsApp.""",
+                title="Complete Setup Instructions",
+                border_style="blue",
+                padding=(1, 2)
             ))
             
             # Path configuration
@@ -1582,6 +1654,32 @@ class Wizard:
                 default=current_path
             ).ask()
             wa_config["web_js_path"] = web_js_path
+            
+            # Show what will happen on first run
+            console.print(Panel(
+                """[bold]Next Steps After Configuration:[/]
+
+When you run [cyan]lollmsbot gateway[/cyan] for the first time:
+
+1. You'll see: "🔍 Step 1: Checking Node.js availability..."
+2. Then: "📦 Installing whatsapp-web.js dependencies..."
+3. Then: "🚀 Starting Node.js bridge process..."
+4. [yellow]A large QR code appears as ASCII art[/yellow]
+5. Scan it with your phone (Settings → Linked Devices)
+6. See "✅ AUTHENTICATED!" when successful
+7. Bot is ready to receive WhatsApp messages!
+
+[bold]Tip:[/] The QR code looks like this:
+█████████████████████████████████
+██ ▄▄▄▄▄ █▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀ ██
+██ █   █ █▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀ ██
+██ █▄▄▄█ █▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀▄▀ ██
+█████████████████████████████████
+
+(But much bigger - fill your terminal width!)""",
+                title="What to Expect on First Run",
+                border_style="green"
+            ))
             
             # User restrictions
             self._configure_whatsapp_users(wa_config)
@@ -1675,8 +1773,42 @@ class Wizard:
         self._configured.add("whatsapp")
         console.print("[green]✅ WhatsApp configured![/]")
         
-        # Show summary
+        # Show summary with scanning instructions reminder
         self._show_whatsapp_summary(wa_config)
+        
+        # Final reminder about QR code scanning
+        if backend == "web_js":
+            console.print(Panel(
+                """[bold yellow]📱 IMPORTANT: How to Scan the QR Code[/bold yellow]
+
+When you start lollmsbot, the QR code will appear as [bold]ASCII art[/bold] 
+in your terminal - a big square made of block characters (█ and ░).
+
+[yellow]Scanning Instructions:[/]
+1. Open WhatsApp on your phone
+2. Tap: [bold]Settings (⚙️) → Linked Devices → Link a Device[/bold]
+3. Point camera at the terminal screen
+4. The QR code is the large black/white square of characters
+5. Hold steady until you see "Authenticated!"
+
+[bold]Testing the Bot:[/]
+⚠️  [yellow]You CANNOT message yourself![/yellow] WhatsApp doesn't allow it.
+   Instead:
+   • Ask a friend to message your WhatsApp number
+   • Create a group chat and add the bot (your number)
+   • Use a second phone/SIM with different WhatsApp
+
+[bold]Common Mistakes:[/]
+❌ Don't look for an image file - it's text in the terminal
+❌ Don't use a QR scanner app - use WhatsApp's built-in scanner
+❌ Don't try to message yourself - it won't work!
+✅ Do make terminal window very wide (drag to expand)
+✅ Do scroll up if QR code is above current view
+
+[yellow]The QR code will only appear once per session.[/yellow]""",
+                title="QR Code Scanning Guide",
+                border_style="yellow"
+            ))
     
     def _configure_whatsapp_users(self, wa_config: Dict[str, Any]) -> None:
         """Configure allowed/blocked users for WhatsApp."""

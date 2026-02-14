@@ -11,7 +11,7 @@ import hashlib
 import hmac
 import sys
 import time
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Union
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -164,6 +164,16 @@ if HOST not in ("127.0.0.1", "localhost", "::1") and not API_KEY:
 _security = HTTPBearer(auto_error=False)
 
 # Channel tokens
+# Channel disable flags (quick way to turn off channels without deleting config)
+DISABLED_CHANNELS: Set[str] = set(
+    _get_config("lollmsbot", "disabled_channels", "LOLLMSBOT_DISABLE_CHANNELS", "").split(",")
+) if _get_config("lollmsbot", "disabled_channels", "LOLLMSBOT_DISABLE_CHANNELS", "") else set()
+
+# Channel disable flags (quick way to turn off channels without deleting config)
+DISABLED_CHANNELS: Set[str] = set(
+    _get_config("lollmsbot", "disabled_channels", "LOLLMSBOT_DISABLE_CHANNELS", "").split(",")
+) if _get_config("lollmsbot", "disabled_channels", "LOLLMSBOT_DISABLE_CHANNELS", "") else set()
+
 DISCORD_TOKEN = _get_config("discord", "bot_token", "DISCORD_BOT_TOKEN", None)
 DISCORD_ALLOWED_USERS = _get_config("discord", "allowed_users", "DISCORD_ALLOWED_USERS", None)
 DISCORD_ALLOWED_GUILDS = _get_config("discord", "allowed_guilds", "DISCORD_ALLOWED_GUILDS", None)
@@ -546,7 +556,18 @@ async def root():
             "memory": "/debug/memory",
             "stats": "/debug/stats",
         }
-    
+
+    # NEW: Add power management status
+    from lollmsbot.power_management import get_power_manager
+    power_mgr = get_power_manager()
+    power_state = power_mgr.get_state()
+    response["power_management"] = {
+        "platform_supported": power_mgr.is_windows,
+        "sleep_prevented": power_state.is_preventing_sleep,
+        "display_kept_awake": power_state.display_required,
+        "away_mode": power_state.away_mode,
+    }
+
     return response
 
 @app.get("/health", response_model=Health)
@@ -578,7 +599,7 @@ async def health():
     doc_count = 0
     if _document_manager:
         doc_count = len(_document_manager.list_documents())
-    
+
     # Get tool counts
     all_tools = list(agent.tools.keys()) if hasattr(agent, 'tools') else []
     writing_tools = [t for t in all_tools if t in [
@@ -586,7 +607,12 @@ async def health():
         "get_document_context", "write_section", "submit_written_content",
         "search_references", "get_writing_progress"
     ]]
-    
+
+    # NEW: Power management status
+    from lollmsbot.power_management import get_power_manager
+    power_mgr = get_power_manager()
+    power_state = power_mgr.get_state()
+
     response = {
         "status": "ok",
         "url": f"http://{HOST}:{PORT}",
@@ -618,8 +644,14 @@ async def health():
             "writing_tools_available": len(writing_tools),
         },
         "environment": env_summary,
+        "power_management": {
+            "platform_supported": power_mgr.is_windows,
+            "sleep_prevented": power_state.is_preventing_sleep,
+            "display_kept_awake": power_state.display_required,
+            "away_mode": power_state.away_mode,
+        },
     }
-    
+
     return response
 
 @app.post("/chat", response_model=ChatResp, dependencies=[Depends(require_auth)])
@@ -850,6 +882,63 @@ async def set_permission(req: PermissionReq):
         "error": "Admin permission management not yet implemented in this version",
     }
 
+# ========== CHANNEL CONTROL ENDPOINTS ==========
+
+@app.post("/admin/channels/{channel_name}/disable", dependencies=[Depends(require_auth)])
+async def disable_channel(channel_name: str):
+    """Disable a channel at runtime."""
+    valid_channels = {"discord", "telegram", "whatsapp"}
+    if channel_name not in valid_channels:
+        raise HTTPException(status_code=400, detail=f"Invalid channel. Must be one of: {valid_channels}")
+    
+    DISABLED_CHANNELS.add(channel_name)
+    
+    # Stop the channel if running
+    if channel_name in _active_channels:
+        try:
+            await _active_channels[channel_name].stop()
+            del _active_channels[channel_name]
+        except Exception as e:
+            logger.error(f"Error stopping {channel_name}: {e}")
+    
+    return {
+        "success": True,
+        "channel": channel_name,
+        "status": "disabled",
+        "active_channels": list(_active_channels.keys()),
+        "disabled_channels": list(DISABLED_CHANNELS),
+    }
+
+@app.post("/admin/channels/{channel_name}/enable", dependencies=[Depends(require_auth)])
+async def enable_channel(channel_name: str):
+    """Re-enable a disabled channel (will restart on next gateway restart)."""
+    valid_channels = {"discord", "telegram", "whatsapp"}
+    if channel_name not in valid_channels:
+        raise HTTPException(status_code=400, detail=f"Invalid channel. Must be one of: {valid_channels}")
+    
+    if channel_name in DISABLED_CHANNELS:
+        DISABLED_CHANNELS.remove(channel_name)
+    
+    return {
+        "success": True,
+        "channel": channel_name,
+        "status": "enabled (restart gateway to activate)",
+        "note": "Channel configuration preserved. Restart gateway to activate.",
+    }
+
+@app.get("/admin/channels/status")
+async def get_channel_status():
+    """Get current channel status."""
+    return {
+        "active": list(_active_channels.keys()),
+        "disabled": list(DISABLED_CHANNELS),
+        "configured": {
+            "discord": bool(DISCORD_TOKEN),
+            "telegram": bool(TELEGRAM_TOKEN),
+            "whatsapp": bool(WHATSAPP_BACKEND),
+        },
+    }
+
 # ========== DEBUG ENDPOINTS ==========
 
 if DEBUG_MODE:
@@ -989,6 +1078,20 @@ async def lifespan(app_: FastAPI):
     # This also initializes document manager and ALL tools including writing tools
     agent = await get_agent()
 
+    # NEW: Initialize power management before heartbeat (so it stays awake during long operations)
+    from lollmsbot.power_management import get_power_manager
+    power_mgr = get_power_manager()
+    if power_mgr.is_windows:
+        console.print("[bold cyan]🔌 Power Management:[/]")
+        success = power_mgr.prevent_sleep(require_display=True, use_away_mode=False)
+        if success:
+            console.print("[green]  ✅ Sleep/shutdown prevention enabled[/]")
+            console.print("[dim]   System will stay awake while gateway is running[/]")
+        else:
+            console.print("[yellow]  ⚠️ Could not enable power management (may need admin rights)[/]")
+    else:
+        console.print("[dim]  ℹ️ Power management: Windows-only feature (Linux/Mac use systemd/caffeinate)[/]")
+
     # Execute heartbeat once at startup to optimize memory
     try:
         from lollmsbot.heartbeat import get_heartbeat
@@ -1028,8 +1131,8 @@ async def lifespan(app_: FastAPI):
             "ingest_document", "create_book_project", "create_outline",
             "get_document_context", "write_section", "submit_written_content",
             "search_references", "get_writing_progress"
-        ] else "base"
-        icon = "📚" if tool_type == "writing" else "🔧"
+        ] else "power" if name == "power" else "base"
+        icon = "📚" if tool_type == "writing" else "🔌" if tool_type == "power" else "🔧"
         console.print(f"[dim]  {icon} {name}[/]")
     
     # Show environment info
@@ -1059,7 +1162,9 @@ async def lifespan(app_: FastAPI):
     global _active_channels, _channel_tasks, _agent, _document_manager
     
     # Discord with full agent capabilities
-    if DISCORD_TOKEN:
+    if "discord" in DISABLED_CHANNELS:
+        console.print("[dim]ℹ️  Discord disabled via LOLLMSBOT_DISABLE_CHANNELS[/]")
+    elif DISCORD_TOKEN:
         try:
             from lollmsbot.channels.discord import DiscordChannel
             
@@ -1078,7 +1183,7 @@ async def lifespan(app_: FastAPI):
             require_mention_guild = DISCORD_REQUIRE_MENTION_GUILD.lower() in ("true", "1", "yes")
             require_mention_dm = DISCORD_REQUIRE_MENTION_DM.lower() in ("true", "1", "yes")
             
-            channel = DiscordChannel(
+            discord_channel = DiscordChannel(
                 agent=agent,
                 bot_token=DISCORD_TOKEN,
                 allowed_users=allowed_users,
@@ -1087,13 +1192,13 @@ async def lifespan(app_: FastAPI):
                 require_mention_in_guild=require_mention_guild,
                 require_mention_in_dm=require_mention_dm,
             )
-            _active_channels["discord"] = channel
+            _active_channels["discord"] = discord_channel
             
-            task = asyncio.create_task(channel.start())
+            task = asyncio.create_task(discord_channel.start())
             _channel_tasks.append(task)
             
-            async def wait_discord():
-                ready = await channel.wait_for_ready(timeout=15.0)
+            async def wait_discord(dc=discord_channel):
+                ready = await dc.wait_for_ready(timeout=15.0)
                 if ready:
                     console.print("[bold green]✅ Discord connected with FULL AGENT capabilities![/]")
                     console.print("[dim]   File delivery enabled: Users receive generated files via DM[/]")
@@ -1114,7 +1219,9 @@ async def lifespan(app_: FastAPI):
         console.print("[dim]ℹ️  Discord disabled (no DISCORD_BOT_TOKEN)[/]")
     
     # Telegram
-    if TELEGRAM_TOKEN:
+    if "telegram" in DISABLED_CHANNELS:
+        console.print("[dim]ℹ️  Telegram disabled via LOLLMSBOT_DISABLE_CHANNELS[/]")
+    elif TELEGRAM_TOKEN:
         try:
             from lollmsbot.channels.telegram import TelegramChannel
             
@@ -1134,21 +1241,33 @@ async def lifespan(app_: FastAPI):
         console.print("[dim]ℹ️  Telegram disabled (no TELEGRAM_BOT_TOKEN)[/]")
     
     # WhatsApp
-    if WHATSAPP_BACKEND:
+    if "whatsapp" in DISABLED_CHANNELS:
+        console.print("[dim]ℹ️  WhatsApp disabled via LOLLMSBOT_DISABLE_CHANNELS[/]")
+    elif WHATSAPP_BACKEND:
         try:
             from lollmsbot.channels.whatsapp import WhatsAppChannel
             
-            # Parse allowed/blocked numbers
-            def parse_number_list(val: Optional[str]) -> Optional[Set[str]]:
+            # Parse allowed/blocked numbers (handle both string and list inputs)
+            def parse_number_list(val: Optional[Union[str, List]]) -> Optional[Set[str]]:
                 if not val:
                     return None
                 try:
+                    # If already a list, use it directly
+                    if isinstance(val, list):
+                        return set(str(n).strip() for n in val if str(n).strip())
+                    # Otherwise assume comma-separated string
                     return set(n.strip() for n in val.split(",") if n.strip())
-                except ValueError:
+                except (ValueError, AttributeError):
                     return None
             
             allowed_numbers = parse_number_list(WHATSAPP_ALLOWED_NUMBERS)
             blocked_numbers = parse_number_list(WHATSAPP_BLOCKED_NUMBERS)
+            
+            # Parse require_confirmation (handle both bool and string)
+            if isinstance(WHATSAPP_REQUIRE_CONFIRMATION, bool):
+                require_confirmation = WHATSAPP_REQUIRE_CONFIRMATION
+            else:
+                require_confirmation = str(WHATSAPP_REQUIRE_CONFIRMATION).lower() in ("true", "1", "yes")
             
             channel = WhatsAppChannel(
                 agent=agent,
@@ -1162,7 +1281,7 @@ async def lifespan(app_: FastAPI):
                 webhook_port=WHATSAPP_WEBHOOK_PORT,
                 allowed_numbers=allowed_numbers,
                 blocked_numbers=blocked_numbers,
-                require_confirmation=WHATSAPP_REQUIRE_CONFIRMATION.lower() in ("true", "1", "yes"),
+                require_confirmation=require_confirmation,
             )
             _active_channels["whatsapp"] = channel
             
@@ -1199,6 +1318,18 @@ async def lifespan(app_: FastAPI):
     else:
         console.print(f"[yellow]⚠️  LoLLMS: Not connected - tools will work but chat uses fallback mode[/]")
     
+    # NEW: Power management status
+    from lollmsbot.power_management import get_power_manager
+    power_mgr = get_power_manager()
+    if power_mgr.is_windows:
+        power_state = power_mgr.get_state()
+        if power_state.is_preventing_sleep:
+            console.print(f"[bold green]🔌 Power: Sleep prevention active[/]")
+        else:
+            console.print(f"[yellow]⚠️  Power: Sleep prevention not active[/]")
+    else:
+        console.print(f"[dim]🔌 Power: Windows-only feature[/]")
+    
     yield
     
     # Cleanup
@@ -1222,6 +1353,13 @@ async def lifespan(app_: FastAPI):
                 pass
     
     _channel_tasks.clear()
+    
+    # NEW: Restore normal power behavior on shutdown
+    from lollmsbot.power_management import get_power_manager
+    power_mgr = get_power_manager()
+    if power_mgr.is_windows and power_mgr.get_state().is_preventing_sleep:
+        console.print("[yellow]🔌 Restoring normal power management...[/]")
+        power_mgr.allow_sleep()
     
     # Close agent resources
     if _agent:

@@ -70,6 +70,14 @@ from lollmsbot.agent.rlm.memory_map import (
     KnowledgeGap
 )
 
+# NEW: Power management
+from lollmsbot.power_management import (
+    PowerManager,
+    PowerState,
+    ExecutionState,
+    get_power_manager,
+)
+
 __all__ = [
     # Version
     "__version__",
@@ -126,4 +134,10 @@ __all__ = [
     "MemoryCategorySummary",
     "MemoryAnchor",
     "KnowledgeGap",
+    
+    # NEW: Power management
+    "PowerManager",
+    "PowerState", 
+    "ExecutionState",
+    "get_power_manager",
 ]

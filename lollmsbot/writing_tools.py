@@ -564,14 +564,33 @@ class SubmitWrittenContentTool(Tool):
     def __init__(self, document_manager: DocumentManager):
         self._doc_mgr = document_manager
     
-    async def execute(
-        self,
-        project_id: str,
-        task_id: str,
-        content: str,
-        **kwargs,
-    ) -> ToolResult:
+    async def execute(self, **kwargs) -> ToolResult:
         """Submit content."""
+        # Extract required parameters from kwargs
+        project_id = kwargs.get("project_id")
+        task_id = kwargs.get("task_id")
+        content = kwargs.get("content")
+        
+        # Validate required parameters
+        if not project_id:
+            return ToolResult(
+                success=False,
+                output=None,
+                error="Missing required parameter: project_id",
+            )
+        if not task_id:
+            return ToolResult(
+                success=False,
+                output=None,
+                error="Missing required parameter: task_id",
+            )
+        if not content:
+            return ToolResult(
+                success=False,
+                output=None,
+                error="Missing required parameter: content",
+            )
+        
         project = self._doc_mgr.get_book_project(project_id)
         
         if not project:

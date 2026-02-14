@@ -2,9 +2,8 @@
 Tools package for LollmsBot.
 
 This package provides a collection of built-in tools for the Agent framework,
-including filesystem operations, HTTP requests, calendar management, and
-shell command execution. It also provides the ToolRegistry for dynamic
-tool registration and discovery.
+including filesystem operations, HTTP requests, calendar management,
+shell command execution, and power management.
 
 Example:
     >>> from lollmsbot.tools import get_default_tools, ToolRegistry
@@ -21,6 +20,7 @@ from lollmsbot.tools.filesystem import FilesystemTool
 from lollmsbot.tools.http import HttpTool
 from lollmsbot.tools.calendar import CalendarTool
 from lollmsbot.tools.shell import ShellTool
+from lollmsbot.tools.power import PowerTool  # NEW: Power management
 
 
 class ToolRegistry:
@@ -117,6 +117,7 @@ def get_default_tools() -> list[Tool]:
     - HttpTool: HTTP requests and API calls
     - CalendarTool: Date and time management
     - ShellTool: Safe shell command execution
+    - PowerTool: Power management operations
     
     Returns:
         List of default tool instances.
@@ -131,6 +132,7 @@ def get_default_tools() -> list[Tool]:
         HttpTool(),
         CalendarTool(),
         ShellTool(),
+        PowerTool(),  # NEW: Power management tool
     ]
 
 
@@ -146,6 +148,7 @@ __all__ = [
     "HttpTool",
     "CalendarTool",
     "ShellTool",
+    "PowerTool",  # NEW
     # Utility functions
     "get_default_tools",
 ]

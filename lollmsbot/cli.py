@@ -186,6 +186,24 @@ def main(argv: List[str] | None = None) -> None:
     chat_parser.add_argument("--name", type=str, default=None, help="Agent name (default: from config)")
     chat_parser.add_argument("--no-markdown", action="store_true", help="Disable markdown rendering")
 
+    # Channel control command (NEW)
+    channel_parser = subparsers.add_parser(
+        "channels",
+        help="Manage channel status (enable/disable)",
+        description="Quickly enable or disable messaging channels without deleting configuration"
+    )
+    channel_parser.add_argument(
+        "action",
+        choices=["disable", "enable", "status", "list"],
+        help="Action to perform"
+    )
+    channel_parser.add_argument(
+        "channel",
+        nargs="?",
+        choices=["discord", "telegram", "whatsapp", "all"],
+        help="Channel to control (not needed for 'status' or 'list')"
+    )
+
     args = parser.parse_args(argv)
 
     try:
@@ -255,6 +273,68 @@ def main(argv: List[str] | None = None) -> None:
                 config=config,
                 verbose=args.verbose,
             )
+            
+        elif args.command == "channels":
+            # NEW: Channel control
+            from pathlib import Path
+            import json
+            
+            config_path = Path.home() / ".lollmsbot" / "config.json"
+            config = json.loads(config_path.read_text()) if config_path.exists() else {}
+            
+            disabled = config.get("lollmsbot", {}).get("disabled_channels", "").split(",")
+            disabled = [c.strip() for c in disabled if c.strip()]
+            
+            if args.action == "list":
+                console.print("\n[bold]Configured Channels:[/]")
+                for name in ["discord", "telegram", "whatsapp"]:
+                    cfg = config.get(name, {})
+                    has_config = bool(cfg.get("bot_token") or cfg.get("backend"))
+                    is_disabled = name in disabled
+                    status = "[red]⛔ DISABLED[/]" if is_disabled else "[green]✅ Active[/]" if has_config else "[dim]⭕ Not configured[/]"
+                    console.print(f"  • {name.title()}: {status}")
+                    
+            elif args.action == "status":
+                console.print("\n[bold]Channel Status:[/]")
+                console.print(f"  Disabled via config: {disabled or 'None'}")
+                console.print(f"\nUse 'lollmsbot channels disable <channel>' to disable")
+                console.print(f"Use 'lollmsbot channels enable <channel>' to re-enable")
+                
+            elif args.action == "disable":
+                if not args.channel:
+                    console.print("[red]Error: specify channel to disable[/]")
+                    return
+                    
+                targets = ["discord", "telegram", "whatsapp"] if args.channel == "all" else [args.channel]
+                for ch in targets:
+                    if ch not in disabled:
+                        disabled.append(ch)
+                        
+                # Save back
+                config.setdefault("lollmsbot", {})["disabled_channels"] = ",".join(disabled)
+                config_path.parent.mkdir(exist_ok=True)
+                config_path.write_text(json.dumps(config, indent=2))
+                
+                console.print(f"[green]✅ Disabled: {', '.join(targets)}[/]")
+                console.print("[yellow]⏸️  Restart gateway for changes to take effect[/]")
+                
+            elif args.action == "enable":
+                if not args.channel:
+                    console.print("[red]Error: specify channel to enable[/]")
+                    return
+                    
+                targets = ["discord", "telegram", "whatsapp"] if args.channel == "all" else [args.channel]
+                for ch in targets:
+                    if ch in disabled:
+                        disabled.remove(ch)
+                        
+                # Save back
+                config.setdefault("lollmsbot", {})["disabled_channels"] = ",".join(disabled)
+                config_path.parent.mkdir(exist_ok=True)
+                config_path.write_text(json.dumps(config, indent=2))
+                
+                console.print(f"[green]✅ Enabled: {', '.join(targets)}[/]")
+                console.print("[yellow]⏯️  Restart gateway for changes to take effect[/]")
             
         elif args.command == "wizard":
             from lollmsbot import wizard
