@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Set, Callable, Awaitable
 
 from lollmsbot.config import BotConfig
 from lollmsbot.lollms_client import LollmsClient, build_lollms_client
+
 from lollmsbot.guardian import get_guardian, Guardian
 
 
@@ -44,6 +45,14 @@ from lollmsbot.agent.rlm import (
     MemoryChunkType,
     RCBEntry,
     PromptInjectionSanitizer,
+)
+
+from lollmsbot.agent.project_memory import (
+    ProjectMemoryManager,
+    Project,
+    MemorySegment,
+    ProjectStatus,
+    get_project_memory_manager,
 )
 
 from lollmsbot.agent.identity import IdentityDetector
@@ -112,6 +121,12 @@ class Agent:
         self._memory: Optional[RLMMemoryManager] = None
         self._memory_lock: asyncio.Lock = asyncio.Lock()
         self._memory_db_path = memory_db_path
+        
+        # PROJECT MEMORY SYSTEM
+        self._project_memory: Optional[ProjectMemoryManager] = None
+        
+        # OPENCLAW INTEGRATION
+        self._openclaw: Optional[Any] = None
         
         self._identity_detector = IdentityDetector()
         self._prompt_builder = PromptBuilder(agent_name=self.name)
@@ -195,8 +210,35 @@ class Agent:
         await self._ensure_memory()
         await self._store_environment_knowledge()
         
+        # Register project memory tool if available
+        try:
+            from lollmsbot.tools.project_memory import ProjectMemoryTool
+            if self._project_memory:
+                project_tool = ProjectMemoryTool()
+                project_tool.set_project_memory(self._project_memory)
+                await self.register_tool(project_tool)
+                self._logger.log("✅ Project memory tool registered", "green", "🔧")
+        except Exception as e:
+            self._logger.log(f"Could not register project memory tool: {e}", "yellow")
+            import traceback
+            self._logger.log(f"Traceback: {traceback.format_exc()}", "dim")
+        
+        # Initialize simplified_agent integration
+        try:
+            from lollmsbot.simplified_agent_integration import simplified_agentIntegration
+            self._simplified_agent = simplified_agentIntegration(self)
+            await self._simplified_agent.initialize()
+            
+            # Register simplified_agent tools
+            await self._register_simplified_agent_tools()
+            
+            self._logger.log("✅ simplified_agent integration initialized", "green", "🚀")
+        except Exception as e:
+            self._logger.log(f"simplified_agent integration not available: {e}", "yellow")
+            self._simplified_agent = None
+        
         self._initialized = True
-        self._logger.log(f"✅ Agent {self.name} initialized with environment awareness", "green", "🚀")
+        self._logger.log(f"✅ Agent {self.name} initialized with project-based memory", "green", "🚀")
     
     def _generate_id(self) -> str:
         import uuid
@@ -224,6 +266,11 @@ class Agent:
                 f"{stats.get('rcb_entries', 0)}/{stats.get('rcb_capacity', 10)} RCB entries",
                 "green", "🧠"
             )
+            
+            # Initialize project memory manager
+            self._project_memory = get_project_memory_manager(self._memory)
+            await self._project_memory.initialize()
+            self._logger.log("✅ Project Memory Manager initialized", "green", "📁")
         
         return self._memory
     
@@ -663,11 +710,18 @@ class Agent:
     async def register_tool(self, tool: Tool) -> None:
         async with self._tool_lock:
             if tool.name in self._tools:
-                raise ValueError(f"Tool '{tool.name}' already registered")
+                self._logger.log(f"Tool '{tool.name}' already registered, skipping", "yellow", "⚠️")
+                return  # Skip instead of raising
             
             if tool.name == "http" and hasattr(tool, 'set_rlm_memory'):
                 tool.set_rlm_memory(self._memory)
                 self._logger.log(f"🔗 Connected RLM memory to HTTP tool", "cyan", "🔗")
+            
+            # Special handling for project_memory tool
+            if tool.name == "project_memory" and self._project_memory:
+                if hasattr(tool, 'set_project_memory'):
+                    tool.set_project_memory(self._project_memory)
+                    self._logger.log(f"🔗 Connected project memory manager to project_memory tool", "cyan", "🔗")
             
             self._tools[tool.name] = tool
             self._logger.log(
@@ -948,6 +1002,7 @@ class Agent:
         tools_used: List[str] = []
         skills_used: List[str] = []
         files_to_send: List[Dict[str, Any]] = []
+        thinking_content: Optional[str] = None
         
         memory = await self._ensure_memory()
         conversation_history = self._get_conversation_history(user_id)
@@ -996,9 +1051,12 @@ class Agent:
             except Exception as e:
                 self._logger.log(f"Failed to store identity: {e}", "yellow")
         
-        # Check for info query
+        # Check for info query (basic tools inquiry)
         if self._identity_detector.is_informational_query(message):
-            return await self._handle_informational_query(memory, user_id)
+            # But still load self-knowledge if it's about the system
+            if not is_self_knowledge_query:
+                return await self._handle_informational_query(memory, user_id)
+            # Otherwise continue to load self-knowledge below
         
         is_file_request = self._file_generator and self._file_generator.is_file_request(message)
         
@@ -1009,9 +1067,17 @@ class Agent:
         memory_structure = ""
         if self._memory:
             try:
-                memory_structure = await self._memory.get_memory_structure_for_prompt(max_length=3000)
+                memory_structure = await self._memory.get_memory_structure_for_prompt(max_length=2000)
             except Exception as e:
                 self._logger.log(f"Failed to generate memory structure: {e}", "yellow")
+        
+        # Get project memory structure
+        project_structure = ""
+        if self._project_memory:
+            try:
+                project_structure = self._project_memory.format_memory_structure_for_prompt(max_length=2000)
+            except Exception as e:
+                self._logger.log(f"Failed to generate project structure: {e}", "yellow")
         
         # Build prompt with loaded content
         soul = self._ensure_soul()
@@ -1022,6 +1088,7 @@ class Agent:
             loaded_memories=loaded_memories,
             is_file_request=is_file_request,
             memory_structure=memory_structure,
+            project_structure=project_structure,
         )
         
         # CRITICAL DEBUG: Log the actual memory content being sent
@@ -1036,7 +1103,7 @@ class Agent:
         
         # Get LLM response
         client = self._ensure_lollms_client()
-        response, extracted_tools, extracted_files, raw_llm_response, tool_results = await self._get_llm_response_with_tools(
+        response, extracted_tools, extracted_files, raw_llm_response, tool_results, thinking_content = await self._get_llm_response_with_tools(
             client, system_prompt, user_id, message, is_file_request, memory, conversation_history
         )
         
@@ -1046,6 +1113,7 @@ class Agent:
             "full_raw_response": raw_llm_response,  # FULL content
             "response_length": len(response),
             "tools_used": len(extracted_tools),
+            "has_thinking": bool(thinking_content),
         })
         
         tools_used.extend(extracted_tools)
@@ -1082,13 +1150,19 @@ class Agent:
         final_response = self._build_final_response(response, files_to_send)
         self._logger.log_response_sent(user_id, len(final_response), tools_used)
         
-        return {
+        result = {
             "success": True,
             "response": final_response,
             "tools_used": tools_used,
             "skills_used": skills_used,
             "files_to_send": files_to_send,
         }
+        
+        # Include thinking content for CLI display (not for channels)
+        if thinking_content:
+            result["thinking_content"] = thinking_content
+            
+        return result
     
     def _build_system_prompt(
         self,
@@ -1098,6 +1172,7 @@ class Agent:
         loaded_memories: List[Dict[str, Any]],
         is_file_request: bool,
         memory_structure: str = "",
+        project_structure: str = "",
     ) -> str:
         """Build system prompt with multi-step memory reasoning instructions."""
         
@@ -1109,7 +1184,12 @@ class Agent:
         
         parts = [base_prompt]
         
-        # Add memory structure awareness (NEW)
+        # Add project memory structure FIRST (most important for context)
+        if project_structure:
+            parts.append(project_structure)
+            parts.append("")  # Separator
+        
+        # Add memory structure awareness
         if memory_structure:
             parts.append(memory_structure)
             parts.append("")  # Separator
@@ -1225,6 +1305,16 @@ class Agent:
         parts.append(self._prompt_builder._build_strict_tool_instructions(self._tools))
         parts.append("")
         
+        # Project memory specific guidance
+        parts.append("")
+        parts.append("PROJECT MEMORY GUIDANCE:")
+        parts.append("- When user says 'create project [name]': use create_project")
+        parts.append("- When user says 'open [name] project' or 'open project [name]': use find_or_open_project")
+        parts.append("  (This will load existing if found, or create new if not found)")
+        parts.append("- When user says 'switch to [name]' or 'load [name]': use load_project with specific ID")
+        parts.append("- To see all projects: use list_projects")
+        parts.append("")
+        
         if is_file_request:
             parts.append("FILE GENERATION: Use filesystem tool to create files when requested.")
         
@@ -1311,15 +1401,16 @@ class Agent:
         memory: RLMMemoryManager,
         conversation_history: Optional[List[ConversationTurn]] = None,
         max_iterations: int = 5,
-    ) -> tuple[str, List[str], List[Dict[str, Any]], str, List[Dict[str, Any]]]:
+    ) -> tuple[str, List[str], List[Dict[str, Any]], str, List[Dict[str, Any]], Optional[str]]:
         if not client:
             response = await self._try_direct_execution(message, user_id)
-            return response[0], response[1], response[2], "[no LLM]", []
+            return response[0], response[1], response[2], "[no LLM]", [], None
         
         tools_used: List[str] = []
         files_generated: List[Dict[str, Any]] = []
         all_tool_results: List[Dict[str, Any]] = []
         last_raw_response = ""
+        thinking_content: Optional[str] = None
         
         base_prompt = system_prompt
         
@@ -1341,22 +1432,44 @@ class Agent:
             
             last_raw_response = llm_response
             
-            has_tool_calls = "<tool>" in llm_response or "[[TOOL:" in llm_response
+            # Extract thinking blocks and clean response
+            thinking_blocks = client.extract_thinking_blocks(llm_response)
+            if thinking_blocks:
+                thinking_content = "\n\n".join(thinking_blocks)
+                self._logger.log(f"🧠 Extracted {len(thinking_blocks)} thinking block(s)", "cyan", "💭")
+            
+            # Remove thinking blocks for processing and final output
+            cleaned_llm_response = client.remove_thinking_blocks(llm_response)
+            
+            # Log what we're working with for debugging
+            self._logger.log(f"📄 Cleaned response length: {len(cleaned_llm_response)} chars", "dim")
+            
+            has_tool_calls = "<tool>" in cleaned_llm_response or "[[TOOL:" in cleaned_llm_response
             
             if not has_tool_calls:
-                clean_response = self._strip_memory_handles(llm_response.strip())
-                return clean_response, tools_used, files_generated, last_raw_response, all_tool_results
+                clean_response = self._strip_memory_handles(cleaned_llm_response.strip())
+                # Ensure we have actual content, not just empty
+                if not clean_response and thinking_content:
+                    # If no clean response but we have thinking, extract conclusion from thinking
+                    clean_response = self._extract_conclusion_from_thinking(thinking_content)
+                return clean_response, tools_used, files_generated, last_raw_response, all_tool_results, thinking_content
             
             if self._tool_parser:
                 if self._tool_event_callback:
                     await self._tool_event_callback("planning_start", "unknown", {})
                 
-                result = await self._tool_parser.parse_and_execute(llm_response, user_id, None)
+                result = await self._tool_parser.parse_and_execute(cleaned_llm_response, user_id, None)
                 parsed_response, iteration_tools, iteration_files = result
                 
+                # Log tool execution results
+                self._logger.log(f"🔧 Tool execution: {len(iteration_tools)} tools, response length {len(parsed_response)}", "purple")
+                
                 if not iteration_tools:
-                    clean_response = self._strip_memory_handles(llm_response.strip())
-                    return clean_response, tools_used, files_generated, last_raw_response, all_tool_results
+                    # No tools executed - use the parsed response (which may contain error messages)
+                    clean_response = self._strip_memory_handles(parsed_response.strip())
+                    if not clean_response:
+                        clean_response = self._strip_memory_handles(cleaned_llm_response.strip())
+                    return clean_response, tools_used, files_generated, last_raw_response, all_tool_results, thinking_content
                 
                 tools_used.extend(iteration_tools)
                 files_generated.extend(iteration_files)
@@ -1368,14 +1481,52 @@ class Agent:
                     "response_preview": parsed_response[:500],
                 }
                 all_tool_results.append(tool_result)
+                
+                # If we got a meaningful parsed response with tool results, use it as final
+                # This handles the case where tool execution produces the final output
+                if parsed_response.strip() and iteration == 0:
+                    # Check if this looks like a final response (not just tool indicators)
+                    if len(parsed_response) > 50 or "project" in parsed_response.lower():
+                        clean_response = self._strip_memory_handles(parsed_response.strip())
+                        return clean_response, tools_used, files_generated, last_raw_response, all_tool_results, thinking_content
+                
                 continue
             else:
-                clean_response = self._strip_memory_handles(llm_response.strip())
-                return clean_response, tools_used, files_generated, last_raw_response, all_tool_results
+                clean_response = self._strip_memory_handles(cleaned_llm_response.strip())
+                return clean_response, tools_used, files_generated, last_raw_response, all_tool_results, thinking_content
         
         self._logger.log("⚠️ Max tool iterations reached", "yellow", "⏳")
-        final_response = self._strip_memory_handles(last_raw_response.strip())
-        return final_response, tools_used, files_generated, last_raw_response, all_tool_results
+        final_response = self._strip_memory_handles(client.remove_thinking_blocks(last_raw_response).strip())
+        # Ensure we have content
+        if not final_response and thinking_content:
+            final_response = self._extract_conclusion_from_thinking(thinking_content)
+        return final_response, tools_used, files_generated, last_raw_response, all_tool_results, thinking_content
+    
+    def _extract_conclusion_from_thinking(self, thinking_content: str) -> str:
+        """Extract a conclusion or summary from thinking content when no explicit response is given."""
+        # Look for common patterns in thinking that indicate the conclusion
+        lines = thinking_content.strip().split('\n')
+        
+        # Find the last substantial line that looks like a conclusion
+        for line in reversed(lines):
+            line = line.strip()
+            # Skip empty lines, headers, and meta-commentary
+            if not line or line.startswith('│') or line.startswith('─') or line.startswith('='):
+                continue
+            if 'need to' in line.lower() or 'should' in line.lower() or 'will' in line.lower():
+                # Clean up the line
+                conclusion = line.replace('I need to', "I'll").replace('I should', "I'll")
+                conclusion = conclusion.replace('I will', "I'll")
+                # Remove leading bullet points or markers
+                conclusion = re.sub(r'^[•\-\*]\s*', '', conclusion)
+                return conclusion
+        
+        # Fallback: return a generic message with the last few lines
+        substantial_lines = [l.strip() for l in lines if len(l.strip()) > 20]
+        if substantial_lines:
+            return substantial_lines[-1]
+        
+        return "I'm processing your request. Let me know if you need anything else."
     
     def _format_tool_results_for_llm(self, tool_result: Dict[str, Any]) -> str:
         lines = [
@@ -1623,6 +1774,54 @@ class Agent:
             "stats": stats,
         }
     
+    async def _register_openclaw_tools(self) -> None:
+        """Register tools for SimplifiedAgant features."""
+        if not self._openclaw:
+            return
+        
+        # CRM tools
+        try:
+            from lollmsbot.tools.crm_tools import CRMQueryTool, MeetingPrepTool
+            await self.register_tool(CRMQueryTool(self._openclaw.crm))
+            await self.register_tool(MeetingPrepTool(self._openclaw.crm))
+            self._logger.log("✅ CRM tools registered", "green", "🔧")
+        except Exception as e:
+            self._logger.log(f"CRM tools not available: {e}", "dim")
+        
+        # Knowledge base tools
+        try:
+            from lollmsbot.tools.knowledge_tools import KnowledgeQueryTool, IngestContentTool
+            await self.register_tool(KnowledgeQueryTool(self._openclaw.knowledge_base))
+            await self.register_tool(IngestContentTool(self._openclaw.knowledge_base))
+            self._logger.log("✅ Knowledge base tools registered", "green", "🔧")
+        except Exception as e:
+            self._logger.log(f"Knowledge tools not available: {e}", "dim")
+        
+        # Task management tools
+        try:
+            from lollmsbot.tools.task_tools import CreateTaskTool, GetTasksTool
+            await self.register_tool(CreateTaskTool(self._openclaw.task_manager))
+            await self.register_tool(GetTasksTool(self._openclaw.task_manager))
+            self._logger.log("✅ Task tools registered", "green", "🔧")
+        except Exception as e:
+            self._logger.log(f"Task tools not available: {e}", "dim")
+        
+        # YouTube analytics tools
+        try:
+            from lollmsbot.tools.youtube_tools import YouTubeReportTool
+            await self.register_tool(YouTubeReportTool(self._openclaw.youtube_analytics))
+            self._logger.log("✅ YouTube tools registered", "green", "🔧")
+        except Exception as e:
+            self._logger.log(f"YouTube tools not available: {e}", "dim")
+        
+        # Business analysis tools
+        try:
+            from lollmsbot.tools.business_tools import BusinessReportTool
+            await self.register_tool(BusinessReportTool(self._openclaw.business_council))
+            self._logger.log("✅ Business analysis tools registered", "green", "🔧")
+        except Exception as e:
+            self._logger.log(f"Business tools not available: {e}", "dim")
+    
     async def close(self) -> None:
         if self._memory:
             await self._memory.close()
@@ -1631,10 +1830,32 @@ class Agent:
 
 # Re-export for convenience
 from lollmsbot.agent.integrated_document_agent import IntegratedDocumentAgent
+from lollmsbot.agent.project_memory import (
+    ProjectMemoryManager,
+    Project,
+    MemorySegment,
+    ProjectStatus,
+)
+
+# simplified_agent-style exports
+from lollmsbot.agent.simplified_agant_style import (
+    SimplifiedAgantStyle,
+    MinimalToolSet,
+    CodeExtension,
+    SessionBranch,
+)
+from lollmsbot.agent.simplified_agant_integration import (
+    simplified_agentTool,
+    integrate_simplified_agent,
+)
 
 __all__ = [
     "Agent",
     "IntegratedDocumentAgent",
+    "ProjectMemoryManager",
+    "Project",
+    "MemorySegment",
+    "ProjectStatus",
     "AgentState",
     "PermissionLevel",
     "Tool",
@@ -1646,4 +1867,11 @@ __all__ = [
     "ToolError",
     "AgentError",
     "MemoryAnchor",
+    # simplified_agent exports
+    "SimplifiedAgantStyle",
+    "MinimalToolSet",
+    "CodeExtension",
+    "SessionBranch",
+    "simplified_agentTool",
+    "integrate_simplified_agent",
 ]

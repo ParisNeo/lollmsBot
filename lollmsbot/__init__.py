@@ -78,6 +78,26 @@ from lollmsbot.power_management import (
     get_power_manager,
 )
 
+# NEW: Project Memory
+from lollmsbot.agent.project_memory import (
+    ProjectMemoryManager,
+    Project,
+    MemorySegment,
+    ProjectStatus,
+)
+
+# NEW: SimplifiedAgant Integration (when available)
+try:
+    from lollmsbot.openclaw_integration import SimplifiedAgantIntegration
+    from lollmsbot.crm import CRMManager, Contact, ContactRole
+    from lollmsbot.knowledge_base import KnowledgeBaseManager, KnowledgeEntry
+    from lollmsbot.task_manager import TaskManager, Task, TaskPriority
+    from lollmsbot.youtube_analytics import YouTubeAnalyticsManager
+    from lollmsbot.business_analysis import BusinessAnalysisCouncil, CouncilReport
+    OPENCLAW_AVAILABLE = True
+except ImportError:
+    OPENCLAW_AVAILABLE = False
+
 __all__ = [
     # Version
     "__version__",
@@ -94,6 +114,12 @@ __all__ = [
     "ConversationTurn",
     "ToolError",
     "AgentError",
+    
+    # Project Memory
+    "ProjectMemoryManager",
+    "Project",
+    "MemorySegment",
+    "ProjectStatus",
     
     # Document management
     "DocumentManager",
@@ -141,3 +167,20 @@ __all__ = [
     "ExecutionState",
     "get_power_manager",
 ]
+
+# Add SimplifiedAgant exports if available
+if OPENCLAW_AVAILABLE:
+    __all__.extend([
+        "SimplifiedAgantIntegration",
+        "CRMManager",
+        "Contact",
+        "ContactRole",
+        "KnowledgeBaseManager",
+        "KnowledgeEntry",
+        "TaskManager",
+        "Task",
+        "TaskPriority",
+        "YouTubeAnalyticsManager",
+        "BusinessAnalysisCouncil",
+        "CouncilReport",
+    ])

@@ -1,16 +1,16 @@
 """
 Tools package for LollmsBot.
 
-This package provides a collection of built-in tools for the Agent framework,
-including filesystem operations, HTTP requests, calendar management,
-shell command execution, and power management.
+This package provides tool implementations that can be registered with the Agent.
+Tools are the primary way the Agent interacts with external systems and performs actions.
 
-Example:
-    >>> from lollmsbot.tools import get_default_tools, ToolRegistry
-    >>> tools = get_default_tools()
-    >>> registry = ToolRegistry()
-    >>> for tool in tools:
-    ...     registry.register(tool)
+Available tools:
+- filesystem: File operations and HTML app generation
+- http: Web requests with memory integration
+- calendar: Event management
+- shell: Command execution (high risk)
+- power: Windows power management
+- project_memory: Project-based memory management
 """
 
 from lollmsbot.agent import Tool, ToolResult, ToolError
@@ -20,8 +20,19 @@ from lollmsbot.tools.filesystem import FilesystemTool
 from lollmsbot.tools.http import HttpTool
 from lollmsbot.tools.calendar import CalendarTool
 from lollmsbot.tools.shell import ShellTool
-from lollmsbot.tools.power import PowerTool  # NEW: Power management
+from lollmsbot.tools.power import PowerTool
+from lollmsbot.tools.project_memory import ProjectMemoryTool
 
+# SimplifiedAgant integration tools
+try:
+    from lollmsbot.tools.crm_tools import CRMQueryTool, MeetingPrepTool
+    from lollmsbot.tools.knowledge_tools import KnowledgeQueryTool, IngestContentTool
+    from lollmsbot.tools.task_tools import CreateTaskTool, GetTasksTool
+    from lollmsbot.tools.youtube_tools import YouTubeReportTool
+    from lollmsbot.tools.business_tools import BusinessReportTool
+    OPENCLAW_TOOLS_AVAILABLE = True
+except ImportError:
+    OPENCLAW_TOOLS_AVAILABLE = False
 
 class ToolRegistry:
     """Dynamic registry for tool registration and discovery.
@@ -118,6 +129,7 @@ def get_default_tools() -> list[Tool]:
     - CalendarTool: Date and time management
     - ShellTool: Safe shell command execution
     - PowerTool: Power management operations
+    - ProjectMemoryTool: Project-based memory management
     
     Returns:
         List of default tool instances.
@@ -132,7 +144,8 @@ def get_default_tools() -> list[Tool]:
         HttpTool(),
         CalendarTool(),
         ShellTool(),
-        PowerTool(),  # NEW: Power management tool
+        PowerTool(),
+        ProjectMemoryTool(),
     ]
 
 
@@ -148,7 +161,21 @@ __all__ = [
     "HttpTool",
     "CalendarTool",
     "ShellTool",
-    "PowerTool",  # NEW
+    "PowerTool",
+    "ProjectMemoryTool",
     # Utility functions
     "get_default_tools",
 ]
+
+
+if OPENCLAW_TOOLS_AVAILABLE:
+    __all__.extend([
+        "CRMQueryTool",
+        "MeetingPrepTool",
+        "KnowledgeQueryTool",
+        "IngestContentTool",
+        "CreateTaskTool",
+        "GetTasksTool",
+        "YouTubeReportTool",
+        "BusinessReportTool",
+    ])

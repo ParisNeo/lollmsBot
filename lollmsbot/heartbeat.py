@@ -56,6 +56,7 @@ class MaintenanceTask(Enum):
     UPDATE = auto()          # Code update checks, patch application
     OPTIMIZATION = auto()    # Performance tuning, cache cleaning
     HEALING = auto()         # Self-correction of detected drift
+    OPENCLAW_WORKFLOW = auto()  # NEW: SimplifiedAgant daily automation workflow
 
 
 @dataclass
@@ -187,6 +188,10 @@ class Heartbeat:
         self.config = config or HeartbeatConfig()
         self.config_path = config_path or self.DEFAULT_CONFIG_PATH
         
+        # Ensure SimplifiedAgant workflow is in default tasks if not explicitly disabled
+        if MaintenanceTask.OPENCLAW_WORKFLOW not in self.config.tasks_enabled:
+            self.config.tasks_enabled[MaintenanceTask.OPENCLAW_WORKFLOW] = True
+        
         # Subsystems
         self.memory_monitor = MemoryMonitor()
         self.guardian = get_guardian()
@@ -217,6 +222,7 @@ class Heartbeat:
             MaintenanceTask.UPDATE: self._run_update_check,
             MaintenanceTask.OPTIMIZATION: self._run_optimization,
             MaintenanceTask.HEALING: self._run_healing,
+            MaintenanceTask.OPENCLAW_WORKFLOW: self._run_openclaw_workflow,  # NEW
         }
         
         # Load or save config
@@ -231,6 +237,11 @@ class Heartbeat:
         if RLM_MAINTENANCE_AVAILABLE and memory_manager:
             self._rlm_maintenance = MemoryMaintenance(memory_manager)
             logger.info("✅ RLM Memory Maintenance connected to Heartbeat")
+    
+    def set_openclaw_integration(self, simplified_agant: Any) -> None:
+        """Set the SimplifiedAgant integration for daily workflows."""
+        self._openclaw = simplified_agant
+        logger.info("✅ SimplifiedAgant integration connected to Heartbeat")
     
     def _load_config(self) -> None:
         """Load configuration from JSON."""
@@ -359,6 +370,59 @@ class Heartbeat:
             success=True,
             findings=findings,
             actions_taken=actions,
+            duration_seconds=time.time() - start,
+        )
+    
+    async def _run_openclaw_workflow(self) -> TaskResult:
+        """Run SimplifiedAgant daily workflow."""
+        start = time.time()
+        findings = []
+        actions = []
+        warnings = []
+        
+        if not hasattr(self, '_openclaw') or not self._openclaw:
+            return TaskResult(
+                task=MaintenanceTask.OPENCLAW_WORKFLOW,
+                executed_at=datetime.now(),
+                success=True,
+                findings=["SimplifiedAgant integration not configured"],
+                actions_taken=[],
+                duration_seconds=time.time() - start,
+            )
+        
+        try:
+            results = await self._openclaw.daily_workflow()
+            
+            findings.append(f"SimplifiedAgant daily workflow completed")
+            findings.append(f"Steps completed: {', '.join(results.get('steps_completed', []))}")
+            
+            if "youtube_snapshot" in results:
+                yt = results["youtube_snapshot"]
+                findings.append(f"YouTube: {yt.get('views', 0):,} views, {yt.get('subscribers', 0):,} subscribers")
+            
+            if "business_analysis" in results:
+                ba = results["business_analysis"]
+                findings.append(f"Business analysis: {ba.get('priorities', 0)} priorities, {ba.get('confidence')} confidence")
+                actions.append("Business council report generated")
+            
+            if "crm_error" in results:
+                warnings.append(f"CRM workflow issue: {results['crm_error']}")
+            if "youtube_error" in results:
+                warnings.append(f"YouTube analytics issue: {results['youtube_error']}")
+            if "analysis_error" in results:
+                warnings.append(f"Business analysis issue: {results['analysis_error']}")
+            
+        except Exception as e:
+            warnings.append(f"SimplifiedAgant workflow failed: {str(e)}")
+            logger.error(f"SimplifiedAgant daily workflow error: {e}")
+        
+        return TaskResult(
+            task=MaintenanceTask.OPENCLAW_WORKFLOW,
+            executed_at=datetime.now(),
+            success=len(warnings) == 0,
+            findings=findings,
+            actions_taken=actions,
+            warnings=warnings,
             duration_seconds=time.time() - start,
         )
     

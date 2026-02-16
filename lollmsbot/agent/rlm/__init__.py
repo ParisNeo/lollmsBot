@@ -17,6 +17,11 @@ from lollmsbot.agent.rlm.models import (
 from lollmsbot.agent.rlm.sanitizer import PromptInjectionSanitizer
 from lollmsbot.agent.rlm.memory_map import MemoryMap, MemoryCategorySummary, MemoryAnchor, KnowledgeGap
 
+from lollmsbot.agent.rlm.self_knowledge import (
+    get_self_knowledge_entries,
+    get_combined_self_knowledge,
+)
+
 __all__ = [
     "RLMDatabase",
     "RLMMemoryManager",
@@ -29,4 +34,6 @@ __all__ = [
     "MemoryCategorySummary",
     "MemoryAnchor",
     "KnowledgeGap",
+    "get_self_knowledge_entries",
+    "get_combined_self_knowledge",
 ]

@@ -40,6 +40,9 @@ lollmsbot gateway
 
 # Or with web UI
 lollmsbot gateway --ui
+
+# Or chat in CLI
+lollmsbot chat
 ```
 
 ## 🔧 Configuration

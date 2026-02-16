@@ -79,6 +79,7 @@ class ConsoleChat:
     - File delivery notifications
     - Command palette for special actions
     - Session management
+    - SimplifiedAgant-style minimal tool mode
     """
     
     def __init__(
@@ -86,11 +87,16 @@ class ConsoleChat:
         agent: Optional[Agent] = None,
         config: Optional[BotConfig] = None,
         verbose: bool = True,
+        openclaw_mode: bool = False,
     ) -> None:
         self.console = Console()
         self.config = config or BotConfig.from_env()
         self.agent = agent
         self.verbose = verbose
+        self.openclaw_mode = openclaw_mode
+        
+        # SimplifiedAgant agent (if enabled)
+        self._openclaw: Optional[Any] = None
         
         # Session management
         self.session: Optional[ChatSession] = None
@@ -119,17 +125,24 @@ class ConsoleChat:
             "/exit": self._cmd_exit,
             "/quit": self._cmd_exit,
         }
+        
+        # Add SimplifiedAgant commands if enabled
+        if openclaw_mode:
+            self._commands["/branch"] = self._cmd_branch
+            self._commands["/extensions"] = self._cmd_extensions
+            self._commands["/reload"] = self._cmd_reload
     
     async def initialize(self) -> bool:
         """Initialize the console chat interface."""
         self.console.print()
         
         # Startup banner
+        mode_str = " [SimplifiedAgant Mode]" if self.openclaw_mode else ""
         banner = Panel(
             Text.assemble(
                 ("🤖 ", "bold cyan"),
                 ("lollmsBot", "bold blue"),
-                (" Console Chat\n", "bold white"),
+                (f" Console Chat{mode_str}\n", "bold white"),
                 ("Direct terminal interface to your AI agent", "dim"),
             ),
             box=box.DOUBLE_EDGE,
@@ -153,6 +166,25 @@ class ConsoleChat:
             except Exception as e:
                 self.console.print(f"[red]❌ Failed to initialize agent: {e}[/]")
                 return False
+        
+        # Initialize SimplifiedAgant mode if enabled
+        if self.openclaw_mode:
+            self.console.print("[cyan]Initializing SimplifiedAgant-style minimal tool mode...[/]")
+            try:
+                from lollmsbot.agent.simplified_agant_integration import integrate_openclaw
+                from lollmsbot.agent.simplified_agant_style import SimplifiedAgantTool
+                
+                self._openclaw, oc_tool = integrate_openclaw(self.agent)
+                
+                # Register the SimplifiedAgant tool
+                await self.agent.register_tool(oc_tool)
+                
+                self.console.print(f"[green]✅ SimplifiedAgant mode active: 4 core tools + {len(self._openclaw.extensions)} extensions[/]")
+                self.console.print("[dim]  Core: read, write, edit, bash | Extensions: self-written[/]")
+            except Exception as e:
+                self.console.print(f"[yellow]⚠️ SimplifiedAgant init warning: {e}[/]")
+                import traceback
+                self.console.print(f"[dim]{traceback.format_exc()[:200]}[/]")
         
         # Setup file delivery callback
         self.agent.set_file_delivery_callback(self._handle_file_delivery)
@@ -208,6 +240,20 @@ class ConsoleChat:
         # Files pending
         if self._pending_files:
             status_parts.append(f"[yellow]📎 {len(self._pending_files)} files[/]")
+        
+        # Active project (if any)
+        if hasattr(self.agent, '_project_memory') and self.agent._project_memory:
+            active = self.agent._project_memory._active_project_id
+            if active:
+                # Try to get project name
+                try:
+                    project = self.agent._project_memory._projects.get(active)
+                    if project:
+                        status_parts.append(f"[green]📁 {project.name}[/]")
+                    else:
+                        status_parts.append(f"[green]📁 {active[:8]}...[/]")
+                except:
+                    status_parts.append(f"[green]📁 {active[:8]}...[/]")
         
         # Status line
         status_line = " | ".join(status_parts)
@@ -319,6 +365,7 @@ class ConsoleChat:
     def _display_response(self, result: Dict[str, Any]) -> None:
         """Display the agent response beautifully."""
         response = result.get("response", "")
+        thinking_content = result.get("thinking_content")
         
         # Add to history
         self.conversation_history.append({
@@ -326,34 +373,85 @@ class ConsoleChat:
             "content": response,
             "timestamp": datetime.now().isoformat(),
             "tools_used": result.get("tools_used", []),
+            "thinking_content": thinking_content,
         })
         
         # Print agent header
         self.console.print()
-        self.console.print(f"[bold blue]{self.agent.name}:[/]")
+        self.console.print(f"[bold blue]{self.agent.name}:[/] ")
         
-        # Display tools used
+        # Display tools used in a dedicated panel
         tools_used = result.get("tools_used", [])
-        if tools_used and self.show_tool_details:
-            tools_str = ", ".join(f"[cyan]{t}[/]" for t in tools_used)
-            self.console.print(f"[dim]🔧 Used: {tools_str}[/]")
+        if tools_used:
+            # Create detailed tool panel
+            tool_lines = []
+            for tool_name in tools_used:
+                tool_lines.append(f"[cyan]▶ {tool_name}[/cyan]")
+            
+            # Also show raw tool calls if present in response
+            raw_tool_calls = self._extract_tool_calls(response)
+            if raw_tool_calls:
+                tool_lines.append("")
+                tool_lines.append("[dim]Raw tool calls:[/dim]")
+                for call in raw_tool_calls:
+                    tool_lines.append(f"[dim]{call}[/dim]")
+            
+            tool_panel = Panel(
+                "\n".join(tool_lines),
+                title="[bold yellow]🔧 TOOL CALLS[/bold yellow]",
+                border_style="yellow",
+                box=box.DOUBLE_EDGE,
+                padding=(1, 2),
+            )
+            self.console.print(tool_panel)
         
-        # Display the response with markdown rendering
-        if self.markdown_rendering and not self._is_simple_text(response):
-            # Use markdown rendering
-            md = Markdown(response, code_theme=self.code_theme)
-            panel = Panel(
-                md,
-                border_style="blue",
+        # Display thinking content in a separate panel if present
+        if thinking_content and self.show_tool_details:
+            from rich.syntax import Syntax
+            thinking_panel = Panel(
+                Syntax(thinking_content, "markdown", theme="monokai", word_wrap=True),
+                title="[bold magenta]💭 Thinking Process[/bold magenta]",
+                border_style="magenta",
                 box=box.ROUNDED,
                 padding=(1, 2),
             )
-            self.console.print(panel)
-        else:
-            # Simple text display
+            self.console.print(thinking_panel)
+            self.console.print()
+        
+        # Clean response of tool calls for display
+        clean_response = self._clean_tool_calls_from_response(response)
+        
+        # Display the response with markdown rendering
+        if clean_response.strip():
+            if self.markdown_rendering and not self._is_simple_text(clean_response):
+                # Use markdown rendering
+                md = Markdown(clean_response, code_theme=self.code_theme)
+                panel = Panel(
+                    md,
+                    border_style="blue",
+                    box=box.ROUNDED,
+                    padding=(1, 2),
+                )
+                self.console.print(panel)
+            else:
+                # Simple text display
+                self.console.print(Panel(
+                    clean_response,
+                    border_style="blue",
+                    box=box.ROUNDED,
+                ))
+        elif tools_used:
+            # Empty response but tools were used - show success indicator
             self.console.print(Panel(
-                response,
-                border_style="blue",
+                f"[green]✓ Completed using {', '.join(tools_used)}[/]",
+                border_style="green",
+                box=box.ROUNDED,
+            ))
+        else:
+            # Empty response - show a placeholder
+            self.console.print(Panel(
+                "[dim italic]Processing complete. (No text response generated)[/]",
+                border_style="dim",
                 box=box.ROUNDED,
             ))
         
@@ -363,6 +461,45 @@ class ConsoleChat:
             self._display_file_notification(files)
         
         self.console.print()
+    
+    def _extract_tool_calls(self, response: str) -> List[str]:
+        """Extract raw tool call XML from response for display."""
+        import re
+        tool_calls = []
+        
+        # Find XML tool blocks
+        patterns = [
+            r'<tool>.*?</tool>\s*(?:<operation>.*?</operation>)?\s*(?:<name>.*?</name>)?\s*(?:<method>.*?</method>)?\s*(?:<url>.*?</url>)?',
+            r'<tool>.*?</tool>',
+        ]
+        
+        for pattern in patterns:
+            matches = re.findall(pattern, response, re.DOTALL | re.IGNORECASE)
+            for match in matches:
+                # Clean up the match for display
+                clean = match.strip().replace('\n', ' ')
+                if len(clean) > 100:
+                    clean = clean[:100] + "..."
+                tool_calls.append(clean)
+        
+        return tool_calls[:5]  # Limit to 5
+    
+    def _clean_tool_calls_from_response(self, response: str) -> str:
+        """Remove tool call XML from response for clean display."""
+        import re
+        
+        # Remove XML tool blocks
+        cleaned = re.sub(
+            r'<tool>.*?</tool>\s*(?:<operation>.*?</operation>)?\s*(?:<name>.*?</name>)?\s*(?:<method>.*?</method>)?\s*(?:<url>.*?</url>)?\s*(?:<description>.*?</description>)?\s*(?:<content>.*?</content>)?',
+            '',
+            response,
+            flags=re.DOTALL | re.IGNORECASE
+        )
+        
+        # Clean up multiple newlines
+        cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+        
+        return cleaned.strip()
     
     def _is_simple_text(self, text: str) -> bool:
         """Check if text is simple (no markdown formatting)."""
@@ -433,9 +570,21 @@ class ConsoleChat:
 [bold]/settings[/]      Configure display settings
 [bold]/save[/]          Save conversation to file
 [bold]/exit[/] or [bold]/quit[/]  Exit the console chat
-
-[dim]Tip: You can use natural language to ask the agent to perform tasks using tools.[/]
 """
+        
+        if self.openclaw_mode:
+            help_text += """
+[bold cyan]SimplifiedAgant Commands:[/]
+
+[bold]/branch[/]        Create new session branch for experimentation
+[bold]/extensions[/]    List self-written extensions
+[bold]/reload[/]         Hot reload extensions
+
+[dim]SimplifiedAgant: 4 core tools (read, write, edit, bash) + self-written extensions[/]
+"""
+        
+        help_text += "\n[dim]Tip: You can use natural language to ask the agent to perform tasks using tools.[/]"
+        
         self.console.print(Panel(help_text, title="Help", border_style="cyan"))
     
     async def _cmd_clear(self, args: List[str]) -> None:
@@ -597,6 +746,10 @@ class ConsoleChat:
                 tools = msg.get("tools_used", [])
                 if tools:
                     lines.append(f"*Tools: {', '.join(tools)}*\n\n")
+                # Add thinking content if present
+                thinking = msg.get("thinking_content")
+                if thinking:
+                    lines.append(f"<details>\n<summary>Thinking Process</summary>\n\n```\n{thinking}\n```\n\n</details>\n\n")
         
         # Write file
         filepath.write_text("\n".join(lines), encoding="utf-8")
@@ -615,6 +768,96 @@ class ConsoleChat:
                 await self._cmd_save([])
         
         raise KeyboardInterrupt("User requested exit")
+    
+    # ========== SimplifiedAgant Commands ==========
+    
+    async def _cmd_branch(self, args: List[str]) -> None:
+        """Create a new session branch (SimplifiedAgant-style)."""
+        if not self._openclaw:
+            self.console.print("[red]SimplifiedAgant mode not active[/]")
+            return
+        
+        summary = " ".join(args) if args else "Experimental branch"
+        branch = self._openclaw.branch_session(summary=summary)
+        
+        tree = self._openclaw.get_branch_tree()
+        
+        self.console.print(Panel(
+            f"[bold green]Created branch: {branch.branch_id}[/]\n"
+            f"Parent: {branch.parent_branch_id}\n"
+            f"Summary: {branch.summary}\n"
+            f"Active branches: {len(self._openclaw.branches)}",
+            title="Session Branch",
+            border_style="green"
+        ))
+        
+        # Show tree
+        self.console.print("\n[dim]Branch tree:[/]")
+        self._print_branch_tree(tree["tree"])
+    
+    def _print_branch_tree(self, nodes: List[Dict], indent: int = 0) -> None:
+        """Print branch tree structure."""
+        for node in nodes:
+            prefix = "  " * indent
+            active_marker = "●" if node.get("is_active") else "○"
+            self.console.print(f"{prefix}{active_marker} {node['id']}: {node.get('summary', '')[:40]}")
+            if node.get("children"):
+                self._print_branch_tree(node["children"], indent + 1)
+    
+    async def _cmd_extensions(self, args: List[str]) -> None:
+        """List SimplifiedAgant extensions."""
+        if not self._openclaw:
+            self.console.print("[red]SimplifiedAgant mode not active[/]")
+            return
+        
+        if not self._openclaw.extensions:
+            self.console.print("[dim]No extensions yet. Create one with:[/]")
+            self.console.print("[cyan]  <tool>simplified_agant</tool>[/]")
+            self.console.print("[cyan]  <operation>create_extension</operation>[/]")
+            self.console.print("[cyan]  <extension_name>my_tool</extension_name>[/]")
+            self.console.print("[cyan]  <content>def execute(...): ...</content>[/]")
+            return
+        
+        table = Table(title="SimplifiedAgant Extensions (Self-Written Skills)")
+        table.add_column("Name", style="cyan")
+        table.add_column("Version", style="dim")
+        table.add_column("Status", style="green")
+        table.add_column("Description", style="white", max_width=50)
+        
+        for ext in self._openclaw.extensions.values():
+            status = "✅ active" if ext.is_active else "❌ inactive"
+            table.add_row(ext.name, str(ext.version), status, ext.description[:50])
+        
+        self.console.print(table)
+        self.console.print(f"\n[dim]Total: {len(self._openclaw.extensions)} extensions[/]")
+        self.console.print("[dim]Create new: use simplified_agant tool with operation=create_extension[/]")
+    
+    async def _cmd_reload(self, args: List[str]) -> None:
+        """Hot reload extensions."""
+        if not self._openclaw:
+            self.console.print("[red]SimplifiedAgant mode not active[/]")
+            return
+        
+        ext_name = args[0] if args else None
+        
+        with self.console.status("[bold green]Hot reloading...[/]"):
+            result = await self._openclaw.hot_reload(ext_name)
+        
+        if result["failed"]:
+            self.console.print(Panel(
+                "\n".join(result["failed"]),
+                title="[red]Reload Failures[/]",
+                border_style="red"
+            ))
+        
+        if result["reloaded"]:
+            self.console.print(Panel(
+                "\n".join(result["reloaded"]),
+                title="[green]Reloaded Successfully[/]",
+                border_style="green"
+            ))
+        
+        self.console.print(f"[dim]Total: {result['total']} checked[/]")
     
     async def _cleanup(self) -> None:
         """Clean up resources."""
@@ -647,9 +890,10 @@ def run_console_chat(
     agent: Optional[Agent] = None,
     config: Optional[BotConfig] = None,
     verbose: bool = True,
+    openclaw_mode: bool = False,
 ) -> None:
     """Entry point for console chat."""
-    chat = ConsoleChat(agent=agent, config=config, verbose=verbose)
+    chat = ConsoleChat(agent=agent, config=config, verbose=verbose, openclaw_mode=openclaw_mode)
     
     try:
         asyncio.run(chat.run())

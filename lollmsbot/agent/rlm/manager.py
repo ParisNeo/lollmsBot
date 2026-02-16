@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -751,3 +752,201 @@ The actual content will be provided in your context automatically."""
         """Close the memory system."""
         await self._db.close()
         self._initialized = False
+
+    def _prioritize_memories(self, memories: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Sort memories by relevance, importance, and recency."""
+        def score_memory(mem: Dict[str, Any]) -> float:
+            base_score = mem.get("score", 0)
+            importance = mem.get("importance", 1.0)
+            weight = mem.get("memory_weight", 1.0)  # Include weight in scoring
+            
+            # Boost certain types
+            mem_type = mem.get("type", "")
+            type_boost = 1.0
+            if mem_type == "web_content":
+                type_boost = 1.2
+            elif mem_type == "fact":
+                type_boost = 1.3
+            elif mem_type == "self_knowledge":
+                type_boost = 1.5  # Boost self-knowledge
+            elif mem_type == "related":
+                type_boost = 0.8
+            
+            return base_score * importance * weight * type_boost
+        
+        return sorted(memories, key=score_memory, reverse=True)
+    
+    # NEW: Self-knowledge query detection
+    def _is_self_knowledge_query(self, query: str) -> bool:
+        """Detect if query is asking about how LollmsBot works."""
+        query_lower = query.lower()
+        
+        # Patterns that indicate self-knowledge questions
+        patterns = [
+            # Direct questions about self
+            r"how do you work",
+            r"how (do|does) (lollmsbot|you) (work|function|operate)",
+            r"what are you",
+            r"who (are|created|made) you",
+            r"how do you remember",
+            r"how does your memory work",
+            r"explain your (architecture|system|design)",
+            r"what is (rlm|ems|rcb|soul)",
+            r"how to use (lollmsbot|you)",
+            r"tell me about (yourself|your system|your architecture)",
+            r"what can you do",
+            r"what tools do you have",
+            r"how do i",
+            r"how to (configure|setup|install|start)",
+            r"documentation",
+            r"help (me )?(use|setup|configure)",
+            r"architecture",
+            r"7 pillars",
+            r"your (soul|memory|guardian|heartbeat)",
+            r"sovereign ai",
+        ]
+        
+        for pattern in patterns:
+            if re.search(pattern, query_lower):
+                return True
+        
+        # Check for specific terms
+        terms = ["rlm", "ems", "rcb", "soul.md", "guardian", "heartbeat", "lollmsbot"]
+        if any(term in query_lower for term in terms):
+            return True
+        
+        return False
+    
+    # NEW: Boost self-knowledge results
+    def _boost_self_knowledge_results(
+        self, 
+        results: List[tuple[Any, float]]
+    ) -> List[tuple[Any, float]]:
+        """Boost scores for self-knowledge chunks."""
+        boosted = []
+        for chunk, score in results:
+            if chunk.chunk_type.name == "SELF_KNOWLEDGE":
+                # Significant boost for self-knowledge
+                boosted_score = score * 1.5 + 2.0
+                boosted.append((chunk, boosted_score))
+            else:
+                boosted.append((chunk, score))
+        return boosted
+    
+    # NEW: Calculate memory weight
+    def _calculate_memory_weight(self, chunk: Any, relevance_score: float) -> float:
+        """
+        Calculate weight for a memory based on multiple factors.
+        
+        Weight determines retention in active memory:
+        - Higher weight = stays active longer
+        - Degrades over time and with use
+        - Below threshold = flushed to EMS or removed
+        
+        Formula: weight = base_importance × relevance × freshness × type_multiplier
+        """
+        # Base from chunk importance (1-10 scale)
+        base_weight = chunk.memory_importance
+        
+        # Relevance factor from search score (typically 0-10)
+        relevance_factor = min(relevance_score / 5.0, 2.0)  # Cap at 2x
+        
+        # Freshness factor (how recently created/accessed)
+        days_since_access = 0
+        if chunk.last_accessed:
+            days_since_access = (datetime.now() - chunk.last_accessed).days
+        freshness = max(0.5, 1.0 - (days_since_access / 30.0))  # Decay over 30 days
+        
+        # Type multiplier
+        type_multipliers = {
+            "SELF_KNOWLEDGE": 2.0,    # Permanent high weight
+            "USER_PREFERENCE": 1.5,   # Important user settings
+            "FACT": 1.3,              # Facts are important
+            "CONVERSATION": 0.8,      # Conversations less critical
+            "WEB_CONTENT": 0.9,       # Web content medium
+            "EPISODIC": 0.7,          # Episodic lower priority
+        }
+        type_mult = type_multipliers.get(chunk.chunk_type.name, 1.0)
+        
+        # Calculate final weight
+        weight = base_weight * relevance_factor * freshness * type_mult
+        
+        # Cap at 10.0
+        return min(weight, 10.0)
+    
+    # NEW: Apply weighted retention to RCB
+    async def _apply_weighted_retention(
+        self,
+        memory: RLMMemoryManager,
+        chunk_id: str,
+        weight: float,
+    ) -> None:
+        """Apply weight-based retention policy to RCB entry."""
+        # High-weight memories get priority in RCB
+        # This is handled by the RCB's internal ordering
+        # We just log it for now; actual eviction happens in degradation
+        
+        if weight >= 8.0:
+            logger.info(f"  🔒 High-weight memory ({weight:.1f}): {chunk_id[:16]}...")
+        elif weight >= 5.0:
+            logger.debug(f"  🔐 Medium-weight memory ({weight:.1f}): {chunk_id[:16]}...")
+        else:
+            logger.debug(f"  🔓 Low-weight memory ({weight:.1f}): {chunk_id[:16]}...")
+    
+    # NEW: Degrade loaded memories over time
+    async def _degrade_loaded_memories(self, memory: RLMMemoryManager) -> None:
+        """
+        Apply time-based degradation to all loaded memories.
+        
+        This simulates the natural forgetting process where
+        memories lose weight over time unless reinforced.
+        """
+        # This would be called periodically to degrade weights
+        # For now, we'll implement a simple version that checks
+        # if any memories should be flushed from RCB
+        
+        degraded_count = 0
+        flushed_count = 0
+        
+        for chunk_id in list(self._loaded_anchors if hasattr(self, '_loaded_anchors') else []):
+            # Check if this memory is still in our loaded content
+            # If not accessed recently, consider flushing
+            try:
+                # Get current RCB entries
+                rcb_entries = await memory._db.get_rcb_entries(limit=50)
+                
+                # Find this chunk in RCB
+                for entry in rcb_entries:
+                    if entry.get("chunk_id") == chunk_id:
+                        # Check how long it's been in RCB
+                        loaded_at = entry.get("loaded_at")
+                        if loaded_at:
+                            if isinstance(loaded_at, str):
+                                loaded_at = datetime.fromisoformat(loaded_at)
+                            
+                            hours_in_rcb = (datetime.now() - loaded_at).total_seconds() / 3600
+                            
+                            # If in RCB for more than 1 hour, consider removing
+                            # (unless it's self-knowledge with high importance)
+                            if hours_in_rcb > 1.0:
+                                # Check if it's self-knowledge
+                                chunk = await memory._db.get_chunk(chunk_id)
+                                if chunk:
+                                    is_self = chunk.get("chunk_type") == "SELF_KNOWLEDGE"
+                                    importance = chunk.get("memory_importance", 1.0)
+                                    
+                                    if not is_self or importance < 8.0:
+                                        # Remove from RCB
+                                        await memory._db.remove_rcb_entry(entry.get("entry_id", 0))
+                                        flushed_count += 1
+                                        logger.debug(
+                                            f"  🗑️ Flushed from RCB: {chunk_id[:16]}... (age: {hours_in_rcb:.1f}h)"
+                                        )
+                        
+                        break
+                        
+            except Exception as e:
+                logger.debug(f"Failed to degrade memory {chunk_id}: {e}")
+        
+        if flushed_count > 0:
+            logger.info(f"🧹 Degraded {flushed_count} memories from RCB (garbage collection)")

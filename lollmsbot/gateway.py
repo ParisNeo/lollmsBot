@@ -169,11 +169,6 @@ DISABLED_CHANNELS: Set[str] = set(
     _get_config("lollmsbot", "disabled_channels", "LOLLMSBOT_DISABLE_CHANNELS", "").split(",")
 ) if _get_config("lollmsbot", "disabled_channels", "LOLLMSBOT_DISABLE_CHANNELS", "") else set()
 
-# Channel disable flags (quick way to turn off channels without deleting config)
-DISABLED_CHANNELS: Set[str] = set(
-    _get_config("lollmsbot", "disabled_channels", "LOLLMSBOT_DISABLE_CHANNELS", "").split(",")
-) if _get_config("lollmsbot", "disabled_channels", "LOLLMSBOT_DISABLE_CHANNELS", "") else set()
-
 DISCORD_TOKEN = _get_config("discord", "bot_token", "DISCORD_BOT_TOKEN", None)
 DISCORD_ALLOWED_USERS = _get_config("discord", "allowed_users", "DISCORD_ALLOWED_USERS", None)
 DISCORD_ALLOWED_GUILDS = _get_config("discord", "allowed_guilds", "DISCORD_ALLOWED_GUILDS", None)
@@ -194,6 +189,16 @@ WHATSAPP_WEBHOOK_PORT = int(_get_config("whatsapp", "webhook_port", "WHATSAPP_WE
 WHATSAPP_ALLOWED_NUMBERS = _get_config("whatsapp", "allowed_numbers", "WHATSAPP_ALLOWED_NUMBERS", None)
 WHATSAPP_BLOCKED_NUMBERS = _get_config("whatsapp", "blocked_numbers", "WHATSAPP_BLOCKED_NUMBERS", None)
 WHATSAPP_REQUIRE_CONFIRMATION = _get_config("whatsapp", "require_confirmation", "WHATSAPP_REQUIRE_CONFIRMATION", "true")
+
+# Slack configuration
+SLACK_BOT_TOKEN = _get_config("slack", "bot_token", "SLACK_BOT_TOKEN", None)
+SLACK_SIGNING_SECRET = _get_config("slack", "signing_secret", "SLACK_SIGNING_SECRET", None)
+SLACK_APP_TOKEN = _get_config("slack", "app_token", "SLACK_APP_TOKEN", None)  # For Socket Mode
+SLACK_MODE = _get_config("slack", "mode", "SLACK_MODE", "socket")  # 'socket' or 'http'
+SLACK_ALLOWED_USERS = _get_config("slack", "allowed_users", "SLACK_ALLOWED_USERS", None)
+SLACK_ALLOWED_CHANNELS = _get_config("slack", "allowed_channels", "SLACK_ALLOWED_CHANNELS", None)
+SLACK_BLOCKED_USERS = _get_config("slack", "blocked_users", "SLACK_BLOCKED_USERS", None)
+SLACK_REQUIRE_MENTION = _get_config("slack", "require_mention", "SLACK_REQUIRE_MENTION", "true")
 
 _active_channels: Dict[str, Any] = {}
 _channel_tasks: List[asyncio.Task] = []
@@ -478,11 +483,14 @@ async def root():
     channels_status = {
         "discord": "enabled" if DISCORD_TOKEN else "disabled",
         "telegram": "enabled" if TELEGRAM_TOKEN else "disabled",
+        "slack": "enabled" if SLACK_BOT_TOKEN else "disabled",
     }
     if "discord" in _active_channels:
         channels_status["discord"] = "active"
     if "telegram" in _active_channels:
         channels_status["telegram"] = "active"
+    if "slack" in _active_channels:
+        channels_status["slack"] = "active"
     
     # Environment info
     env_info = {}
@@ -579,6 +587,7 @@ async def health():
     
     discord_status = "active" if "discord" in _active_channels else "disabled"
     telegram_status = "active" if "telegram" in _active_channels else "disabled"
+    slack_status = "active" if "slack" in _active_channels else "disabled"
     
     # Count pending files across channels
     pending_files = 0
@@ -619,6 +628,7 @@ async def health():
         "discord": discord_status,
         "telegram": telegram_status,
         "whatsapp": "active" if "whatsapp" in _active_channels else "disabled",
+        "slack": slack_status,
         "lollms": {
             "connected": lollms_ok,
             "host": LollmsSettings.from_env().host_address,
@@ -1096,6 +1106,12 @@ async def lifespan(app_: FastAPI):
     try:
         from lollmsbot.heartbeat import get_heartbeat
         heartbeat = get_heartbeat()
+        
+        # Connect SimplifiedAgant integration to heartbeat if available
+        if hasattr(agent, '_openclaw') and agent._openclaw:
+            heartbeat.set_openclaw_integration(agent._openclaw)
+            console.print("[dim]  💓 SimplifiedAgant workflow connected to heartbeat[/]")
+        
         if heartbeat.config.enabled:
             # Pass is_startup=True for rich event logging
             heartbeat_result = await heartbeat.run_once(is_startup=True)
@@ -1306,6 +1322,65 @@ async def lifespan(app_: FastAPI):
             traceback.print_exc()
     else:
         console.print("[dim]ℹ️  WhatsApp disabled (no WHATSAPP_BACKEND configured)[/]")
+    
+    # Slack
+    if "slack" in DISABLED_CHANNELS:
+        console.print("[dim]ℹ️  Slack disabled via LOLLMSBOT_DISABLE_CHANNELS[/]")
+    elif SLACK_BOT_TOKEN:
+        try:
+            from lollmsbot.channels.slack import SlackChannel
+            
+            def parse_id_list(val: Optional[str]) -> Optional[Set[str]]:
+                if not val:
+                    return None
+                try:
+                    return set(x.strip() for x in val.split(","))
+                except ValueError:
+                    return None
+            
+            allowed_users = parse_id_list(SLACK_ALLOWED_USERS)
+            allowed_channels = parse_id_list(SLACK_ALLOWED_CHANNELS)
+            blocked_users = parse_id_list(SLACK_BLOCKED_USERS)
+            
+            require_mention = str(SLACK_REQUIRE_MENTION).lower() in ("true", "1", "yes")
+            
+            slack_channel = SlackChannel(
+                agent=agent,
+                bot_token=SLACK_BOT_TOKEN,
+                signing_secret=SLACK_SIGNING_SECRET,
+                app_token=SLACK_APP_TOKEN,
+                mode=SLACK_MODE,
+                allowed_users=allowed_users,
+                allowed_channels=allowed_channels,
+                blocked_users=blocked_users,
+                require_mention_in_channel=require_mention,
+            )
+            _active_channels["slack"] = slack_channel
+            
+            task = asyncio.create_task(slack_channel.start())
+            _channel_tasks.append(task)
+            
+            async def wait_slack():
+                await asyncio.sleep(2)
+                console.print("[bold green]✅ Slack connected with FULL AGENT capabilities![/]")
+                console.print(f"[dim]   Mode: {SLACK_MODE}[/]")
+                if SLACK_MODE == "socket":
+                    console.print("[dim]   Socket Mode active (no public URL needed)[/]")
+                else:
+                    console.print("[dim]   HTTP Mode - ensure webhook URL is configured[/]")
+                if allowed_users:
+                    console.print(f"[dim]   Allowed users: {len(allowed_users)}[/]")
+                if allowed_channels:
+                    console.print(f"[dim]   Allowed channels: {len(allowed_channels)}[/]")
+            
+            asyncio.create_task(wait_slack())
+            
+        except Exception as e:
+            console.print(f"[red]❌ Slack failed: {e}[/]")
+            import traceback
+            traceback.print_exc()
+    else:
+        console.print("[dim]ℹ️  Slack disabled (no SLACK_BOT_TOKEN)[/]")
     
     # Summary
     console.print(f"[bold green]📊 Active channels: {len(_active_channels)}[/]")

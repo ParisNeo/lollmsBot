@@ -185,6 +185,7 @@ def main(argv: List[str] | None = None) -> None:
     chat_parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose logging")
     chat_parser.add_argument("--name", type=str, default=None, help="Agent name (default: from config)")
     chat_parser.add_argument("--no-markdown", action="store_true", help="Disable markdown rendering")
+    chat_parser.add_argument("--simplified_agant", action="store_true", help="Enable SimplifiedAgant-style minimal tool mode")
 
     # Channel control command (NEW)
     channel_parser = subparsers.add_parser(
@@ -200,7 +201,7 @@ def main(argv: List[str] | None = None) -> None:
     channel_parser.add_argument(
         "channel",
         nargs="?",
-        choices=["discord", "telegram", "whatsapp", "all"],
+        choices=["discord", "telegram", "whatsapp", "slack", "all"],
         help="Channel to control (not needed for 'status' or 'list')"
     )
 
@@ -272,6 +273,7 @@ def main(argv: List[str] | None = None) -> None:
             run_console_chat(
                 config=config,
                 verbose=args.verbose,
+                openclaw_mode=args.simplified_agant,
             )
             
         elif args.command == "channels":
@@ -287,9 +289,9 @@ def main(argv: List[str] | None = None) -> None:
             
             if args.action == "list":
                 console.print("\n[bold]Configured Channels:[/]")
-                for name in ["discord", "telegram", "whatsapp"]:
+                for name in ["discord", "telegram", "whatsapp", "slack"]:
                     cfg = config.get(name, {})
-                    has_config = bool(cfg.get("bot_token") or cfg.get("backend"))
+                    has_config = bool(cfg.get("bot_token") or cfg.get("backend") or cfg.get("bot_token"))
                     is_disabled = name in disabled
                     status = "[red]⛔ DISABLED[/]" if is_disabled else "[green]✅ Active[/]" if has_config else "[dim]⭕ Not configured[/]"
                     console.print(f"  • {name.title()}: {status}")
@@ -305,7 +307,7 @@ def main(argv: List[str] | None = None) -> None:
                     console.print("[red]Error: specify channel to disable[/]")
                     return
                     
-                targets = ["discord", "telegram", "whatsapp"] if args.channel == "all" else [args.channel]
+                targets = ["discord", "telegram", "whatsapp", "slack"] if args.channel == "all" else [args.channel]
                 for ch in targets:
                     if ch not in disabled:
                         disabled.append(ch)
@@ -323,7 +325,7 @@ def main(argv: List[str] | None = None) -> None:
                     console.print("[red]Error: specify channel to enable[/]")
                     return
                     
-                targets = ["discord", "telegram", "whatsapp"] if args.channel == "all" else [args.channel]
+                targets = ["discord", "telegram", "whatsapp", "slack"] if args.channel == "all" else [args.channel]
                 for ch in targets:
                     if ch in disabled:
                         disabled.remove(ch)

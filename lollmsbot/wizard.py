@@ -331,7 +331,7 @@ They cannot prevent deliberate misuse by someone with full system access.
 
 ## Why This Matters
 
-The release of tools like OpenClaw demonstrates that those who want to cause harm 
+The release of tools like SimplifiedAgant demonstrates that those who want to cause harm 
 already have means to do so. lollmsBot exists to provide the **same automation power** 
 to those with legitimate needs—researchers, developers, system administrators, 
 and power users—while embedding ethical guardrails into its very architecture.
@@ -473,6 +473,7 @@ class Wizard:
                     Choice("🤖 Discord Channel", "discord"),
                     Choice("✈️ Telegram Channel", "telegram"),
                     Choice("💬 WhatsApp Channel", "whatsapp"),
+                    Choice("💬 Slack Channel", "slack"),
                     Choice("🧬 Soul (Personality & Identity)", "soul"),
                     Choice("💓 Heartbeat (Self-Maintenance)", "heartbeat"),
                     Choice("🧠 Memory (Storage & Retention)", "memory"),
@@ -493,6 +494,8 @@ class Wizard:
                 self.configure_service("telegram")
             elif action == "whatsapp":
                 self.configure_service("whatsapp")
+            elif action == "slack":
+                self.configure_service("slack")
             elif action == "soul":
                 self.configure_soul()
             elif action == "heartbeat":
@@ -523,7 +526,7 @@ class Wizard:
         
         # Core services
         services = tree.add("[bold]Services[/]")
-        for key in ["lollms", "discord", "telegram", "whatsapp"]:
+        for key in ["lollms", "discord", "telegram", "whatsapp", "slack"]:
             configured = key in self.config and self.config[key]
             status = "✅" if configured else "⭕"
             color = "green" if configured else "dim"
@@ -532,6 +535,7 @@ class Wizard:
                 "discord": "Discord",
                 "telegram": "Telegram",
                 "whatsapp": "WhatsApp",
+                "slack": "Slack",
             }.get(key, key.title())
             services.add(f"[{color}]{status} {display_name}[/{color}]")
         
@@ -840,11 +844,19 @@ class Wizard:
                 "fields": [],  # Custom handling below
                 "setup_instructions": "",  # Custom handling below
             },
+            "slack": {
+                "title": "💬 Slack Bot",
+                "fields": [],  # Custom handling below
+                "setup_instructions": "",  # Custom handling below
+            },
         }
         
-        # Special handling for WhatsApp
+        # Special handling for WhatsApp and Slack
         if service_name == "whatsapp":
             self._configure_whatsapp()
+            return
+        elif service_name == "slack":
+            self._configure_slack()
             return
         
         service = SERVICES_CONFIG.get(service_name)
@@ -1883,6 +1895,223 @@ in your terminal - a big square made of block characters (█ and ░).
         
         console.print(table)
     
+    def _configure_slack(self) -> None:
+        """Configure Slack integration with mode selection."""
+        console.print("\n[bold green]💬 Slack Configuration[/]")
+        
+        # Educational explanation first
+        console.print(Panel(
+            """[bold]How Slack Integration Works[/bold]
+
+LollmsBot connects to Slack using the [cyan]Slack Bolt SDK[/cyan], which is the 
+official modern Python SDK for building Slack apps.
+
+Two connection modes are available:
+
+[bold]🔌 Socket Mode (Recommended)[/bold]
+   • WebSocket-based connection, no public URL needed
+   • Works behind firewalls and NAT
+   • Best for local development and private networks
+   • Requires App-Level Token (starts with xapp-)
+
+[bold]🌐 HTTP Mode[/bold]
+   • Webhook-based, requires public HTTPS URL
+   • Traditional request/response model
+   • Best for production deployments with public endpoints
+   • Requires Signing Secret for request verification
+
+[bold]Setup Steps:[/bold]
+   1. Create a Slack app at https://api.slack.com/apps
+   2. Add Bot Token Scopes: app_mentions:read, chat:write, im:read, im:write
+   3. Install app to your workspace
+   4. Copy Bot User OAuth Token (starts with xoxb-)
+   5. For Socket Mode: enable Socket Mode and copy App-Level Token (xapp-)
+   6. For HTTP Mode: add Request URL and copy Signing Secret""",
+            title="📚 Slack Architecture",
+            border_style="cyan",
+            padding=(1, 2)
+        ))
+        
+        # Select mode
+        mode = questionary.select(
+            "Choose Slack connection mode:",
+            choices=[
+                Choice("🔌 Socket Mode (WebSocket, no public URL needed)", "socket"),
+                Choice("🌐 HTTP Mode (webhook, requires public URL)", "http"),
+            ],
+            use_indicator=True,
+        ).ask()
+        
+        slack_config = self.config.setdefault("slack", {})
+        slack_config["mode"] = mode
+        
+        console.print(f"\n[bold]Configuring {mode} mode...[/]")
+        
+        # Bot token (required for both)
+        current_token = slack_config.get("bot_token", "")
+        bot_token = questionary.password(
+            "Bot User OAuth Token (xoxb-...)",
+            default=current_token,
+            instruction="From OAuth & Permissions page"
+        ).ask()
+        slack_config["bot_token"] = bot_token
+        
+        if mode == "socket":
+            # App token for Socket Mode
+            current_app_token = slack_config.get("app_token", "")
+            app_token = questionary.password(
+                "App-Level Token (xapp-...)",
+                default=current_app_token,
+                instruction="From Basic Information → App-Level Tokens"
+            ).ask()
+            slack_config["app_token"] = app_token
+            
+            console.print(Panel(
+                """[bold]Socket Mode Setup Complete![/bold]
+
+Your bot will connect via WebSocket. No public URL needed.
+
+[bold]Next steps:[/bold]
+1. Ensure your bot has these Bot Token Scopes:
+   • app_mentions:read
+   • chat:write
+   • im:read, im:write
+   • files:write (for file uploads)
+
+2. Start lollmsbot gateway - the bot will connect automatically
+
+3. Invite @lollmsbot to channels or DM it directly""",
+                title="Socket Mode Ready",
+                border_style="green"
+            ))
+            
+        else:  # http mode
+            # Signing secret for HTTP mode
+            current_secret = slack_config.get("signing_secret", "")
+            signing_secret = questionary.password(
+                "Signing Secret",
+                default=current_secret,
+                instruction="From Basic Information → Signing Secret"
+            ).ask()
+            slack_config["signing_secret"] = signing_secret
+            
+            console.print(Panel(
+                """[bold]HTTP Mode Setup[/bold]
+
+You need to configure the Request URL in Slack:
+
+1. Go to Event Subscriptions → Enable Events
+2. Request URL: https://your-domain/slack/events
+   (Or your custom path if mounted differently)
+
+3. Subscribe to bot events:
+   • app_mention
+   • message.im (for DMs)
+
+4. Reinstall app after adding scopes""",
+                title="HTTP Mode Configuration",
+                border_style="yellow"
+            ))
+        
+        # User/channel restrictions
+        self._configure_slack_users(slack_config)
+        
+        # Mention requirement
+        slack_config["require_mention"] = questionary.confirm(
+            "Require @mention in channels? (DMs always work without mention)",
+            default=slack_config.get("require_mention", True)
+        ).ask()
+        
+        self._configured.add("slack")
+        console.print("[green]✅ Slack configured![/]")
+        
+        # Show summary
+        self._show_slack_summary(slack_config)
+    
+    def _configure_slack_users(self, slack_config: Dict[str, Any]) -> None:
+        """Configure allowed/blocked users and channels for Slack."""
+        # Allowed users (Slack user IDs)
+        current_allowed = slack_config.get("allowed_users", [])
+        allowed_str = ",".join(current_allowed) if current_allowed else ""
+        
+        allowed_input = questionary.text(
+            "Allowed Slack User IDs (comma-separated, optional - empty = allow all)",
+            default=allowed_str,
+            instruction="Format: U1234567890, U0987654321 (from user profiles)"
+        ).ask()
+        
+        if allowed_input.strip():
+            slack_config["allowed_users"] = [
+                u.strip() for u in allowed_input.split(",") if u.strip()
+            ]
+        else:
+            slack_config["allowed_users"] = []
+        
+        # Allowed channels
+        current_channels = slack_config.get("allowed_channels", [])
+        channels_str = ",".join(current_channels) if current_channels else ""
+        
+        channels_input = questionary.text(
+            "Allowed Channel IDs (comma-separated, optional)",
+            default=channels_str,
+            instruction="Format: C1234567890 (from channel details)"
+        ).ask()
+        
+        if channels_input.strip():
+            slack_config["allowed_channels"] = [
+                c.strip() for c in channels_input.split(",") if c.strip()
+            ]
+        else:
+            slack_config["allowed_channels"] = []
+        
+        # Blocked users
+        current_blocked = slack_config.get("blocked_users", [])
+        blocked_str = ",".join(current_blocked) if current_blocked else ""
+        
+        blocked_input = questionary.text(
+            "Blocked Slack User IDs (comma-separated, optional)",
+            default=blocked_str
+        ).ask()
+        
+        if blocked_input.strip():
+            slack_config["blocked_users"] = [
+                u.strip() for u in blocked_input.split(",") if u.strip()
+            ]
+        else:
+            slack_config["blocked_users"] = []
+    
+    def _show_slack_summary(self, slack_config: Dict[str, Any]) -> None:
+        """Show Slack configuration summary."""
+        table = Table(title="Slack Configuration Summary")
+        table.add_column("Setting", style="cyan")
+        table.add_column("Value", style="green")
+        
+        mode = slack_config.get("mode", "socket")
+        mode_display = "🔌 Socket Mode" if mode == "socket" else "🌐 HTTP Mode"
+        
+        table.add_row("Mode", mode_display)
+        
+        has_token = bool(slack_config.get("bot_token"))
+        table.add_row("Bot Token", "✅ Set" if has_token else "❌ Not set")
+        
+        if mode == "socket":
+            has_app_token = bool(slack_config.get("app_token"))
+            table.add_row("App Token", "✅ Set" if has_app_token else "❌ Not set")
+        else:
+            has_secret = bool(slack_config.get("signing_secret"))
+            table.add_row("Signing Secret", "✅ Set" if has_secret else "❌ Not set")
+        
+        allowed_users = slack_config.get("allowed_users", [])
+        allowed_channels = slack_config.get("allowed_channels", [])
+        blocked_users = slack_config.get("blocked_users", [])
+        
+        table.add_row("Allowed Users", str(len(allowed_users)) if allowed_users else "All")
+        table.add_row("Allowed Channels", str(len(allowed_channels)) if allowed_channels else "All")
+        table.add_row("Blocked Users", str(len(blocked_users)))
+        table.add_row("Require Mention", "Yes" if slack_config.get("require_mention") else "No")
+        
+        console.print(table)
+    
     def _test_single(self, service_name: str, config: Dict[str, Any]) -> tuple[str, str]:
         """Test a single service connection."""
         try:
@@ -1967,10 +2196,10 @@ in your terminal - a big square made of block characters (█ and ░).
             ))
         
         # Other services
-        for svc in ["discord", "telegram"]:
+        for svc in ["discord", "telegram", "slack"]:
             if svc in self.config:
                 # Mask secrets
-                safe_config = {k: (v if "token" not in k else "***") for k, v in self.config[svc].items()}
+                safe_config = {k: (v if "token" not in k and "secret" not in k else "***") for k, v in self.config[svc].items()}
                 console.print(Panel(
                     json.dumps(safe_config, indent=2),
                     title=svc.title(),

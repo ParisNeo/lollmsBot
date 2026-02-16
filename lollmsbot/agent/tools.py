@@ -162,8 +162,9 @@ class ToolParser:
                         pass  # RLM handles this internally
             
             else:
-                # Tool failed - minimal error
-                response_parts.append("\n\n**⚠️ tool error**\n\n")
+                # Tool failed - show error details for debugging
+                error_msg = result.error or "Unknown error"
+                response_parts.append(f"\n\n**⚠️ tool error: {error_msg[:500]}**\n\n")
             
             last_end = end
         

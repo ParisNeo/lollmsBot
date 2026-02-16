@@ -249,15 +249,41 @@ class CreateOutlineTool(Tool):
     def __init__(self, document_manager: DocumentManager):
         self._doc_mgr = document_manager
     
-    async def execute(
-        self,
-        project_id: str,
-        num_chapters: int,
-        synopsis: Optional[str] = None,
-        chapter_titles: Optional[List[str]] = None,
-        **kwargs,
-    ) -> ToolResult:
+    async def execute(self, **kwargs) -> ToolResult:
         """Create outline."""
+        # Extract required parameters from kwargs
+        project_id = kwargs.get("project_id")
+        num_chapters = kwargs.get("num_chapters")
+        
+        # Validate required parameters
+        if not project_id:
+            return ToolResult(
+                success=False,
+                output=None,
+                error="Missing required parameter: project_id",
+            )
+        if num_chapters is None:
+            return ToolResult(
+                success=False,
+                output=None,
+                error="Missing required parameter: num_chapters",
+            )
+        
+        # Convert num_chapters to int if it's a string
+        if isinstance(num_chapters, str):
+            try:
+                num_chapters = int(num_chapters)
+            except ValueError:
+                return ToolResult(
+                    success=False,
+                    output=None,
+                    error=f"Invalid num_chapters: {num_chapters} (must be an integer)",
+                )
+        
+        # Extract optional parameters
+        synopsis = kwargs.get("synopsis")
+        chapter_titles = kwargs.get("chapter_titles")
+        
         project = self._doc_mgr.get_book_project(project_id)
         
         if not project:
@@ -464,16 +490,49 @@ class WriteSectionTool(Tool):
     def __init__(self, document_manager: DocumentManager):
         self._doc_mgr = document_manager
     
-    async def execute(
-        self,
-        project_id: str,
-        chapter_number: int,
-        section_title: Optional[str] = None,
-        target_words: int = 2000,
-        style_notes: Optional[str] = None,
-        **kwargs,
-    ) -> ToolResult:
+    async def execute(self, **kwargs) -> ToolResult:
         """Create writing task."""
+        # Extract required parameters from kwargs
+        project_id = kwargs.get("project_id")
+        chapter_number = kwargs.get("chapter_number")
+        
+        # Validate required parameters
+        if not project_id:
+            return ToolResult(
+                success=False,
+                output=None,
+                error="Missing required parameter: project_id",
+            )
+        if chapter_number is None:
+            return ToolResult(
+                success=False,
+                output=None,
+                error="Missing required parameter: chapter_number",
+            )
+        
+        # Convert chapter_number to int if it's a string
+        if isinstance(chapter_number, str):
+            try:
+                chapter_number = int(chapter_number)
+            except ValueError:
+                return ToolResult(
+                    success=False,
+                    output=None,
+                    error=f"Invalid chapter_number: {chapter_number} (must be an integer)",
+                )
+        
+        # Extract optional parameters
+        section_title = kwargs.get("section_title")
+        target_words = kwargs.get("target_words", 2000)
+        style_notes = kwargs.get("style_notes")
+        
+        # Convert target_words to int if it's a string
+        if isinstance(target_words, str):
+            try:
+                target_words = int(target_words)
+            except ValueError:
+                target_words = 2000
+        
         project = self._doc_mgr.get_book_project(project_id)
         
         if not project:
@@ -670,14 +729,36 @@ class SearchReferencesTool(Tool):
     def __init__(self, document_manager: DocumentManager):
         self._doc_mgr = document_manager
     
-    async def execute(
-        self,
-        project_id: str,
-        query: str,
-        limit: int = 3,
-        **kwargs,
-    ) -> ToolResult:
+    async def execute(self, **kwargs) -> ToolResult:
         """Search references."""
+        # Extract required parameters from kwargs
+        project_id = kwargs.get("project_id")
+        query = kwargs.get("query")
+        
+        # Validate required parameters
+        if not project_id:
+            return ToolResult(
+                success=False,
+                output=None,
+                error="Missing required parameter: project_id",
+            )
+        if not query:
+            return ToolResult(
+                success=False,
+                output=None,
+                error="Missing required parameter: query",
+            )
+        
+        # Extract optional parameters
+        limit = kwargs.get("limit", 3)
+        
+        # Convert limit to int if it's a string
+        if isinstance(limit, str):
+            try:
+                limit = int(limit)
+            except ValueError:
+                limit = 3
+        
         project = self._doc_mgr.get_book_project(project_id)
         
         if not project:
@@ -760,12 +841,19 @@ class GetWritingProgressTool(Tool):
     def __init__(self, document_manager: DocumentManager):
         self._doc_mgr = document_manager
     
-    async def execute(
-        self,
-        project_id: str,
-        **kwargs,
-    ) -> ToolResult:
+    async def execute(self, **kwargs) -> ToolResult:
         """Get progress."""
+        # Extract required parameters from kwargs
+        project_id = kwargs.get("project_id")
+        
+        # Validate required parameters
+        if not project_id:
+            return ToolResult(
+                success=False,
+                output=None,
+                error="Missing required parameter: project_id",
+            )
+        
         project = self._doc_mgr.get_book_project(project_id)
         
         if not project:
