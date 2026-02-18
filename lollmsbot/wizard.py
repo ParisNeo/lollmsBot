@@ -470,6 +470,7 @@ class Wizard:
                 "What would you like to configure?",
                 choices=[
                     Choice("🔗 AI Backend (Select Binding First)", "lollms"),
+                    Choice("🔍 Internet Search (Google, DuckDuckGo, etc.)", "search"),
                     Choice("🤖 Discord Channel", "discord"),
                     Choice("✈️ Telegram Channel", "telegram"),
                     Choice("💬 WhatsApp Channel", "whatsapp"),
@@ -488,6 +489,8 @@ class Wizard:
 
             if action == "lollms":
                 self.configure_backend()  # New binding-first configuration
+            elif action == "search":
+                self.configure_search()
             elif action == "discord":
                 self.configure_service("discord")
             elif action == "telegram":
@@ -543,6 +546,28 @@ class Wizard:
         if "lollms" in self.config and "binding_name" in self.config["lollms"]:
             binding = self.config["lollms"]["binding_name"]
             services.add(f"   [dim cyan]↳ Using: {binding}[/]")
+        
+        # Search configuration
+        search_configured = "search" in self.config
+        search_status = "✅" if search_configured else "⭕"
+        search_color = "green" if search_configured else "dim"
+        services.add(f"[{search_color}]{search_status} Internet Search[/{search_color}]")
+        if search_configured:
+            # Show which providers are configured
+            search_data = self.config.get("search", {})
+            providers = []
+            if search_data.get("google_api_key"):
+                providers.append("Google")
+            if search_data.get("twitter_bearer_token"):
+                providers.append("Twitter")
+            if search_data.get("news_api_key"):
+                providers.append("NewsAPI")
+            if search_data.get("reddit_client_id"):
+                providers.append("Reddit")
+            if providers:
+                services.add(f"   [dim cyan]↳ Providers: {', '.join(providers)}[/]")
+            else:
+                services.add("   [dim cyan]↳ DuckDuckGo (default)[/]")
         
         # 7 Pillars
         pillars = tree.add("[bold]7 Pillars[/]")
@@ -721,18 +746,56 @@ class Wizard:
                     Path(models_path_expanded).mkdir(parents=True, exist_ok=True)
                     console.print("[green]✅ Directory created[/]")
 
-        # Step 4: Optional advanced settings
-        console.print("\n[bold]Step 4: Advanced settings (optional)[/]")
+        # Step 4: Context size configuration (moved from advanced to main flow)
+        console.print("\n[bold]Step 4: Context Size (Token Window)[/]")
+        
+        # Suggest default based on binding type and model
+        default_contexts = {
+            # Remote APIs typically have large contexts
+            "openai": 128000,      # GPT-4o standard
+            "claude": 200000,      # Claude 3.5 Sonnet
+            "gemini": 128000,      # Gemini 1.5 Flash
+            "groq": 128000,          # Most Groq models
+            "grok": 128000,        # Grok-2
+            "mistral": 128000,     # Mistral Large
+            "ollama": 128000,        # Default for local models
+            "llama_cpp_server": 128000,
+            "vllm": 128000,
+            "tensor_rt": 128000,
+            "transformers": 128000,
+            "lollms": 128000,       # LoLLMS default
+        }
+        
+        suggested_default = default_contexts.get(binding_name, 4096)
+        
+        # Check if model name suggests different context
+        model_lower = (lollms_config.get("model_name") or "").lower()
+        if any(x in model_lower for x in ["32k", "128k", "200k"]):
+            # Model name hints at context size
+            pass  # Keep the default
+        
+        current_ctx = lollms_config.get("context_size", suggested_default)
+        
+        console.print(f"[dim]Suggested for {binding_name}: {suggested_default:,} tokens[/]")
+        console.print(f"[dim]Common values: 4096 (4K), 8192 (8K), 16384 (16K), 32768 (32K), 128000 (128K)[/]")
+        
+        context_size = IntPrompt.ask(
+            "Context size (tokens)",
+            default=current_ctx
+        )
+        
+        # Validate reasonable range
+        if context_size < 512:
+            console.print("[yellow]⚠️ Very small context - minimum recommended is 512[/]")
+        elif context_size > 200000:
+            console.print("[yellow]⚠️ Very large context - ensure your model supports this[/]")
+        
+        lollms_config["context_size"] = context_size
+        
+        # Step 5: Optional advanced settings
+        console.print("\n[bold]Step 5: Advanced settings (optional)[/]")
         
         if questionary.confirm("Configure advanced options?", default=False).ask():
-            # Context size
-            current_ctx = lollms_config.get("context_size", 4096)
-            context_size = IntPrompt.ask(
-                "Context size (tokens)",
-                default=current_ctx
-            )
-            lollms_config["context_size"] = context_size
-            
             # Temperature
             current_temp = lollms_config.get("temperature", 0.7)
             temperature = FloatPrompt.ask(
@@ -740,6 +803,15 @@ class Wizard:
                 default=current_temp
             )
             lollms_config["temperature"] = max(0.0, min(2.0, temperature))
+            
+            # Response length (max_tokens)
+            current_max_tokens = lollms_config.get("max_tokens", 0)
+            max_tokens = IntPrompt.ask(
+                "Max response tokens (0 = unlimited)",
+                default=current_max_tokens if current_max_tokens else 0
+            )
+            if max_tokens > 0:
+                lollms_config["max_tokens"] = max_tokens
 
         # Summary and test
         console.print("\n[bold green]✅ Backend configured![/]")
@@ -761,6 +833,15 @@ class Wizard:
         table.add_row("Binding", binding_info.display_name)
         table.add_row("Model", config.get("model_name", "Not set") or "Not set")
         
+        # Context size with visual indicator
+        ctx_size = config.get("context_size", 4096)
+        ctx_display = f"{ctx_size:,}"
+        if ctx_size >= 100000:
+            ctx_display += " 🔥"  # Large context emoji
+        elif ctx_size >= 32000:
+            ctx_display += " ⚡"  # Medium-large
+        table.add_row("Context Size", ctx_display)
+        
         if binding_info.category in ("remote", "local_server"):
             table.add_row("Host", config.get("host_address", "Not set") or "Not set")
             has_key = bool(config.get("api_key"))
@@ -771,8 +852,19 @@ class Wizard:
         if binding_info.requires_models_path or config.get("models_path"):
             table.add_row("Models Path", config.get("models_path", "Not set") or "Not set")
         
-        table.add_row("Context Size", str(config.get("context_size", 4096)))
-        table.add_row("Temperature", str(config.get("temperature", 0.7)))
+        # Temperature with visual indicator
+        temp = config.get("temperature", 0.7)
+        temp_display = f"{temp}"
+        if temp < 0.3:
+            temp_display += " 🧊"  # Cold/focused
+        elif temp > 1.0:
+            temp_display += " 🔥"  # Hot/creative
+        table.add_row("Temperature", temp_display)
+        
+        # Max tokens if configured
+        max_tokens = config.get("max_tokens")
+        if max_tokens:
+            table.add_row("Max Tokens", f"{max_tokens:,}")
         
         console.print(table)
 
@@ -1530,6 +1622,19 @@ class Wizard:
             json.dumps(self.soul.to_dict(), sort_keys=True).encode()
         ).hexdigest()[:16]
         table.add_row("Soul", "✅ VALID", f"Hash: {soul_hash}")
+        
+        # Test Search
+        if "search" in self.config:
+            try:
+                from lollmsbot.tools.search import SearchManager
+                search_manager = SearchManager(self.config.get("search", {}))
+                status = search_manager.get_status()
+                available = sum(1 for v in status.values() if v)
+                table.add_row("Search", "✅ CONFIGURED", f"{available}/{len(status)} providers ready")
+            except Exception as e:
+                table.add_row("Search", "⚠️ ERROR", str(e)[:40])
+        else:
+            table.add_row("Search", "⭕ NOT CONFIGURED", "Use wizard to configure")
 
         # Test Heartbeat
         hb_status = self.heartbeat.get_status()
@@ -2195,6 +2300,20 @@ You need to configure the Request URL in Slack:
                 border_style="blue"
             ))
         
+        # Search configuration
+        if "search" in self.config:
+            search = self.config["search"].copy()
+            # Mask API keys
+            for key in search:
+                if "key" in key or "secret" in key or "token" in key:
+                    if search[key]:
+                        search[key] = "***" + search[key][-4:] if len(search[key]) > 4 else "***"
+            console.print(Panel(
+                json.dumps(search, indent=2),
+                title="Internet Search",
+                border_style="blue"
+            ))
+        
         # Other services
         for svc in ["discord", "telegram", "slack"]:
             if svc in self.config:
@@ -2228,6 +2347,213 @@ You need to configure the Request URL in Slack:
             title=f"Skills Library ({skill_stats['total']} skills)",
             border_style="yellow"
         ))
+
+    def configure_search(self) -> None:
+        """Configure internet search providers."""
+        console.print("\n[bold green]🔍 Search Configuration[/]")
+        console.print("[dim]Configure internet search capabilities[/]")
+        console.print()
+        
+        search_config = self.config.setdefault("search", {})
+        
+        # Show available providers status
+        console.print(Panel(
+            """[bold]Available Search Providers:[/]
+
+[cyan]✅ DuckDuckGo[/] - Always available, no API key needed
+[yellow]⭕ Google[/] - Requires API key + Custom Search CX
+[yellow]⭕ Stack Overflow[/] - No API key (rate limited)
+[yellow]⭕ Wikipedia[/] - No API key needed
+[yellow]⭕ Twitter/X[/] - Requires API credentials
+[yellow]⭕ News API[/] - Requires API key
+[yellow]⭕ Reddit[/] - Requires API credentials
+
+Quick search works immediately with DuckDuckGo!
+""",
+            title="Search Providers",
+            border_style="blue"
+        ))
+        
+        # DuckDuckGo is always enabled
+        console.print("[green]✅ DuckDuckGo (quick_search) - Enabled by default[/]")
+        
+        # Google Search
+        if questionary.confirm("Configure Google Search?", default=bool(search_config.get("google_api_key"))).ask():
+            console.print("\n[bold]Google Search Setup:[/]")
+            console.print("[dim]Get API key at: https://developers.google.com/custom-search/v1/overview[/]")
+            console.print("[dim]Create search engine at: https://programmablesearchengine.google.com/[/]")
+            
+            current_key = search_config.get("google_api_key", "")
+            google_key = questionary.password(
+                "Google API Key",
+                default=current_key,
+            ).ask()
+            search_config["google_api_key"] = google_key
+            
+            current_cx = search_config.get("google_cx", "")
+            google_cx = questionary.text(
+                "Google Custom Search Engine ID (cx)",
+                default=current_cx,
+            ).ask()
+            search_config["google_cx"] = google_cx
+            
+            if google_key and google_cx:
+                console.print("[green]✅ Google Search configured[/]")
+        
+        # Twitter/X
+        if questionary.confirm("Configure Twitter/X Search?", default=bool(search_config.get("twitter_bearer_token"))).ask():
+            console.print("\n[bold]Twitter/X Setup:[/]")
+            console.print("[dim]Get credentials at: https://developer.twitter.com/en/portal/dashboard[/]")
+            
+            current_bearer = search_config.get("twitter_bearer_token", "")
+            twitter_bearer = questionary.password(
+                "Twitter Bearer Token",
+                default=current_bearer,
+            ).ask()
+            search_config["twitter_bearer_token"] = twitter_bearer
+            
+            # Optional: full API credentials for posting (not just search)
+            if questionary.confirm("Add full API credentials (for advanced features)?", default=False).ask():
+                search_config["twitter_api_key"] = questionary.password("API Key").ask()
+                search_config["twitter_api_secret"] = questionary.password("API Secret").ask()
+                search_config["twitter_access_token"] = questionary.password("Access Token").ask()
+                search_config["twitter_access_secret"] = questionary.password("Access Token Secret").ask()
+            
+            if twitter_bearer:
+                console.print("[green]✅ Twitter/X Search configured[/]")
+        
+        # News API
+        if questionary.confirm("Configure News API?", default=bool(search_config.get("news_api_key"))).ask():
+            console.print("\n[bold]News API Setup:[/]")
+            console.print("[dim]Get API key at: https://newsapi.org/[/]")
+            
+            current_news = search_config.get("news_api_key", "")
+            news_key = questionary.password(
+                "NewsAPI Key",
+                default=current_news,
+            ).ask()
+            search_config["news_api_key"] = news_key
+            
+            if news_key:
+                console.print("[green]✅ News API configured[/]")
+        
+        # Reddit
+        if questionary.confirm("Configure Reddit Search?", default=bool(search_config.get("reddit_client_id"))).ask():
+            console.print("\n[bold]Reddit Setup:[/]")
+            console.print("[dim]Create app at: https://www.reddit.com/prefs/apps[/]")
+            
+            current_reddit_id = search_config.get("reddit_client_id", "")
+            reddit_id = questionary.text(
+                "Reddit Client ID",
+                default=current_reddit_id,
+            ).ask()
+            search_config["reddit_client_id"] = reddit_id
+            
+            current_reddit_secret = search_config.get("reddit_client_secret", "")
+            reddit_secret = questionary.password(
+                "Reddit Client Secret",
+                default=current_reddit_secret,
+            ).ask()
+            search_config["reddit_client_secret"] = reddit_secret
+            
+            search_config["reddit_user_agent"] = questionary.text(
+                "User Agent",
+                default=search_config.get("reddit_user_agent", "LollmsBot/1.0"),
+            ).ask()
+            
+            if reddit_id and reddit_secret:
+                console.print("[green]✅ Reddit Search configured[/]")
+        
+        # Cache settings
+        console.print("\n[bold]Cache Settings:[/]")
+        current_ttl = search_config.get("cache_ttl_hours", 24)
+        cache_ttl = IntPrompt.ask("Cache TTL (hours)", default=current_ttl)
+        search_config["cache_ttl_hours"] = cache_ttl
+        
+        # Test search
+        if questionary.confirm("Test search now?", default=True).ask():
+            self._test_search(search_config)
+        
+        self._configured.add("search")
+        console.print("\n[green]✅ Search configuration saved![/]")
+        
+        # Show summary
+        self._show_search_summary(search_config)
+    
+    def _test_search(self, search_config: Dict[str, Any]) -> None:
+        """Test search configuration."""
+        console.print("\n[bold]Testing search...[/]")
+        
+        try:
+            from lollmsbot.tools.search import SearchManager
+            
+            manager = SearchManager(search_config)
+            status = manager.get_status()
+            
+            table = Table(title="Search Provider Status")
+            table.add_column("Provider", style="cyan")
+            table.add_column("Status", style="green")
+            
+            for provider, available in status.items():
+                status_text = "[green]✅ Ready[/]" if available else "[yellow]⭕ Not configured[/]"
+                table.add_row(provider, status_text)
+            
+            console.print(table)
+            
+            # Try a quick search
+            if status.get("duckduckgo"):
+                console.print("\n[dim]Testing DuckDuckGo search...[/]")
+                import asyncio
+                
+                async def test():
+                    results = await manager.search_duckduckgo("python programming", 3)
+                    return results
+                
+                results = asyncio.run(test())
+                
+                if results:
+                    console.print(f"[green]✅ Search working! Found {len(results)} results[/]")
+                    console.print(f"[dim]Top result: {results[0].title[:50]}...[/]")
+                else:
+                    console.print("[yellow]⚠️ Search returned no results[/]")
+            
+        except Exception as e:
+            console.print(f"[red]❌ Test failed: {e}[/]")
+    
+    def _show_search_summary(self, search_config: Dict[str, Any]) -> None:
+        """Show search configuration summary."""
+        table = Table(title="Search Configuration Summary")
+        table.add_column("Provider", style="cyan")
+        table.add_column("Configured", style="green")
+        
+        # DuckDuckGo always available
+        table.add_row("DuckDuckGo", "[green]✅ Always available[/]")
+        
+        # Google
+        has_google = bool(search_config.get("google_api_key") and search_config.get("google_cx"))
+        table.add_row("Google", "[green]✅ Yes[/]" if has_google else "[dim]⭕ No[/]")
+        
+        # Twitter
+        has_twitter = bool(search_config.get("twitter_bearer_token"))
+        table.add_row("Twitter/X", "[green]✅ Yes[/]" if has_twitter else "[dim]⭕ No[/]")
+        
+        # News API
+        has_news = bool(search_config.get("news_api_key"))
+        table.add_row("News API", "[green]✅ Yes[/]" if has_news else "[dim]⭕ No[/]")
+        
+        # Reddit
+        has_reddit = bool(search_config.get("reddit_client_id") and search_config.get("reddit_client_secret"))
+        table.add_row("Reddit", "[green]✅ Yes[/]" if has_reddit else "[dim]⭕ No[/]")
+        
+        # Stack Overflow and Wikipedia (no config needed)
+        table.add_row("Stack Overflow", "[green]✅ Available[/]")
+        table.add_row("Wikipedia", "[green]✅ Available[/]")
+        
+        console.print(table)
+        
+        # Show cache info
+        ttl = search_config.get("cache_ttl_hours", 24)
+        console.print(f"\n[dim]Cache TTL: {ttl} hours[/]")
 
     def _save_all(self) -> None:
         """Save all configurations."""

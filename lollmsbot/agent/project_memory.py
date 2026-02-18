@@ -312,14 +312,44 @@ class ProjectMemoryManager:
         
         # Load segments into RCB if requested
         if load_segments:
+            # CRITICAL: Load ALL segments with content, not just auto_load ones
             for segment in project.segments.values():
-                if segment.auto_load or segment.segment_id in project.active_segment_ids:
-                    await self.load_segment(project_id, segment.segment_id)
+                await self.load_segment(project_id, segment.segment_id)
+            
+            # Also search for any conversation chunks related to this project
+            await self._load_project_conversations(project_id)
         
         await self._notify_project("activated", project_id, project.to_dict())
         logger.info(f"Activated project '{project.name}' ({project_id})")
         
         return project
+    
+    async def _load_project_conversations(self, project_id: str) -> None:
+        """Load conversation chunks associated with this project from EMS."""
+        try:
+            # Search for conversation chunks tagged with this project
+            results = await self._memory.search_ems(
+                query=f"project:{project_id} conversation",
+                chunk_types=[MemoryChunkType.CONVERSATION],
+                limit=50,
+            )
+            
+            loaded_count = 0
+            for chunk, score in results:
+                # Check if already in RCB
+                if chunk.chunk_id in self._loaded_segments:
+                    continue
+                    
+                # Load into RCB
+                await self._memory.load_from_ems(chunk.chunk_id, add_to_rcb=True)
+                self._loaded_segments[chunk.chunk_id] = datetime.now()
+                loaded_count += 1
+            
+            if loaded_count > 0:
+                logger.info(f"Loaded {loaded_count} conversation chunks for project {project_id}")
+                
+        except Exception as e:
+            logger.warning(f"Failed to load project conversations: {e}")
     
     async def unload_project(self, project_id: str, save_state: bool = True) -> None:
         """

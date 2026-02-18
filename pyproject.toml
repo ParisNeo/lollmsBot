@@ -1,6 +1,6 @@
 [project]
 name = "lollmsbot"
-version = "0.0.2"
+version = "0.0.3"
 description = "LoLLMS-based personal AI assistant"
 authors = [{ name = "Your Name" }]
 requires-python = ">=3.10"
@@ -18,7 +18,12 @@ dependencies = [
     "openai", # for lollms
     "PyNaCl",
     "jinja2",
-    "aiosqlite"
+    "aiosqlite",
+    "duckduckgo_search",
+    "tweepy",
+    "wikipedia",
+    "newsapi",
+    "praw"
 ]
 
 [project.optional-dependencies]

@@ -12,6 +12,9 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 from rich.style import Style
+from rich.live import Live
+from rich.spinner import Spinner
+from rich.status import Status
 
 import logging
 
@@ -25,6 +28,11 @@ class AgentLogger:
         self.verbose = verbose
         self._console = Console()
         self._logger = logging.getLogger(__name__)
+        
+        # Status tracking to prevent overlapping displays
+        self._current_status: Optional[Status] = None
+        self._live_display: Optional[Live] = None
+        self._status_lock: Optional[Any] = None
         
         # Style mapping
         self._styles = {
@@ -54,6 +62,15 @@ class AgentLogger:
         )
         self._console.print(panel)
     
+    def _end_current_status(self) -> None:
+        """Clean up any active status display to prevent overlapping."""
+        if self._current_status is not None:
+            try:
+                self._current_status.stop()
+            except Exception:
+                pass
+            self._current_status = None
+    
     def log(
         self,
         message: str,
@@ -64,6 +81,9 @@ class AgentLogger:
         """Log a message with styling."""
         if not self.verbose:
             return
+        
+        # End any active status before printing
+        self._end_current_status()
         
         rich_style = self._styles.get(style, style)
         prefix = f"{emoji} " if emoji else ""
@@ -83,6 +103,9 @@ class AgentLogger:
         tool_count: int,
     ) -> None:
         """Log when a command is received."""
+        # End any active status first
+        self._end_current_status()
+        
         channel = context.get("channel", "unknown") if context else "unknown"
         msg_preview = message[:100] + "..." if len(message) > 100 else message
         
@@ -98,6 +121,8 @@ class AgentLogger:
     
     def log_security_check(self, is_safe: bool, event: Optional[Any]) -> None:
         """Log security screening results."""
+        self._end_current_status()
+        
         if is_safe:
             self.log("✅ Input passed security screening", "green", "🛡️")
         else:
@@ -106,6 +131,8 @@ class AgentLogger:
     
     def log_tool_detection(self, tool_count: int, tools_found: List[str]) -> None:
         """Log tool detection in LLM response."""
+        self._end_current_status()
+        
         if tool_count > 0:
             panel = Panel(
                 f"[bold white]Found {tool_count} tool call(s):[/bold white]\n" +
@@ -125,6 +152,8 @@ class AgentLogger:
         error: Optional[str] = None,
     ) -> None:
         """Log tool execution with parameters."""
+        self._end_current_status()
+        
         params_str = ", ".join([f"{k}={v}" for k, v in params.items()])[:200]
         
         if success:
@@ -135,6 +164,8 @@ class AgentLogger:
     
     def log_llm_call(self, prompt_length: int, system_prompt: str) -> None:
         """Log LLM invocation."""
+        self._end_current_status()
+        
         sys_preview = system_prompt[:80] + "..." if len(system_prompt) > 80 else system_prompt
         
         panel = Panel(
@@ -147,11 +178,15 @@ class AgentLogger:
     
     def log_llm_response(self, response_length: int, has_tools: bool) -> None:
         """Log LLM response received."""
+        self._end_current_status()
+        
         tool_status = "🟢 contains tools" if has_tools else "🔵 text only"
         self.log(f"📤 LLM response: {response_length} chars ({tool_status})", "orange")
     
     def log_file_generation(self, file_count: int, filenames: List[str]) -> None:
         """Log file generation events."""
+        self._end_current_status()
+        
         if file_count > 0:
             panel = Panel(
                 f"[bold white]Generated {file_count} file(s):[/bold white]\n" +
@@ -163,6 +198,8 @@ class AgentLogger:
     
     def log_state_change(self, old_state: str, new_state: str, reason: str = "") -> None:
         """Log agent state transitions."""
+        self._end_current_status()
+        
         reason_str = f" ({reason})" if reason else ""
         self.log(f"🔄 State: {old_state} → {new_state}{reason_str}", "yellow", "ℹ️")
     
@@ -173,20 +210,27 @@ class AgentLogger:
         tools_used: List[str],
     ) -> None:
         """Log final response delivery."""
+        self._end_current_status()
+        
         tools_str = f" | Tools: {', '.join(tools_used)}" if tools_used else " | No tools"
         self.log(f"📤 Response sent to {user_id}: {response_length} chars{tools_str}", "green", "✅")
     
     def log_error(self, message: str, exception: Optional[Exception] = None) -> None:
         """Log errors with optional exception details."""
+        self._end_current_status()
+        
         exc_str = f": {str(exception)}" if exception else ""
         self.log(f"💥 ERROR: {message}{exc_str}", "red", "❌", "error")
     
     def log_critical(self, message: str) -> None:
         """Log critical security/system events."""
+        self._end_current_status()
         self.log(message, "red", "🚨", "critical")
     
     def log_skill_execution(self, skill_name: str, success: bool) -> None:
         """Log skill execution events."""
+        self._end_current_status()
+        
         if success:
             self.log(f"🎯 Skill '{skill_name}' executed successfully", "magenta", "📚")
         else:
@@ -194,6 +238,8 @@ class AgentLogger:
     
     def log_important_memory(self, category: str, facts: Dict[str, Any], user_id: str) -> None:
         """Log important memory detection and storage."""
+        self._end_current_status()
+        
         facts_str = ", ".join([f"{k}={v}" for k, v in facts.items() if v])
         
         panel = Panel(

@@ -1,563 +1,496 @@
 """
-simplified_agent minimal agent architecture for lollmsbot.
+SimplifiedAgant-Style Module - minimal agent architecture for lollmsbot.
 
-Implements the "Pi" philosophy: 4 core tools that self-extend through code.
+Implements key concepts:
+- Minimal 4-tool core (read, write, edit, bash)
+- Self-written code extensions
+- Hot reloading
+- Session branching
+- Skills vs Tools distinction
+
+Philosophy: "The agent writes its own extensions through code"
 """
 
 from __future__ import annotations
 
-import asyncio
+import ast
 import hashlib
+import importlib.util
+import inspect
 import json
 import os
 import re
-import subprocess
 import sys
-import tempfile
+import textwrap
+import threading
 import time
-import traceback
 from dataclasses import dataclass, field
 from datetime import datetime
+from enum import Enum, auto
 from pathlib import Path
-from typing import Any, Callable, Coroutine, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type, Union
 
-from lollmsbot.agent import Tool, ToolResult
-from lollmsbot.agent.rlm import RLMMemoryManager, MemoryChunkType
+try:
+    from rich.console import Console
+    from rich.live import Live
+    from rich.panel import Panel
+    from rich.progress import Progress, SpinnerColumn, TextColumn
+    from rich.syntax import Syntax
+    from rich.table import Table
+    from rich.tree import Tree
+    from rich import box
+    RICH_AVAILABLE = True
+except ImportError:
+    RICH_AVAILABLE = False
 
 import logging
 
 logger = logging.getLogger(__name__)
 
 
+class ExtensionStatus(Enum):
+    """Status of a self-written extension."""
+    DRAFT = auto()      # Just created, not tested
+    ACTIVE = auto()     # Loaded and working
+    DEPRECATED = auto() # Replaced by newer version
+    BROKEN = auto()     # Failed to load or execute
+
+
 @dataclass
 class CodeExtension:
-    """A self-written code extension (Skill in SimplifiedAgant terms)."""
+    """
+    A self-written extension created by the agent.
+    
+    OpenClaw-style: The agent writes Python code to add functionality.
+    Extensions are stored as Python modules and can be hot-reloaded.
+    """
     name: str
-    code: str
-    description: str
-    created_at: datetime = field(default_factory=datetime.now)
-    version: int = 1
-    test_results: List[Dict[str, Any]] = field(default_factory=list)
-    is_active: bool = True
+    version: str = "1.0.0"
+    description: str = ""
+    code: str = ""  # The actual Python code
     dependencies: List[str] = field(default_factory=list)
+    
+    # Runtime state
+    status: ExtensionStatus = ExtensionStatus.DRAFT
+    created_at: datetime = field(default_factory=datetime.now)
+    last_modified: datetime = field(default_factory=datetime.now)
+    execution_count: int = 0
+    
+    # Compiled module (transient)
+    _compiled_module: Optional[Any] = field(default=None, repr=False)
+    _main_function: Optional[Callable] = field(default=None, repr=False)
     
     def to_dict(self) -> Dict[str, Any]:
         return {
             "name": self.name,
-            "description": self.description,
-            "created_at": self.created_at.isoformat(),
             "version": self.version,
-            "is_active": self.is_active,
+            "description": self.description,
+            "code_preview": self.code[:200] + "..." if len(self.code) > 200 else self.code,
             "dependencies": self.dependencies,
+            "status": self.status.name,
+            "created_at": self.created_at.isoformat(),
+            "last_modified": self.last_modified.isoformat(),
+            "execution_count": self.execution_count,
         }
 
 
 @dataclass
 class SessionBranch:
-    """A branch in the tree-structured session history."""
+    """
+    A branch in the session tree for experimentation.
+    
+    OpenClaw feature: Tree-structured sessions allow trying things
+    without polluting the main conversation context.
+    """
     branch_id: str
-    parent_branch_id: Optional[str]
+    parent_branch_id: Optional[str] = None
+    summary: str = ""  # What this branch is about
     created_at: datetime = field(default_factory=datetime.now)
+    
+    # Content
     messages: List[Dict[str, Any]] = field(default_factory=list)
     extensions_created: List[str] = field(default_factory=list)
-    is_active: bool = True
-    summary: str = ""  # AI-generated summary of what happened in this branch
+    files_modified: List[str] = field(default_factory=list)
+    
+    # State
+    is_active: bool = False
+    is_merged: bool = False
     
     def to_dict(self) -> Dict[str, Any]:
         return {
             "branch_id": self.branch_id,
             "parent_branch_id": self.parent_branch_id,
+            "summary": self.summary,
             "created_at": self.created_at.isoformat(),
             "message_count": len(self.messages),
             "extensions_created": self.extensions_created,
+            "files_modified": self.files_modified,
             "is_active": self.is_active,
-            "summary": self.summary,
+            "is_merged": self.is_merged,
         }
 
 
 class MinimalToolSet:
     """
-    SimplifiedAgant's 4 core tools: Read, Write, Edit, Bash.
+    OpenClaw's minimal 4-tool philosophy.
     
-    These are the ONLY tools loaded into context. Everything else
-    is implemented as self-written code extensions (skills).
+    Instead of many specialized tools, provide just the essentials
+    that can be composed to achieve any task.
     """
     
-    def __init__(self, working_dir: Path):
-        self.working_dir = working_dir
-        self.working_dir.mkdir(parents=True, exist_ok=True)
+    TOOLS = {
+        "read": {
+            "description": "Read content from files or URLs",
+            "parameters": {
+                "source": "string - file path or URL to read",
+                "limit": "optional int - max lines/chars to read",
+            },
+            "example": '<tool>read</tool><source>/path/to/file.txt</source>',
+        },
+        "write": {
+            "description": "Write content to a file (creates or overwrites)",
+            "parameters": {
+                "path": "string - file path to write",
+                "content": "string - content to write",
+            },
+            "example": '<tool>write</tool><path>/tmp/output.txt</path><content>Hello World</content>',
+        },
+        "edit": {
+            "description": "Edit existing file content (find/replace)",
+            "parameters": {
+                "path": "string - file to edit",
+                "old_string": "string - text to find",
+                "new_string": "string - text to replace with",
+            },
+            "example": '<tool>edit</tool><path>file.py</path><old_string>print("old")</old_string><new_string>print("new")</new_string>',
+        },
+        "bash": {
+            "description": "Execute shell commands",
+            "parameters": {
+                "command": "string - shell command to run",
+                "working_dir": "optional string - directory to run in",
+            },
+            "example": '<tool>bash</tool><command>ls -la</command>',
+        },
+    }
     
-    async def read(self, path: str, offset: int = 0, limit: int = 100) -> ToolResult:
-        """Read file contents."""
-        try:
-            full_path = self._resolve_path(path)
-            if not full_path.exists():
-                return ToolResult(
-                    success=False,
-                    output=None,
-                    error=f"File not found: {path}"
-                )
-            
-            with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
-                lines = f.readlines()
-            
-            start = offset
-            end = min(offset + limit, len(lines))
-            selected = lines[start:end]
-            
-            return ToolResult(
-                success=True,
-                output={
-                    "path": str(full_path),
-                    "content": ''.join(selected),
-                    "total_lines": len(lines),
-                    "shown_lines": f"{start}-{end}",
-                }
-            )
-        except Exception as e:
-            return ToolResult(success=False, output=None, error=str(e))
-    
-    async def write(self, path: str, content: str, append: bool = False) -> ToolResult:
-        """Write or append to file."""
-        try:
-            full_path = self._resolve_path(path)
-            full_path.parent.mkdir(parents=True, exist_ok=True)
-            
-            mode = 'a' if append else 'w'
-            with open(full_path, mode, encoding='utf-8') as f:
-                f.write(content)
-            
-            return ToolResult(
-                success=True,
-                output={
-                    "path": str(full_path),
-                    "bytes_written": len(content.encode('utf-8')),
-                    "operation": "append" if append else "write",
-                }
-            )
-        except Exception as e:
-            return ToolResult(success=False, output=None, error=str(e))
-    
-    async def edit(self, path: str, old_string: str, new_string: str) -> ToolResult:
-        """Edit file by replacing old_string with new_string."""
-        try:
-            full_path = self._resolve_path(path)
-            
-            with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
-                content = f.read()
-            
-            if old_string not in content:
-                # Try fuzzy matching
-                similar = self._find_similar(content, old_string)
-                return ToolResult(
-                    success=False,
-                    output=None,
-                    error=f"String not found. Did you mean: {similar[:100]}..."
-                )
-            
-            new_content = content.replace(old_string, new_string, 1)
-            
-            with open(full_path, 'w', encoding='utf-8') as f:
-                f.write(new_content)
-            
-            return ToolResult(
-                success=True,
-                output={
-                    "path": str(full_path),
-                    "replacements": 1,
-                    "old_length": len(old_string),
-                    "new_length": len(new_string),
-                }
-            )
-        except Exception as e:
-            return ToolResult(success=False, output=None, error=str(e))
-    
-    async def bash(self, command: str, timeout: int = 60, cwd: Optional[str] = None) -> ToolResult:
-        """Execute bash command with safety checks."""
-        # Safety: block dangerous commands
-        dangerous = ['rm -rf /', 'mkfs', 'dd if=/dev/zero', '> /dev/sda']
-        for d in dangerous:
-            if d in command:
-                return ToolResult(
-                    success=False,
-                    output=None,
-                    error=f"Dangerous command blocked: {d}"
-                )
+    @classmethod
+    def get_tool_instructions(cls) -> str:
+        """Generate instructions for the minimal tool set."""
+        lines = [
+            "╔══════════════════════════════════════════════════════════════════╗",
+            "║  MINIMAL TOOL SET - OpenClaw Style                              ║",
+            "╠══════════════════════════════════════════════════════════════════╣",
+            "",
+            "You have exactly 4 tools. All tasks must be accomplished",
+            "by composing these 4 primitives:",
+            "",
+        ]
         
-        try:
-            working_dir = cwd or str(self.working_dir)
-            
-            result = subprocess.run(
-                command,
-                shell=True,
-                cwd=working_dir,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-            )
-            
-            return ToolResult(
-                success=result.returncode == 0,
-                output={
-                    "stdout": result.stdout,
-                    "stderr": result.stderr,
-                    "returncode": result.returncode,
-                }
-            )
-        except subprocess.TimeoutExpired:
-            return ToolResult(success=False, output=None, error=f"Command timed out after {timeout}s")
-        except Exception as e:
-            return ToolResult(success=False, output=None, error=str(e))
-    
-    def _resolve_path(self, path: str) -> Path:
-        """Resolve path relative to working directory."""
-        if path.startswith('/'):
-            return Path(path)
-        return self.working_dir / path
-    
-    def _find_similar(self, content: str, target: str) -> str:
-        """Find similar string in content for error suggestions."""
-        # Simple approach: find lines containing similar words
-        target_words = set(target.lower().split())
-        best_match = ""
-        best_score = 0
+        for name, info in cls.TOOLS.items():
+            lines.extend([
+                f"  ▶ {name.upper()}",
+                f"    {info['description']}",
+                f"    Parameters: {', '.join(info['parameters'].keys())}",
+                f"    Example: {info['example']}",
+                "",
+            ])
         
-        for line in content.split('\n'):
-            line_words = set(line.lower().split())
-            score = len(target_words & line_words)
-            if score > best_score:
-                best_score = score
-                best_match = line
+        lines.extend([
+            "╔══════════════════════════════════════════════════════════════════╗",
+            "║  EXTENSION PRINCIPLE                                             ║",
+            "╠══════════════════════════════════════════════════════════════════╣",
+            "",
+            "Need more capability? Write an extension:",
+            "",
+            "  <tool>write</tool>",
+            "  <path>~/.lollmsbot/extensions/my_tool.py</path>",
+            "  <content>",
+            "  def execute(args):",
+            "      # Your implementation",
+            "      return result",
+            "  </content>",
+            "",
+            "Then reload extensions with: /reload",
+            "",
+            "This is how OpenClaw works - you write your own tools!",
+            "",
+        ])
         
-        return best_match
+        return "\n".join(lines)
 
 
 class SimplifiedAgantStyle:
     """
-    simplified_agent-style agent with minimal tools and self-extension capability.
+    Main class implementing OpenClaw-style architecture.
     
-    Key features:
-    - 4 core tools only (Read, Write, Edit, Bash)
-    - Self-written code extensions (skills)
-    - Tree-structured sessions with branching
-    - Hot reloading of extensions
+    Features:
+    - Minimal 4-tool mode
+    - Self-written extensions
+    - Session branching
+    - Hot reloading
+    - TUI components
     """
     
     def __init__(
         self,
-        working_dir: Optional[Path] = None,
-        memory_manager: Optional[RLMMemoryManager] = None,
-    ):
-        self.working_dir = working_dir or Path.home() / ".lollmsbot" / "openclaw_workspace"
-        self.working_dir.mkdir(parents=True, exist_ok=True)
+        agent: Any,
+        extensions_dir: Optional[Path] = None,
+        enable_tui: bool = True,
+    ) -> None:
+        self.agent = agent
+        self.extensions_dir = extensions_dir or (Path.home() / ".lollmsbot" / "extensions")
+        self.extensions_dir.mkdir(parents=True, exist_ok=True)
         
-        # Extensions directory
-        self.extensions_dir = self.working_dir / ".extensions"
-        self.extensions_dir.mkdir(exist_ok=True)
+        self.enable_tui = enable_tui and RICH_AVAILABLE
+        self.console = Console() if self.enable_tui else None
         
-        # Minimal core tools
-        self.core_tools = MinimalToolSet(self.working_dir)
-        
-        # Memory
-        self._memory = memory_manager
-        
-        # Session tree structure
-        self.branches: Dict[str, SessionBranch] = {}
-        self.active_branch_id: Optional[str] = None
-        self._create_main_branch()
-        
-        # Loaded extensions (skills)
+        # Extensions registry
         self.extensions: Dict[str, CodeExtension] = {}
-        self._extension_modules: Dict[str, Any] = {}
+        self._extension_lock = threading.Lock()
+        
+        # Session branching
+        self.branches: Dict[str, SessionBranch] = {}
+        self._active_branch_id: Optional[str] = None
+        self._main_branch_id: Optional[str] = None
+        
+        # TUI state
+        self._progress_bars: Dict[str, Any] = {}
+        self._spinners: Dict[str, Any] = {}
         
         # Load existing extensions
-        self._load_extensions_from_disk()
+        self._load_existing_extensions()
         
-        # Hot reload watcher
-        self._reload_callbacks: List[Callable[[str], None]] = []
+        logger.info(f"SimplifiedAgantStyle initialized: extensions_dir={self.extensions_dir}")
     
-    def _create_main_branch(self) -> None:
-        """Create the main trunk branch."""
-        main = SessionBranch(
-            branch_id="main",
-            parent_branch_id=None,
-            summary="Main conversation trunk",
-        )
-        self.branches["main"] = main
-        self.active_branch_id = "main"
-    
-    # ========== Core Tool Interface ==========
-    
-    async def execute_core_tool(self, tool_name: str, **params) -> ToolResult:
-        """Execute one of the 4 core tools."""
-        if tool_name == "read":
-            return await self.core_tools.read(
-                path=params.get("path", ""),
-                offset=params.get("offset", 0),
-                limit=params.get("limit", 100),
-            )
-        elif tool_name == "write":
-            return await self.core_tools.write(
-                path=params.get("path", ""),
-                content=params.get("content", ""),
-                append=params.get("append", False),
-            )
-        elif tool_name == "edit":
-            return await self.core_tools.edit(
-                path=params.get("path", ""),
-                old_string=params.get("old_string", ""),
-                new_string=params.get("new_string", ""),
-            )
-        elif tool_name == "bash":
-            return await self.core_tools.bash(
-                command=params.get("command", ""),
-                timeout=params.get("timeout", 60),
-                cwd=params.get("cwd"),
-            )
-        else:
-            # Try extension
-            return await self._execute_extension(tool_name, params)
-    
-    # ========== Self-Extension System ==========
-    
-    async def create_extension(
-        self,
-        name: str,
-        description: str,
-        code: str,
-        test_command: Optional[str] = None,
-    ) -> CodeExtension:
-        """
-        Create a new code extension (skill).
-        
-        The agent writes Python code that extends its capabilities.
-        """
-        # Validate Python syntax
-        try:
-            compile(code, f"<{name}>", 'exec')
-        except SyntaxError as e:
-            raise ValueError(f"Invalid Python syntax: {e}")
-        
-        extension = CodeExtension(
-            name=name,
-            code=code,
-            description=description,
-        )
-        
-        # Save to disk
-        ext_path = self.extensions_dir / f"{name}.py"
-        ext_path.write_text(code, encoding='utf-8')
-        
-        # Save metadata
-        meta_path = self.extensions_dir / f"{name}.json"
-        meta_path.write_text(
-            json.dumps(extension.to_dict(), indent=2),
-            encoding='utf-8'
-        )
-        
-        # Load and test
-        await self._load_extension(extension)
-        
-        if test_command:
-            test_result = await self._test_extension(name, test_command)
-            extension.test_results.append(test_result)
-        
-        self.extensions[name] = extension
-        
-        # Record in active branch
-        if self.active_branch_id:
-            branch = self.branches[self.active_branch_id]
-            branch.extensions_created.append(name)
-        
-        # Store in memory
-        if self._memory:
-            await self._memory.store_in_ems(
-                content=f"Extension created: {name}\nDescription: {description}\nCode:\n{code[:500]}...",
-                chunk_type=MemoryChunkType.PROCEDURAL,
-                importance=7.0,
-                tags=["extension", "skill", "self_written", name],
-                summary=f"Self-written extension: {name}",
-                load_hints=[name, "extension", "skill"],
-                source=f"extension:{name}",
-            )
-        
-        return extension
-    
-    async def _load_extension(self, extension: CodeExtension) -> bool:
-        """Load extension code into memory."""
-        try:
-            # Create module namespace
-            module_name = f"ext_{extension.name}"
-            namespace = {
-                '__name__': module_name,
-                '__file__': str(self.extensions_dir / f"{extension.name}.py"),
-            }
-            
-            # Execute code in namespace
-            exec(extension.code, namespace)
-            
-            # Store module
-            self._extension_modules[extension.name] = namespace
-            
-            extension.is_active = True
-            logger.info(f"Loaded extension: {extension.name}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to load extension {extension.name}: {e}")
-            extension.is_active = False
-            return False
-    
-    async def _execute_extension(self, name: str, params: Dict[str, Any]) -> ToolResult:
-        """Execute a loaded extension."""
-        if name not in self._extension_modules:
-            return ToolResult(
-                success=False,
-                output=None,
-                error=f"Extension '{name}' not found. Create it with: create_extension(name='{name}', ...)"
-            )
-        
-        module = self._extension_modules[name]
-        
-        # Look for execute function
-        if 'execute' not in module:
-            return ToolResult(
-                success=False,
-                output=None,
-                error=f"Extension '{name}' has no execute() function"
-            )
-        
-        try:
-            execute_func = module['execute']
-            result = execute_func(**params)
-            
-            # Handle async
-            if asyncio.iscoroutine(result):
-                result = await result
-            
-            # Normalize to ToolResult
-            if isinstance(result, dict):
-                return ToolResult(success=True, output=result)
-            elif isinstance(result, ToolResult):
-                return result
-            else:
-                return ToolResult(success=True, output={"result": str(result)})
-                
-        except Exception as e:
-            return ToolResult(
-                success=False,
-                output=None,
-                error=f"Extension '{name}' execution failed: {str(e)}\n{traceback.format_exc()}"
-            )
-    
-    async def _test_extension(self, name: str, test_command: str) -> Dict[str, Any]:
-        """Test an extension with a command."""
-        start = time.time()
-        
-        try:
-            # Parse test command
-            parts = test_command.split()
-            tool_name = parts[0]
-            params = {}
-            
-            for part in parts[1:]:
-                if '=' in part:
-                    key, value = part.split('=', 1)
-                    params[key] = value
-            
-            result = await self._execute_extension(name, params)
-            
-            return {
-                "test_command": test_command,
-                "success": result.success,
-                "duration": time.time() - start,
-                "output_preview": str(result.output)[:200] if result.output else None,
-                "error": result.error,
-            }
-            
-        except Exception as e:
-            return {
-                "test_command": test_command,
-                "success": False,
-                "duration": time.time() - start,
-                "error": str(e),
-            }
-    
-    def _load_extensions_from_disk(self) -> None:
-        """Load all extensions from disk on startup."""
+    def _load_existing_extensions(self) -> None:
+        """Load extensions from disk."""
         if not self.extensions_dir.exists():
             return
         
         for ext_file in self.extensions_dir.glob("*.py"):
-            name = ext_file.stem
-            
-            # Load metadata if exists
-            meta_file = self.extensions_dir / f"{name}.json"
-            if meta_file.exists():
-                try:
-                    meta = json.loads(meta_file.read_text())
-                    extension = CodeExtension(
-                        name=name,
-                        code=ext_file.read_text(),
-                        description=meta.get("description", ""),
-                        created_at=datetime.fromisoformat(meta.get("created_at", datetime.now().isoformat())),
-                        version=meta.get("version", 1),
-                        dependencies=meta.get("dependencies", []),
-                    )
-                except Exception:
-                    extension = CodeExtension(
-                        name=name,
-                        code=ext_file.read_text(),
-                        description=f"Extension: {name}",
-                    )
-            else:
-                extension = CodeExtension(
-                    name=name,
-                    code=ext_file.read_text(),
-                    description=f"Extension: {name}",
-                )
-            
-            # Async load will happen later
-            self.extensions[name] = extension
+            try:
+                self._load_extension_from_file(ext_file)
+            except Exception as e:
+                logger.warning(f"Failed to load extension {ext_file}: {e}")
     
-    # ========== Hot Reload ==========
-    
-    async def hot_reload(self, extension_name: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Hot reload extensions.
+    def _load_extension_from_file(self, ext_file: Path) -> Optional[CodeExtension]:
+        """Load a single extension from Python file."""
+        name = ext_file.stem
         
-        If extension_name is None, reload all.
+        try:
+            code = ext_file.read_text(encoding='utf-8')
+            
+            # Parse metadata from docstring/comments
+            description = ""
+            version = "1.0.0"
+            
+            # Extract description from docstring
+            docstring_match = re.search(r'"""(.*?)"""', code, re.DOTALL)
+            if docstring_match:
+                description = docstring_match.group(1).strip()[:200]
+            
+            # Extract version from __version__ or comment
+            version_match = re.search(r'__version__\s*=\s*["\']([^"\']+)["\']', code)
+            if version_match:
+                version = version_match.group(1)
+            
+            ext = CodeExtension(
+                name=name,
+                version=version,
+                description=description,
+                code=code,
+                status=ExtensionStatus.ACTIVE,
+            )
+            
+            # Try to compile
+            if self._compile_extension(ext):
+                with self._extension_lock:
+                    self.extensions[name] = ext
+                logger.info(f"Loaded extension: {name} v{version}")
+                return ext
+            else:
+                ext.status = ExtensionStatus.BROKEN
+                with self._extension_lock:
+                    self.extensions[name] = ext
+                return ext
+                
+        except Exception as e:
+            logger.error(f"Failed to load extension {name}: {e}")
+            return None
+    
+    def _compile_extension(self, ext: CodeExtension) -> bool:
+        """Compile extension code and extract main function."""
+        try:
+            # Compile the code
+            compiled = compile(ext.code, f"<extension_{ext.name}>", 'exec')
+            
+            # Create module namespace
+            module_namespace = {
+                '__name__': f'extension_{ext.name}',
+                '__file__': str(self.extensions_dir / f"{ext.name}.py"),
+            }
+            
+            # Execute to populate namespace
+            exec(compiled, module_namespace)
+            
+            # Look for main function
+            main_func = module_namespace.get('execute')
+            if main_func is None:
+                # Also accept 'main' or any callable starting with ext name
+                for key, value in module_namespace.items():
+                    if callable(value) and not key.startswith('_'):
+                        if key in ('execute', 'main', f'{ext.name}_execute'):
+                            main_func = value
+                            break
+            
+            ext._compiled_module = module_namespace
+            ext._main_function = main_func
+            
+            return main_func is not None
+            
+        except SyntaxError as e:
+            logger.error(f"Syntax error in extension {ext.name}: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Failed to compile extension {ext.name}: {e}")
+            return False
+    
+    # ========== EXTENSION MANAGEMENT ==========
+    
+    def create_extension(
+        self,
+        name: str,
+        code: str,
+        description: str = "",
+    ) -> CodeExtension:
+        """
+        Create a new self-written extension.
+        
+        OpenClaw style: The agent writes Python code that becomes a tool.
+        """
+        # Validate name
+        name = re.sub(r'[^\w]', '_', name.lower())
+        if not name or name[0].isdigit():
+            name = f"ext_{name}"
+        
+        # Check for existing
+        if name in self.extensions:
+            raise ValueError(f"Extension '{name}' already exists")
+        
+        # Create extension
+        ext = CodeExtension(
+            name=name,
+            description=description or f"Self-written extension: {name}",
+            code=code,
+        )
+        
+        # Save to disk
+        ext_file = self.extensions_dir / f"{name}.py"
+        ext_file.write_text(code, encoding='utf-8')
+        
+        # Try to compile
+        if self._compile_extension(ext):
+            ext.status = ExtensionStatus.ACTIVE
+            logger.info(f"Created and activated extension: {name}")
+        else:
+            ext.status = ExtensionStatus.BROKEN
+            logger.warning(f"Created extension {name} but compilation failed")
+        
+        with self._extension_lock:
+            self.extensions[name] = ext
+        
+        # Track in active branch if any
+        if self._active_branch_id:
+            branch = self.branches.get(self._active_branch_id)
+            if branch:
+                branch.extensions_created.append(name)
+        
+        return ext
+    
+    async def execute_extension(self, name: str, **kwargs) -> Any:
+        """Execute a self-written extension."""
+        with self._extension_lock:
+            ext = self.extensions.get(name)
+        
+        if not ext:
+            raise ValueError(f"Extension '{name}' not found")
+        
+        if ext.status != ExtensionStatus.ACTIVE:
+            raise RuntimeError(f"Extension '{name}' is not active (status: {ext.status.name})")
+        
+        if not ext._main_function:
+            raise RuntimeError(f"Extension '{name}' has no executable function")
+        
+        # Execute with TUI if enabled
+        if self.enable_tui and self.console:
+            with self.console.status(f"[bold green]Running {name}...") as status:
+                try:
+                    result = ext._main_function(**kwargs)
+                    ext.execution_count += 1
+                    return result
+                except Exception as e:
+                    logger.error(f"Extension {name} execution failed: {e}")
+                    raise
+        else:
+            result = ext._main_function(**kwargs)
+            ext.execution_count += 1
+            return result
+    
+    async def hot_reload(self, ext_name: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Hot reload extensions without restarting.
+        
+        OpenClaw feature: Extensions can be reloaded on the fly.
         """
         reloaded = []
         failed = []
         
-        targets = [extension_name] if extension_name else list(self.extensions.keys())
+        if ext_name:
+            # Reload specific extension
+            targets = [ext_name] if ext_name in self.extensions else []
+        else:
+            # Reload all
+            targets = list(self.extensions.keys())
         
         for name in targets:
-            if name not in self.extensions:
-                failed.append(f"{name}: not found")
+            ext = self.extensions.get(name)
+            if not ext:
                 continue
             
-            ext = self.extensions[name]
-            # Re-read from disk
-            ext_path = self.extensions_dir / f"{name}.py"
-            if ext_path.exists():
-                ext.code = ext_path.read_text()
-                ext.version += 1
+            ext_file = self.extensions_dir / f"{name}.py"
+            if not ext_file.exists():
+                failed.append(f"{name}: file not found")
+                continue
             
-            success = await self._load_extension(ext)
-            if success:
-                reloaded.append(name)
-            else:
-                failed.append(f"{name}: load failed")
+            try:
+                # Read fresh code
+                new_code = ext_file.read_text(encoding='utf-8')
+                
+                # Update extension
+                ext.code = new_code
+                ext.last_modified = datetime.now()
+                
+                # Recompile
+                if self._compile_extension(ext):
+                    ext.status = ExtensionStatus.ACTIVE
+                    reloaded.append(f"{name}: v{ext.version}")
+                else:
+                    ext.status = ExtensionStatus.BROKEN
+                    failed.append(f"{name}: compilation failed")
+                    
+            except Exception as e:
+                failed.append(f"{name}: {str(e)}")
         
-        # Notify callbacks
-        for cb in self._reload_callbacks:
-            for name in reloaded:
+        # Also scan for new extensions
+        for ext_file in self.extensions_dir.glob("*.py"):
+            name = ext_file.stem
+            if name not in self.extensions:
                 try:
-                    cb(name)
-                except Exception:
-                    pass
+                    self._load_extension_from_file(ext_file)
+                    reloaded.append(f"{name}: newly discovered")
+                except Exception as e:
+                    failed.append(f"{name}: discovery failed - {e}")
         
         return {
             "reloaded": reloaded,
@@ -565,273 +498,331 @@ class SimplifiedAgantStyle:
             "total": len(targets),
         }
     
-    def on_reload(self, callback: Callable[[str], None]) -> None:
-        """Register callback for extension reload events."""
-        self._reload_callbacks.append(callback)
+    def list_extensions(self) -> List[Dict[str, Any]]:
+        """List all extensions with their status."""
+        return [ext.to_dict() for ext in self.extensions.values()]
     
-    # ========== Session Tree ==========
+    # ========== SESSION BRANCHING ==========
     
-    def branch_session(self, summary: str = "") -> SessionBranch:
+    def create_branch(self, summary: str = "") -> SessionBranch:
         """
-        Create a new branch from current active branch.
+        Create a new branch for experimentation.
         
-        This allows experimenting without polluting main context.
+        OpenClaw feature: Tree-structured sessions allow safe experimentation.
         """
-        if not self.active_branch_id:
-            self._create_main_branch()
+        branch_id = f"branch_{hashlib.sha256(f'{summary}{time.time()}'.encode()).hexdigest()[:12]}"
         
-        parent_id = self.active_branch_id
-        branch_id = f"branch_{len(self.branches)}_{hashlib.sha256(str(time.time()).encode()).hexdigest()[:8]}"
-        
-        # Copy parent messages
-        parent = self.branches[parent_id]
+        # Parent is currently active branch, or None if first
+        parent_id = self._active_branch_id
         
         branch = SessionBranch(
             branch_id=branch_id,
             parent_branch_id=parent_id,
-            messages=parent.messages.copy(),  # Inherit history
-            summary=summary or f"Branched from {parent_id}",
+            summary=summary,
+            is_active=True,
         )
         
-        self.branches[branch_id] = branch
-        self.active_branch_id = branch_id
+        # Deactivate current branch if any
+        if self._active_branch_id and self._active_branch_id in self.branches:
+            self.branches[self._active_branch_id].is_active = False
         
+        self.branches[branch_id] = branch
+        self._active_branch_id = branch_id
+        
+        if self._main_branch_id is None:
+            self._main_branch_id = branch_id
+        
+        logger.info(f"Created branch: {branch_id} (parent: {parent_id})")
         return branch
     
-    def switch_branch(self, branch_id: str) -> bool:
+    def switch_branch(self, branch_id: str) -> Optional[SessionBranch]:
         """Switch to a different branch."""
         if branch_id not in self.branches:
-            return False
+            return None
         
-        self.active_branch_id = branch_id
-        return True
-    
-    def merge_branch(self, branch_id: str, target_id: Optional[str] = None) -> bool:
-        """
-        Merge a branch back to its parent or specified target.
+        # Deactivate current
+        if self._active_branch_id in self.branches:
+            self.branches[self._active_branch_id].is_active = False
         
-        Summarize changes and add to target.
-        """
-        if branch_id not in self.branches:
-            return False
+        # Activate new
+        self._active_branch_id = branch_id
+        self.branches[branch_id].is_active = True
         
-        branch = self.branches[branch_id]
-        target = target_id or branch.parent_branch_id
-        
-        if not target or target not in self.branches:
-            return False
-        
-        target_branch = self.branches[target]
-        
-        # Create merge message with summary
-        merge_msg = {
-            "role": "system",
-            "content": f"[BRANCH MERGED] {branch.summary}\nExtensions created: {', '.join(branch.extensions_created)}\nMessages added: {len(branch.messages) - len(target_branch.messages)}",
-            "timestamp": datetime.now().isoformat(),
-        }
-        
-        target_branch.messages.append(merge_msg)
-        
-        # Deactivate source branch
-        branch.is_active = False
-        
-        # Switch to target
-        self.active_branch_id = target
-        
-        return True
+        logger.info(f"Switched to branch: {branch_id}")
+        return self.branches[branch_id]
     
     def get_branch_tree(self) -> Dict[str, Any]:
-        """Get tree structure of all branches."""
-        def build_tree(branch_id: str, depth: int = 0) -> Dict[str, Any]:
+        """Get hierarchical tree of all branches."""
+        # Build parent-child relationships
+        tree: Dict[str, List[str]] = {}
+        for branch in self.branches.values():
+            parent = branch.parent_branch_id or "root"
+            if parent not in tree:
+                tree[parent] = []
+            tree[parent].append(branch.branch_id)
+        
+        def build_node(branch_id: str, depth: int = 0) -> Dict[str, Any]:
             branch = self.branches.get(branch_id)
             if not branch:
-                return {"error": f"Branch {branch_id} not found"}
+                return {"id": branch_id, "missing": True}
             
-            children = [
-                build_tree(bid, depth + 1)
-                for bid, b in self.branches.items()
-                if b.parent_branch_id == branch_id
-            ]
-            
+            children = tree.get(branch_id, [])
             return {
                 "id": branch_id,
                 "summary": branch.summary,
+                "is_active": branch.is_active,
                 "depth": depth,
-                "is_active": branch_id == self.active_branch_id,
-                "message_count": len(branch.messages),
-                "extensions": branch.extensions_created,
-                "children": children,
+                "children": [build_node(child, depth + 1) for child in children],
             }
         
-        # Find root (no parent)
-        roots = [bid for bid, b in self.branches.items() if b.parent_branch_id is None]
+        # Find root branches (no parent or parent not in tree)
+        roots = [bid for bid, b in self.branches.items() 
+                if b.parent_branch_id is None or b.parent_branch_id not in self.branches]
         
         return {
-            "active_branch": self.active_branch_id,
+            "tree": [build_node(root) for root in roots],
+            "active_branch": self._active_branch_id,
             "total_branches": len(self.branches),
-            "tree": [build_tree(r) for r in roots],
         }
     
-    # ========== Agent Interface ==========
+    def add_message_to_branch(self, role: str, content: str, metadata: Optional[Dict] = None) -> None:
+        """Add a message to the current branch."""
+        if not self._active_branch_id:
+            return
+        
+        branch = self.branches.get(self._active_branch_id)
+        if not branch:
+            return
+        
+        branch.messages.append({
+            "role": role,
+            "content": content,
+            "timestamp": datetime.now().isoformat(),
+            "metadata": metadata or {},
+        })
     
-    def get_system_prompt(self) -> str:
-        """
-        Generate system prompt explaining the SimplifiedAgant-style architecture.
-        """
-        extensions_list = ", ".join(self.extensions.keys()) or "none yet"
+    def get_branch_context(self, branch_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Get conversation context for a branch."""
+        target_id = branch_id or self._active_branch_id
+        if not target_id or target_id not in self.branches:
+            return []
         
-        return f"""You are an AI agent with simplified_agent-style architecture.
-
-## Your Core Tools (ALWAYS available)
-1. **read(path, offset=0, limit=100)** - Read file contents
-2. **write(path, content, append=False)** - Write or append to file
-3. **edit(path, old_string, new_string)** - Replace text in file
-4. **bash(command, timeout=60)** - Execute shell command
-
-## Your Extensions (self-written skills)
-Currently loaded: {extensions_list}
-
-You can create new extensions by writing Python code:
-```python
-# Example extension: calculator
-def execute(expression: str):
-    import math
-    try:
-        result = eval(expression, {{"__builtins__": {{}}}}, math.__dict__)
-        return {{"result": result}}
-    except Exception as e:
-        return {{"error": str(e)}}
-```
-
-## Session Tree
-You can branch sessions to experiment without risk:
-- Current branch: {self.active_branch_id}
-- Total branches: {len(self.branches)}
-- Use: branch_session(summary="experiment with X")
-
-## Hot Reload
-Extensions can be modified and reloaded instantly.
-Use: hot_reload(extension_name="my_extension")
-
-## Philosophy
-"Software building software" - you maintain your own functionality.
-Write code to extend yourself. Throw away what doesn't work.
-No pre-built extensions; hand-crafted to user specifications.
-
-## Response Format
-When you want to use a tool, output:
-<tool>TOOL_NAME</tool>
-<param1>value1</param1>
-
-Example:
-<tool>read</tool>
-<path>./main.py</path>
-<limit>50</limit>
-"""
-    
-    async def chat(
-        self,
-        user_message: str,
-        llm_client: Any,  # LollmsClient or similar
-        streaming_callback: Optional[Callable[[str], bool]] = None,
-    ) -> str:
-        """
-        Process a chat message with SimplifiedAgant-style tool loop.
-        """
-        # Add to active branch
-        if self.active_branch_id:
-            branch = self.branches[self.active_branch_id]
-            branch.messages.append({
-                "role": "user",
-                "content": user_message,
-                "timestamp": datetime.now().isoformat(),
-            })
+        # Collect messages from this branch and ancestors
+        context = []
+        current_id = target_id
         
-        # Build messages for LLM
-        messages = [
-            {"role": "system", "content": self.get_system_prompt()},
-        ]
-        
-        # Add branch history
-        if self.active_branch_id:
-            branch = self.branches[self.active_branch_id]
-            messages.extend(branch.messages[-10:])  # Last 10 messages
-        
-        # Generate response
-        response = llm_client.generate_text(
-            prompt=messages[-1]["content"] if messages else user_message,
-            temperature=0.7,
-        )
-        
-        # Parse and execute tools
-        final_response, tools_used = await self._parse_and_execute_tools(response)
-        
-        # Add to branch
-        if self.active_branch_id:
-            branch = self.branches[self.active_branch_id]
-            branch.messages.append({
-                "role": "assistant",
-                "content": final_response,
-                "tools_used": tools_used,
-                "timestamp": datetime.now().isoformat(),
-            })
-        
-        return final_response
-    
-    async def _parse_and_execute_tools(self, llm_response: str) -> Tuple[str, List[str]]:
-        """Parse tool calls from LLM response and execute them."""
-        tools_used = []
-        
-        # Find all tool calls
-        tool_pattern = r'<tool>(\w+)</tool>'
-        param_pattern = r'<(\w+)>(.*?)</\1>'
-        
-        # Simple iterative approach
-        max_iterations = 5
-        current_response = llm_response
-        
-        for _ in range(max_iterations):
-            tool_match = re.search(tool_pattern, current_response, re.DOTALL)
-            if not tool_match:
+        while current_id:
+            branch = self.branches.get(current_id)
+            if not branch:
                 break
             
-            tool_name = tool_match.group(1).lower()
+            # Add this branch's messages (newest first for prepending)
+            for msg in reversed(branch.messages):
+                context.insert(0, msg)
             
-            # Find params after this tool tag
-            remaining = current_response[tool_match.end():]
-            
-            # Extract params until next tool or end
-            params = {}
-            for param_match in re.finditer(param_pattern, remaining):
-                param_name = param_match.group(1)
-                param_value = param_match.group(2)
-                
-                # Stop if we hit another tool tag
-                if param_name == "tool":
-                    break
-                
-                params[param_name] = param_value
-            
-            # Execute tool
-            result = await self.execute_core_tool(tool_name, **params)
-            tools_used.append(tool_name)
-            
-            # Replace tool call with result indicator
-            # Find end of this tool block
-            block_end = tool_match.end()
-            for param_match in re.finditer(param_pattern, remaining):
-                if param_match.group(1) == "tool":
-                    break
-                block_end = param_match.end()
-            
-            result_indicator = f"\n[Tool {tool_name}: {'success' if result.success else 'failed'}]\n"
-            if result.output:
-                result_indicator += f"Output: {str(result.output)[:200]}\n"
-            
-            current_response = (
-                current_response[:tool_match.start()] +
-                result_indicator +
-                current_response[block_end:]
-            )
+            current_id = branch.parent_branch_id
         
-        return current_response.strip(), tools_used
+        return context
+    
+    # ========== TUI COMPONENTS ==========
+    
+    def show_progress(
+        self,
+        task_id: str,
+        description: str = "Processing...",
+        total: Optional[int] = None,
+    ) -> Any:
+        """Show a progress bar (if TUI enabled)."""
+        if not self.enable_tui or not self.console:
+            return None
+        
+        if task_id in self._progress_bars:
+            # Update existing
+            progress = self._progress_bars[task_id]
+            return progress
+        
+        # Create new progress bar
+        progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            transient=True,
+        )
+        
+        task = progress.add_task(description, total=total)
+        self._progress_bars[task_id] = progress
+        
+        return progress
+    
+    def update_progress(
+        self,
+        task_id: str,
+        advance: int = 1,
+        description: Optional[str] = None,
+    ) -> None:
+        """Update progress bar."""
+        if not self.enable_tui or task_id not in self._progress_bars:
+            return
+        
+        progress = self._progress_bars[task_id]
+        for task in progress.tasks:
+            if description:
+                progress.update(task.id, advance=advance, description=description)
+            else:
+                progress.update(task.id, advance=advance)
+    
+    def finish_progress(self, task_id: str) -> None:
+        """Complete and remove progress bar."""
+        if task_id in self._progress_bars:
+            del self._progress_bars[task_id]
+    
+    def show_spinner(self, message: str = "Loading...") -> Any:
+        """Show a spinner (if TUI enabled)."""
+        if not self.enable_tui or not self.console:
+            return None
+        
+        return self.console.status(f"[bold green]{message}")
+    
+    def display_code(self, code: str, language: str = "python") -> None:
+        """Display syntax-highlighted code."""
+        if not self.enable_tui or not self.console:
+            print(code)
+            return
+        
+        syntax = Syntax(code, language, theme="monokai", line_numbers=True)
+        self.console.print(Panel(syntax, border_style="green"))
+    
+    def display_table(self, data: List[Dict[str, Any]], title: str = "") -> None:
+        """Display data as a table."""
+        if not self.enable_tui or not self.console or not data:
+            # Fallback to simple print
+            for row in data:
+                print(row)
+            return
+        
+        table = Table(title=title, box=box.ROUNDED)
+        
+        # Add columns
+        for key in data[0].keys():
+            table.add_column(key, style="cyan")
+        
+        # Add rows
+        for row in data:
+            table.add_row(*[str(v) for v in row.values()])
+        
+        self.console.print(table)
+    
+    def display_tree(self, data: Dict[str, Any], title: str = "Tree") -> None:
+        """Display hierarchical data as a tree."""
+        if not self.enable_tui or not self.console:
+            self._print_tree_fallback(data, title)
+            return
+        
+        tree = Tree(f"[bold]{title}[/]")
+        self._build_rich_tree(tree, data)
+        self.console.print(tree)
+    
+    def _build_rich_tree(self, parent: Any, node: Dict[str, Any]) -> None:
+        """Recursively build rich tree."""
+        if "children" in node and node["children"]:
+            for child in node["children"]:
+                child_node = parent.add(f"{child.get('id', 'unknown')}: {child.get('summary', '')[:40]}")
+                self._build_rich_tree(child_node, child)
+    
+    def _print_tree_fallback(self, data: Dict[str, Any], title: str, indent: int = 0) -> None:
+        """Fallback tree printing without rich."""
+        prefix = "  " * indent
+        print(f"{prefix}{title}")
+        
+        if "tree" in data:
+            for node in data["tree"]:
+                self._print_tree_node(node, indent + 1)
+    
+    def _print_tree_node(self, node: Dict[str, Any], indent: int) -> None:
+        """Print tree node recursively."""
+        prefix = "  " * indent
+        marker = "● " if node.get("is_active") else "○ "
+        print(f"{prefix}{marker}{node.get('id', 'unknown')}: {node.get('summary', '')[:50]}")
+        
+        for child in node.get("children", []):
+            self._print_tree_node(child, indent + 1)
+    
+    # ========== SKILL VS TOOL DISTINCTION ==========
+    
+    def get_skill_instructions(self) -> str:
+        """
+        Explain Skills vs Tools distinction (OpenClaw concept).
+        
+        Tools: Loaded into LLM context (for the AI to use)
+        Skills: Agent-maintained functionality (no context overhead)
+        """
+        return """
+╔══════════════════════════════════════════════════════════════════╗
+║  SKILLS vs TOOLS - OpenClaw Architecture                        ║
+╠══════════════════════════════════════════════════════════════════╣
+
+TOOLS (LLM Context):
+  • What the AI sees and can directly invoke
+  • 4 minimal tools: read, write, edit, bash
+  • Extensions you create become tools after /reload
+
+SKILLS (Agent-Maintained):
+  • Functionality the agent manages internally
+  • No context overhead - not shown to LLM
+  • Examples:
+    - Browser automation via CDP
+    - Code review workflows
+    - Session management
+    - File change tracking
+
+KEY DIFFERENCE:
+  Tools = "I can call this now" (immediate execution)
+  Skills = "I know how to do this" (managed capability)
+
+When you need new functionality:
+  1. Can it be a Tool? → Write extension code with write/edit
+  2. Can it be a Skill? → Agent manages it internally
+  3. Complex? → Compose Tools + Skills
+
+The agent writes Skills through code - this is the OpenClaw way!
+        """.strip()
+    
+    # ========== INTEGRATION WITH AGENT ==========
+    
+    def get_system_prompt_addon(self) -> str:
+        """Get system prompt addon for SimplifiedAgant mode."""
+        lines = [
+            "",
+            "=" * 70,
+            "SIMPLIFIEDAGANT MODE ACTIVE - OpenClaw Architecture",
+            "=" * 70,
+            "",
+            MinimalToolSet.get_tool_instructions(),
+            "",
+            self.get_skill_instructions(),
+            "",
+            "CURRENT EXTENSIONS:",
+        ]
+        
+        if self.extensions:
+            for name, ext in self.extensions.items():
+                status_icon = "✅" if ext.status == ExtensionStatus.ACTIVE else "⚠️"
+                lines.append(f"  {status_icon} {name} v{ext.version} - {ext.description[:50]}...")
+        else:
+            lines.append("  (No extensions yet - create one with the write tool!)")
+        
+        lines.extend([
+            "",
+            "BRANCH INFORMATION:",
+            f"  Active branch: {self._active_branch_id or 'none'}",
+            f"  Total branches: {len(self.branches)}",
+        ])
+        
+        if self.branches:
+            lines.append("  Use /branch to create new experimental branch")
+        
+        lines.extend([
+            "",
+            "=" * 70,
+        ])
+        
+        return "\n".join(lines)

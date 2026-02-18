@@ -36,6 +36,7 @@ class ProjectMemoryTool(Tool):
                 "type": "string",
                 "enum": [
                     "create_project",
+                    "find_or_open_project",  # Most common - use for 'open [name]'
                     "load_project",
                     "unload_project",
                     "delete_project",
@@ -46,12 +47,11 @@ class ProjectMemoryTool(Tool):
                     "unload_segment",
                     "add_to_segment",
                     "promote_to_global",
-                    "query_memory",
+                    "query_memory",  # Query within current/active project
                     "search_all_projects",
                     "get_active_context",
-                    "find_or_open_project",
                 ],
-                "description": "The operation to perform. Use 'find_or_open_project' when user says 'open [project name]' - it will find existing or create new.",
+                "description": "The operation to perform. Common: 'find_or_open_project' (opens existing or creates new), 'query_memory' (search within project), 'list_projects' (see all).",
             },
             "project_id": {
                 "type": "string",
@@ -126,6 +126,19 @@ class ProjectMemoryTool(Tool):
         operation = params.get("operation")
         logger.info(f"Operation: {operation}")
         
+        # Handle common LLM mistakes - map similar operations
+        operation_aliases = {
+            "query_project": "query_memory",  # LLM often says query_project
+            "search_project": "query_memory",
+            "find_in_project": "query_memory",
+        }
+        
+        # Normalize operation name
+        normalized_op = operation_aliases.get(operation, operation)
+        if normalized_op != operation:
+            logger.info(f"Normalized operation '{operation}' -> '{normalized_op}'")
+            operation = normalized_op
+        
         try:
             if operation == "create_project":
                 return await self._create_project(params)
@@ -158,10 +171,17 @@ class ProjectMemoryTool(Tool):
             elif operation == "find_or_open_project":
                 return await self._find_or_open_project(params)
             else:
+                # Provide helpful error with available operations
+                available_ops = [
+                    "create_project", "find_or_open_project", "load_project", "unload_project",
+                    "delete_project", "list_projects", "get_project_details",
+                    "create_segment", "load_segment", "unload_segment", "add_to_segment",
+                    "query_memory", "promote_to_global", "search_all_projects", "get_active_context"
+                ]
                 return ToolResult(
                     success=False,
-                    output=None,
-                    error=f"Unknown operation: {operation}",
+                    output={"available_operations": available_ops},
+                    error=f"Unknown operation: '{operation}'. Available operations: {', '.join(available_ops)}. Did you mean 'query_memory'?",
                 )
         
         except Exception as e:
@@ -174,20 +194,36 @@ class ProjectMemoryTool(Tool):
     
     def _resolve_project_id(self, project_id: str) -> Optional[str]:
         """Resolve 'current' to active project ID."""
+        if self._project_memory is None:
+            return None
         if project_id == "current":
             return self._project_memory._active_project_id
         return project_id
     
     async def _create_project(self, params: Dict[str, Any]) -> ToolResult:
         """Create a new project."""
+        import logging
+        logger = logging.getLogger(__name__)
+        
         name = params.get("name") or params.get("project_name")
         description = params.get("description", "")
         
-        # Debug logging
-        import logging
-        logger = logging.getLogger(__name__)
         logger.info(f"_create_project called with params: {params}")
         logger.info(f"Extracted name: '{name}'")
+        
+        # CRITICAL FIX: Handle case where name might be in other parameters
+        if not name:
+            reserved_keys = {
+                'operation', 'project_id', 'description', 'content',
+                'segment_name', 'segment_type', 'segment_id', 'query',
+                'importance', 'auto_create'
+            }
+            for key, value in params.items():
+                if isinstance(value, str) and value.strip():
+                    if key not in reserved_keys:
+                        name = value.strip()
+                        logger.info(f"Using fallback project name from '{key}': {name[:50]}")
+                        break
         
         if not name:
             return ToolResult(
@@ -244,8 +280,14 @@ class ProjectMemoryTool(Tool):
     
     async def _load_project(self, params: Dict[str, Any]) -> ToolResult:
         """Load a project into active memory."""
+        import logging
+        logger = logging.getLogger(__name__)
+        
         # Try project_id first, then name/project_name as lookup
         project_id = params.get("project_id")
+        
+        logger.info(f"_load_project called with: project_id={project_id}, name={params.get('name')}")
+        
         if not project_id or project_id == "current":
             # Try to find by name
             name = params.get("name") or params.get("project_name")
@@ -256,35 +298,71 @@ class ProjectMemoryTool(Tool):
                 for proj in all_projects:
                     if proj.get("name", "").lower() == name_lower:
                         project_id = proj["id"]
+                        logger.info(f"Found project by name '{name}': {project_id}")
                         break
         
         project_id = self._resolve_project_id(project_id)
         
         if not project_id:
+            # List available projects in error
+            try:
+                all_projects = await self._project_memory.get_project_list()
+                project_names = [p.get("name", "unknown") for p in all_projects[:5]]
+            except Exception:
+                project_names = []
+            
+            return ToolResult(
+                success=False,
+                output={"available_projects": project_names},
+                error=f"No project ID provided and no active project. Use 'name' or 'project_name' to search by name. Available: {', '.join(project_names) if project_names else 'none'}",
+            )
+        
+        # Check if already loaded
+        if project_id in self._project_memory._projects:
+            project = self._project_memory._projects[project_id]
+            if project.status.name == "ACTIVE":
+                logger.info(f"Project {project_id} already active, refreshing...")
+                # Still reload to refresh content
+                pass
+        
+        try:
+            project = await self._project_memory.load_project(project_id, load_segments=True)
+            
+            # Also load project conversations if available
+            try:
+                await self._project_memory._load_project_conversations(project_id)
+            except Exception as e:
+                logger.warning(f"Could not load project conversations: {e}")
+            
+            active_segments = project.get_active_segments()
+            
+            return ToolResult(
+                success=True,
+                output={
+                    "project_id": project.project_id,
+                    "name": project.name,
+                    "description": project.description,
+                    "status": "loaded",
+                    "active_segments": [
+                        {
+                            "id": seg.segment_id,
+                            "type": seg.segment_type,
+                            "description": seg.description,
+                            "chunks": len(seg.chunk_ids),
+                        }
+                        for seg in active_segments
+                    ],
+                    "total_chunks": project.total_chunks,
+                },
+            )
+            
+        except Exception as e:
+            logger.exception(f"Failed to load project {project_id}: {e}")
             return ToolResult(
                 success=False,
                 output=None,
-                error="No project ID provided and no active project. Use 'name' or 'project_name' to search by name.",
+                error=f"Failed to load project: {str(e)}",
             )
-        
-        project = await self._project_memory.load_project(project_id)
-        
-        return ToolResult(
-            success=True,
-            output={
-                "project_id": project.project_id,
-                "name": project.name,
-                "status": "loaded",
-                "active_segments": [
-                    {
-                        "id": seg.segment_id,
-                        "type": seg.segment_type,
-                        "description": seg.description,
-                    }
-                    for seg in project.get_active_segments()
-                ],
-            },
-        )
     
     async def _unload_project(self, params: Dict[str, Any]) -> ToolResult:
         """Unload active project."""
@@ -462,6 +540,13 @@ class ProjectMemoryTool(Tool):
     
     async def _promote_to_global(self, params: Dict[str, Any]) -> ToolResult:
         """Promote project content to global memory."""
+        if self._project_memory is None:
+            return ToolResult(
+                success=False,
+                output=None,
+                error="Project memory manager not initialized",
+            )
+        
         project_id = self._resolve_project_id(params.get("project_id", "current"))
         content = params.get("content")
         
@@ -488,29 +573,77 @@ class ProjectMemoryTool(Tool):
     
     async def _query_memory(self, params: Dict[str, Any]) -> ToolResult:
         """Query memory within a specific project."""
+        import logging
+        logger = logging.getLogger(__name__)
+        
         project_id = self._resolve_project_id(params.get("project_id", "current"))
         query = params.get("query")
         
-        if not project_id or not query:
+        logger.info(f"_query_memory: project_id={project_id}, query={query[:50] if query else 'None'}...")
+        
+        if not project_id:
+            # Try to get active project info
+            active_id = self._project_memory._active_project_id if self._project_memory else None
+            if active_id:
+                project_id = active_id
+                logger.info(f"Using active project: {project_id}")
+            else:
+                return ToolResult(
+                    success=False,
+                    output={"active_project": active_id},
+                    error="No project specified and no active project. Create or load a project first, or use search_all_projects for global search.",
+                )
+        
+        if not query:
             return ToolResult(
                 success=False,
                 output=None,
-                error="Project ID and query required",
+                error="Query string required. What are you looking for?",
             )
+        
+        # Check if project exists
+        if project_id not in self._project_memory._projects:
+            available = list(self._project_memory._projects.keys())[:5]
+            return ToolResult(
+                success=False,
+                output={
+                    "requested_project": project_id,
+                    "available_projects": available,
+                },
+                error=f"Project '{project_id}' not found. Available: {', '.join(available) if available else 'none'}. Use list_projects to see all.",
+            )
+        
+        # Get project details for context
+        project = self._project_memory._projects[project_id]
+        logger.info(f"Querying project '{project.name}' with {len(project.segments)} segments")
         
         results = await self._project_memory.query_project_memory(
             project_id=project_id,
             query=query,
-            include_inactive=params.get("include_inactive", False),
+            include_inactive=params.get("include_inactive", True),  # Default to true for better UX
         )
+        
+        # Include segment info in response
+        segment_info = {
+            seg_id: {
+                "type": seg.segment_type,
+                "description": seg.description,
+                "chunks": len(seg.chunk_ids),
+            }
+            for seg_id, seg in project.segments.items()
+        }
         
         return ToolResult(
             success=True,
             output={
                 "query": query,
                 "project_id": project_id,
+                "project_name": project.name,
+                "project_description": project.description,
+                "segments": segment_info,
                 "results": results,
                 "count": len(results),
+                "total_project_chunks": project.total_chunks,
             },
         )
     
@@ -538,6 +671,13 @@ class ProjectMemoryTool(Tool):
     
     async def _get_active_context(self) -> ToolResult:
         """Get complete active memory context."""
+        if self._project_memory is None:
+            return ToolResult(
+                success=False,
+                output=None,
+                error="Project memory manager not initialized",
+            )
+        
         context = await self._project_memory.get_active_memory_context()
         
         return ToolResult(
@@ -550,57 +690,122 @@ class ProjectMemoryTool(Tool):
         Find existing project by name (fuzzy match) or create new one.
         Implements 'open project' semantics - checks existence first.
         """
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        # Debug: log what we received
+        logger.info(f"_find_or_open_project params: {params}")
+        
         # Accept both 'name' and 'project_name' for flexibility
         name = params.get("name") or params.get("project_name")
+        
+        # Handle case where value might be in a list or other container
+        if isinstance(name, (list, tuple)) and len(name) > 0:
+            name = name[0]
+        if isinstance(name, dict) and 'name' in name:
+            name = name['name']
+        
+        # CRITICAL FIX: Check for name in various fallback locations
+        # This handles cases where LLM generates malformed XML
+        if not name:
+            # Check all string parameters that could be the project name
+            reserved_keys = {
+                'operation', 'project_id', 'description', 'content',
+                'segment_name', 'segment_type', 'segment_id', 'query',
+                'importance', 'auto_create', 'segment_id', 'project_name'
+            }
+            
+            for key, value in params.items():
+                if isinstance(value, str) and value.strip():
+                    if key not in reserved_keys:
+                        # This might be the project name passed as raw text
+                        name = value.strip()
+                        logger.info(f"Using fallback project name from '{key}': {name[:50]}")
+                        break
+        
         if not name:
             return ToolResult(
                 success=False,
                 output=None,
-                error="Project name required for find_or_open_project (use 'name' or 'project_name' parameter)",
+                error=f"Project name required for find_or_open_project (use 'name' or 'project_name' parameter). Received params: {list(params.keys())}. Example: <name>Bit Flip</name>",
             )
         
-        # First, list all projects and search for match
-        all_projects = await self._project_memory.get_project_list()
+        # Rest of the method continues...
+        # Check if project already exists
+        import hashlib
+        project_id = f"proj_{hashlib.sha256(name.encode()).hexdigest()[:16]}"
         
-        # Case-insensitive exact match first
+        # Search by name for exact or fuzzy match
+        all_projects = await self._project_memory.get_project_list()
         name_lower = name.lower()
+        
         for proj in all_projects:
             if proj.get("name", "").lower() == name_lower:
-                # Found exact match - load it
+                # Found exact match - load it WITH FULL CONTEXT
                 project_id = proj["id"]
-                loaded = await self._project_memory.load_project(project_id)
-                return ToolResult(
-                    success=True,
-                    output={
-                        "action": "loaded_existing",
-                        "project_id": project_id,
-                        "name": loaded.name,
-                        "description": loaded.description,
-                        "status": "loaded",
-                        "message": f"Opened existing project '{loaded.name}'",
-                        "segments": [
-                            {
-                                "id": seg.segment_id,
-                                "type": seg.segment_type,
-                                "description": seg.description,
-                            }
-                            for seg in loaded.get_active_segments()
-                        ],
-                    },
-                )
+                try:
+                    # CRITICAL: Load with full segments and conversations
+                    loaded = await self._project_memory.load_project(project_id, load_segments=True)
+                    
+                    # Also load all conversation history for this project
+                    await self._project_memory._load_project_conversations(project_id)
+                    
+                    # Get loaded segment details
+                    active_segments = loaded.get_active_segments()
+                    segment_details = [
+                        {
+                            "id": seg.segment_id,
+                            "type": seg.segment_type,
+                            "description": seg.description,
+                            "chunk_count": len(seg.chunk_ids),
+                        }
+                        for seg in active_segments
+                    ]
+                    
+                    # Include content preview from first loaded segment
+                    content_preview = ""
+                    if active_segments:
+                        first_seg = active_segments[0]
+                        if first_seg.chunk_ids:
+                            try:
+                                chunk = await self._project_memory._memory._db.get_chunk(first_seg.chunk_ids[0])
+                                if chunk:
+                                    content_preview = chunk.get("summary", "")[:200]
+                            except Exception:
+                                pass
+                    
+                    return ToolResult(
+                        success=True,
+                        output={
+                            "action": "loaded_existing",
+                            "project_id": project_id,
+                            "name": loaded.name,
+                            "description": loaded.description,
+                            "status": "loaded_with_full_context",
+                            "message": f"Opened existing project '{loaded.name}' with {len(active_segments)} active segments",
+                            "segments": segment_details,
+                            "content_preview": content_preview,
+                            "total_chunks": loaded.total_chunks,
+                        },
+                    )
+                except Exception as e:
+                    return ToolResult(
+                        success=False,
+                        output=None,
+                        error=f"Failed to load project '{name}': {str(e)}",
+                    )
         
-        # No exact match - check for partial matches
+        # No existing project found - check for partial matches
         partial_matches = []
         for proj in all_projects:
             proj_name = proj.get("name", "").lower()
-            # Check if name is contained in project name or vice versa
             if name_lower in proj_name or proj_name in name_lower:
                 partial_matches.append(proj)
         
         if partial_matches:
-            # Return suggestions rather than creating
+            # Return suggestions
             return ToolResult(
-                success=False,  # Not a failure, but requires user choice
+                success=False,
                 output={
                     "action": "suggest_existing",
                     "requested_name": name,
@@ -614,10 +819,10 @@ class ProjectMemoryTool(Tool):
                     ],
                     "message": f"Did you mean one of these existing projects? Use load_project with the correct ID, or create_project to make a new '{name}' project.",
                 },
-                error=None,  # Not really an error, just needs user input
+                error=None,
             )
         
-        # No matches at all - create new project
+        # No matches - create new project
         description = params.get("description", f"Project: {name}")
         auto_create = params.get("auto_create", True)
         
@@ -633,24 +838,40 @@ class ProjectMemoryTool(Tool):
             )
         
         # Create new project
-        project = await self._project_memory.create_project(
-            name=name,
-            description=description,
-            initial_context=params.get("content"),
-        )
-        
-        # Auto-load the new project
-        await self._project_memory.load_project(project.project_id)
-        
-        return ToolResult(
-            success=True,
-            output={
-                "action": "created_new",
-                "project_id": project.project_id,
-                "name": project.name,
-                "description": project.description,
-                "status": "created_and_loaded",
-                "message": f"Created and opened new project '{project.name}'",
-                "segments": list(project.segments.keys()),
-            },
-        )
+        try:
+            project = await self._project_memory.create_project(
+                name=name,
+                description=description,
+                initial_context=params.get("content"),
+            )
+            
+            # Auto-load the new project with full context
+            await self._project_memory.load_project(project.project_id, load_segments=True)
+            
+            return ToolResult(
+                success=True,
+                output={
+                    "action": "created_new",
+                    "project_id": project.project_id,
+                    "name": project.name,
+                    "description": project.description,
+                    "status": "created_and_loaded",
+                    "message": f"Created and opened new project '{project.name}'",
+                    "segments": list(project.segments.keys()),
+                },
+            )
+            
+        except ValueError as e:
+            # Project already exists (race condition) or validation error
+            return ToolResult(
+                success=False,
+                output=None,
+                error=f"Cannot create project: {str(e)}",
+            )
+        except Exception as e:
+            logger.exception(f"Failed to create project: {e}")
+            return ToolResult(
+                success=False,
+                output=None,
+                error=f"Failed to create project '{name}': {str(e)}",
+            )

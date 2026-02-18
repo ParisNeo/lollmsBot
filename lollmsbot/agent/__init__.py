@@ -222,6 +222,41 @@ class Agent:
             self._logger.log(f"Could not register project memory tool: {e}", "yellow")
             import traceback
             self._logger.log(f"Traceback: {traceback.format_exc()}", "dim")
+
+        # Register search tools
+        try:
+            from lollmsbot.tools.search import get_search_tools, SearchManager
+
+            # Get search config from wizard config if available
+            search_config = None
+            try:
+                config_path = Path.home() / ".lollmsbot" / "config.json"
+                if config_path.exists():
+                    import json
+                    wizard_data = json.loads(config_path.read_text())
+                    search_config = wizard_data.get("search", {})
+            except Exception:
+                pass
+
+            search_manager = SearchManager(search_config)
+            search_tools = get_search_tools(search_config)
+
+            for tool in search_tools:
+                # Connect search manager
+                if hasattr(tool, 'set_search_manager'):
+                    tool.set_search_manager(search_manager)
+                # Connect agent for memory storage
+                tool._agent = self
+                await self.register_tool(tool)
+
+            status = search_manager.get_status()
+            available = [k for k, v in status.items() if v]
+            self._logger.log(f"✅ Search tools registered ({len(available)} providers: {', '.join(available)})", "green", "🔍")
+
+        except Exception as e:
+            self._logger.log(f"Search tools not available: {e}", "yellow")
+            import traceback
+            self._logger.log(f"Traceback: {traceback.format_exc()}", "dim")
         
         # Initialize simplified_agent integration
         try:
@@ -327,6 +362,9 @@ class Agent:
         """
         Multi-step memory retrieval with progressive refinement.
         
+        Loads memories up to 60% of configured context size to leave
+        room for system prompt, conversation history, and response generation.
+        
         Performs multiple "inner turns" of memory searching:
         1. Initial broad search for context
         2. Follow-up targeted searches based on initial findings
@@ -339,6 +377,20 @@ class Agent:
         seen_chunks: Set[str] = set()
         search_iterations: int = 0
         max_iterations: int = 3  # Allow multiple search passes
+        
+        # Get context size from config and calculate safe loading limit
+        from lollmsbot.config import LollmsSettings
+        settings = LollmsSettings.from_env()
+        context_size = settings.context_size or 4096
+        max_memory_chars = int(context_size * 4 * 0.6)  # ~4 chars/token, 60% limit
+        
+        self._logger.log(
+            f"🧠 Memory budget: {max_memory_chars:,} chars (~{context_size:,} tokens × 4 × 60%)",
+            "cyan"
+        )
+        
+        # Track memory usage
+        total_loaded_chars: int = 0
         
         # Start with the original query
         current_queries: List[str] = [query]
@@ -393,6 +445,14 @@ class Agent:
             new_entities_from_content: Set[str] = set()
             
             for chunk, score in load_candidates:
+                # Check memory budget before loading
+                if total_loaded_chars >= max_memory_chars:
+                    self._logger.log(
+                        f"⏹️ Memory budget reached: {total_loaded_chars:,}/{max_memory_chars:,} chars",
+                        "yellow"
+                    )
+                    break
+                
                 try:
                     content = chunk.decompress_content()
                     
@@ -418,6 +478,15 @@ class Agent:
                     # Determine how much to load based on content type and score
                     load_size = self._determine_load_size(chunk, score)
                     
+                    # Respect memory budget
+                    remaining_budget = max_memory_chars - total_loaded_chars
+                    if load_size > remaining_budget:
+                        load_size = remaining_budget
+                        self._logger.log(
+                            f"📉 Truncated load to fit budget: {load_size:,} chars",
+                            "dim"
+                        )
+                    
                     # Build rich content object
                     content_obj = {
                         "chunk_id": chunk.chunk_id,
@@ -432,6 +501,10 @@ class Agent:
                         "created_at": chunk.created_at.isoformat() if chunk.created_at else None,
                     }
                     
+                    # Track memory usage
+                    content_chars = len(content_obj["content"])
+                    total_loaded_chars += content_chars
+                    
                     # Add full content to anchor cache for potential follow-up
                     self._anchor_cache[chunk.chunk_id] = content
                     
@@ -443,15 +516,24 @@ class Agent:
                     
                     self._logger.log(
                         f"📥 Loaded: {chunk.chunk_id[:16]}... ({content_obj['type']}, "
-                        f"score={score:.1f}, imp={chunk.memory_importance:.1f}, {len(content)} chars)",
+                        f"score={score:.1f}, imp={chunk.memory_importance:.1f}, {content_chars:,} chars, "
+                        f"budget: {total_loaded_chars:,}/{max_memory_chars:,})",
                         "green"
                     )
+                    
+                    # Check if we've hit budget after this load
+                    if total_loaded_chars >= max_memory_chars:
+                        self._logger.log(
+                            f"⏹️ Memory budget exhausted: {total_loaded_chars:,}/{max_memory_chars:,} chars",
+                            "yellow"
+                        )
+                        break
                     
                 except Exception as e:
                     self._logger.log(f"Failed to load {chunk.chunk_id}: {e}", "yellow")
             
-            # Prepare next iteration queries
-            if search_iterations < max_iterations:
+            # Prepare next iteration queries (only if we have budget)
+            if search_iterations < max_iterations and total_loaded_chars < max_memory_chars:
                 # Generate follow-up queries from new entities
                 next_queries: List[str] = []
                 
@@ -481,12 +563,17 @@ class Agent:
             else:
                 current_queries = []
         
-        # Final enrichment: find related memories for loaded content
-        if loaded_content:
-            await self._enrich_with_related_memories(memory, loaded_content, seen_chunks)
+        # Final enrichment: find related memories for loaded content (respect budget)
+        if loaded_content and total_loaded_chars < max_memory_chars * 0.9:  # Only if we have 10% headroom
+            await self._enrich_with_related_memories(memory, loaded_content, seen_chunks, max_memory_chars - total_loaded_chars)
+        
+        # Calculate usage percentage
+        usage_pct = (total_loaded_chars / max_memory_chars * 100) if max_memory_chars > 0 else 0
         
         self._logger.log(
-            f"✅ Memory retrieval complete: {len(loaded_content)} chunks after {search_iterations} iterations",
+            f"✅ Memory retrieval complete: {len(loaded_content)} chunks, "
+            f"{total_loaded_chars:,}/{max_memory_chars:,} chars ({usage_pct:.1f}%) "
+            f"after {search_iterations} iterations",
             "green" if loaded_content else "yellow"
         )
         
@@ -572,8 +659,12 @@ class Agent:
         memory: RLMMemoryManager,
         loaded_content: List[Dict[str, Any]],
         seen_chunks: Set[str],
+        remaining_budget: int = 0,
     ) -> None:
         """Find memories related to already-loaded content for cross-referencing."""
+        if remaining_budget <= 0:
+            return
+        
         # Extract key terms from loaded content
         all_text = " ".join([c["content"][:500] for c in loaded_content])
         key_terms = self._extract_key_terms(all_text)
@@ -591,9 +682,15 @@ class Agent:
             )
             
             added = 0
+            used_chars = 0
+            
             for chunk, score in related:
                 if chunk.chunk_id in seen_chunks:
                     continue
+                
+                # Check remaining budget
+                if used_chars >= remaining_budget:
+                    break
                 
                 # Only add if strongly related
                 if score < 4.0:
@@ -604,17 +701,23 @@ class Agent:
                     if len(content) < 100:
                         continue
                     
+                    # Respect budget for related memories
+                    excerpt_size = min(3000, remaining_budget - used_chars)
+                    if excerpt_size <= 0:
+                        break
+                    
                     # Add as "related" reference
                     loaded_content.append({
                         "chunk_id": chunk.chunk_id,
                         "type": "related",
                         "title": f"Related: {chunk.summary or 'memory'}"[:50],
-                        "content": content[:3000],  # Smaller excerpt for related
+                        "content": content[:excerpt_size],
                         "full_length": len(content),
                         "score": score,
                         "relation_note": f"Related to main query (score: {score:.1f})",
                     })
                     
+                    used_chars += len(content[:excerpt_size])
                     seen_chunks.add(chunk.chunk_id)
                     added += 1
                     
@@ -625,7 +728,10 @@ class Agent:
                     continue
             
             if added > 0:
-                self._logger.log(f"📎 Added {added} related memories for cross-reference", "cyan")
+                self._logger.log(
+                    f"📎 Added {added} related memories ({used_chars:,} chars) for cross-reference",
+                    "cyan"
+                )
                 
         except Exception as e:
             self._logger.log(f"Related memory enrichment failed: {e}", "yellow")
@@ -906,8 +1012,48 @@ class Agent:
                 self._state = AgentState.IDLE
                 self._logger.log_state_change(old_state.name, AgentState.IDLE.name, "processing complete")
     
-    def _get_conversation_history(self, user_id: str) -> List[ConversationTurn]:
-        return self._recent_conversations.get(user_id, [])[-self._max_recent_history:]
+    async def _get_conversation_history(self, user_id: str) -> List[ConversationTurn]:
+        """Get conversation history from both in-memory cache and persistent storage."""
+        # Start with in-memory recent conversations
+        recent = self._recent_conversations.get(user_id, [])[-self._max_recent_history:]
+        
+        # If we have memory manager, also search EMS for older conversations
+        if self._memory and len(recent) < self._max_recent_history:
+            try:
+                # Search for conversation chunks from this user
+                results = await self._memory.search_ems(
+                    query=f"user_{user_id} conversation",
+                    chunk_types=[MemoryChunkType.CONVERSATION],
+                    limit=self._max_recent_history,
+                )
+                
+                # Convert chunks back to ConversationTurn objects
+                ems_turns = []
+                for chunk, score in results:
+                    try:
+                        content = chunk.decompress_content()
+                        data = json.loads(content)
+                        
+                        turn = ConversationTurn(
+                            user_message=data.get("user_message", ""),
+                            agent_response=data.get("agent_response", ""),
+                            tools_used=data.get("tools_used", []),
+                            timestamp=datetime.fromisoformat(data.get("timestamp", datetime.now().isoformat())),
+                            importance_score=chunk.memory_importance,
+                        )
+                        ems_turns.append(turn)
+                    except Exception:
+                        continue
+                
+                # Merge and sort by timestamp
+                all_turns = recent + ems_turns
+                all_turns.sort(key=lambda t: t.timestamp if hasattr(t, 'timestamp') else datetime.now())
+                return all_turns[-self._max_recent_history:]
+                
+            except Exception as e:
+                self._logger.log(f"Failed to load conversation history from EMS: {e}", "yellow")
+        
+        return recent
     
     def _format_history_for_prompt(self, history: List[ConversationTurn]) -> str:
         if not history:
@@ -1005,7 +1151,7 @@ class Agent:
         thinking_content: Optional[str] = None
         
         memory = await self._ensure_memory()
-        conversation_history = self._get_conversation_history(user_id)
+        conversation_history = await self._get_conversation_history(user_id)
         
         # Debug info
         try:
@@ -1845,8 +1991,8 @@ from lollmsbot.agent.simplified_agant_style import (
     SessionBranch,
 )
 from lollmsbot.agent.simplified_agant_integration import (
-    simplified_agentTool,
-    integrate_simplified_agent,
+    SimplifiedAgantTool,
+    integrate_simplified_agant,
 )
 
 __all__ = [
@@ -1872,6 +2018,6 @@ __all__ = [
     "MinimalToolSet",
     "CodeExtension",
     "SessionBranch",
-    "simplified_agentTool",
-    "integrate_simplified_agent",
+    "SimplifiedAgantTool",
+    "integrate_simplified_agant",
 ]
