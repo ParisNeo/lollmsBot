@@ -166,6 +166,12 @@ class RCBEntry:
             
             return f"[[MEMORY:{self.chunk_id}|{{\"type\": \"{self.entry_type}\", \"summary\": \"{summary}\"}}]]"
         
+        if self.entry_type == "current_time":
+            # Format current time prominently
+            return f"""╔══════════════════════════════════════════════════════════════════╗
+║  ⏰ {self.content.split(chr(10))[0].replace('CURRENT TIME: ', '')}                          ║
+╚══════════════════════════════════════════════════════════════════╝"""
+        
         return self.content
 
 

@@ -240,14 +240,34 @@ def main(argv: List[str] | None = None) -> None:
         elif args.command == "ui":
             # Run standalone UI with full rich output
             from lollmsbot.ui.app import WebUI
+            from lollmsbot.agent import Agent, PermissionLevel
+            from lollmsbot.config import BotConfig
+            import asyncio
             import uvicorn
             
             print_ui_banner()
             
-            ui = WebUI(verbose=not args.quiet)
-            ui.print_server_ready(args.host, args.port)
+            # Create agent for standalone UI mode
+            console.print("[yellow]Initializing agent for standalone UI...[/]")
+            
+            async def init_ui_agent():
+                config = BotConfig.from_env()
+                agent = Agent(
+                    config=config,
+                    name="LollmsBot",
+                    default_permissions=PermissionLevel.TOOLS,
+                    verbose_logging=True,
+                )
+                await agent.initialize(gateway_mode="standalone_ui", host_bindings=[f"{args.host}:{args.port}"])
+                return agent
             
             try:
+                agent = asyncio.run(init_ui_agent())
+                console.print(f"[green]✅ Agent initialized: {agent.name}[/]")
+                
+                ui = WebUI(agent=agent, verbose=not args.quiet)
+                ui.print_server_ready(args.host, args.port)
+                
                 uvicorn.run(
                     ui.app,
                     host=args.host,
@@ -256,6 +276,11 @@ def main(argv: List[str] | None = None) -> None:
                 )
             except KeyboardInterrupt:
                 ui._print_shutdown_message()
+            except Exception as e:
+                console.print(f"[red]❌ Failed to initialize UI: {e}[/]")
+                import traceback
+                console.print(f"[dim]{traceback.format_exc()}[/]")
+                sys.exit(1)
             
         elif args.command == "chat":
             # NEW: Console chat interface

@@ -114,6 +114,7 @@ class ProjectMemoryTool(Tool):
         logger = logging.getLogger(__name__)
         
         logger.info(f"ProjectMemoryTool.execute called with params: {list(params.keys())}")
+        logger.info(f"Full params: {params}")
         
         if self._project_memory is None:
             logger.error("Project memory manager not initialized")
@@ -125,6 +126,11 @@ class ProjectMemoryTool(Tool):
         
         operation = params.get("operation")
         logger.info(f"Operation: {operation}")
+        
+        # CRITICAL: Log the name parameter specifically to debug extraction issues
+        name_param = params.get("name")
+        project_name_param = params.get("project_name")
+        logger.info(f"Name param: '{name_param}', Project name param: '{project_name_param}'")
         
         # Handle common LLM mistakes - map similar operations
         operation_aliases = {
@@ -205,25 +211,63 @@ class ProjectMemoryTool(Tool):
         import logging
         logger = logging.getLogger(__name__)
         
+        # CRITICAL: Extract name from params - handle both 'name' and 'project_name'
         name = params.get("name") or params.get("project_name")
         description = params.get("description", "")
         
         logger.info(f"_create_project called with params: {params}")
         logger.info(f"Extracted name: '{name}'")
         
+        # Validate: name should not be the tool name or operation name
+        invalid_names = {'project_memory', 'create_project', 'find_or_open_project', 
+                        'load_project', 'unload_project', 'delete_project', 'list_projects',
+                        'get_project_details', 'create_segment', 'load_segment', 
+                        'unload_segment', 'add_to_segment', 'promote_to_global',
+                        'query_memory', 'search_all_projects', 'get_active_context',
+                        'project', 'memory', 'tool', 'operation'}
+        
+        # Also check if name contains these as substrings
+        def is_invalid_name(n: str) -> bool:
+            if not n:
+                return True
+            n_lower = n.lower().strip()
+            # Exact match
+            if n_lower in invalid_names:
+                return True
+            # Contains tool/operation names
+            if 'project_memory' in n_lower or 'create_project' in n_lower:
+                return True
+            # Too short or generic
+            if len(n_lower) < 2:
+                return True
+            return False
+        
+        if name and is_invalid_name(name):
+            logger.error(f"Invalid project name detected: '{name}' - this appears to be a tool/operation name, not a project name")
+            name = None
+        
         # CRITICAL FIX: Handle case where name might be in other parameters
         if not name:
             reserved_keys = {
                 'operation', 'project_id', 'description', 'content',
                 'segment_name', 'segment_type', 'segment_id', 'query',
-                'importance', 'auto_create'
+                'importance', 'auto_create', 'tool', 'method', 'url',
+                'project_memory', 'create_project'
             }
             for key, value in params.items():
                 if isinstance(value, str) and value.strip():
-                    if key not in reserved_keys:
+                    if key not in reserved_keys and not is_invalid_name(value.strip()):
                         name = value.strip()
                         logger.info(f"Using fallback project name from '{key}': {name[:50]}")
                         break
+        
+        # Final validation
+        if not name or is_invalid_name(name):
+            return ToolResult(
+                success=False,
+                output=None,
+                error=f"Could not extract valid project name from parameters. Received: {list(params.keys())}. Please provide a clear project name using <name>YourProjectName</name> tag.",
+            )
         
         if not name:
             return ToolResult(
@@ -286,20 +330,49 @@ class ProjectMemoryTool(Tool):
         # Try project_id first, then name/project_name as lookup
         project_id = params.get("project_id")
         
-        logger.info(f"_load_project called with: project_id={project_id}, name={params.get('name')}")
+        logger.info(f"_load_project called with: project_id={project_id}, name={params.get('name')}, project_name={params.get('project_name')}")
         
         if not project_id or project_id == "current":
-            # Try to find by name
+            # Try to find by name - check both 'name' and 'project_name' parameters
             name = params.get("name") or params.get("project_name")
+            logger.info(f"Looking up project by name: '{name}'")
+            
             if name and name != "current":
                 # Search for project by name
                 all_projects = await self._project_memory.get_project_list()
-                name_lower = name.lower()
+                logger.info(f"Available projects: {[p.get('name') for p in all_projects]}")
+                name_lower = name.lower().strip()
                 for proj in all_projects:
-                    if proj.get("name", "").lower() == name_lower:
+                    proj_name = proj.get("name", "").lower().strip()
+                    logger.info(f"Comparing '{name_lower}' with '{proj_name}'")
+                    if proj_name == name_lower:
                         project_id = proj["id"]
                         logger.info(f"Found project by name '{name}': {project_id}")
                         break
+                else:
+                    # No match found by name - try matching by ID prefix
+                    logger.info(f"No name match, trying ID prefix match for '{name}'")
+                    for proj in all_projects:
+                        if proj.get("id", "").lower().startswith(name_lower) or name_lower in proj.get("id", "").lower():
+                            project_id = proj["id"]
+                            logger.info(f"Found project by ID prefix '{name}': {project_id}")
+                            break
+        
+        # If we still don't have a project_id but have a name, 
+        # the project might not exist yet - don't resolve to "current"
+        if not project_id and name:
+            # Return error with available projects
+            try:
+                all_projects = await self._project_memory.get_project_list()
+                project_names = [p.get("name", "unknown") for p in all_projects[:5]]
+            except Exception:
+                project_names = []
+            
+            return ToolResult(
+                success=False,
+                output={"available_projects": project_names},
+                error=f"Project '{name}' not found. Available: {', '.join(project_names) if project_names else 'none'}. Use 'find_or_open_project' to create if missing.",
+            )
         
         project_id = self._resolve_project_id(project_id)
         
@@ -705,6 +778,31 @@ class ProjectMemoryTool(Tool):
         if isinstance(name, dict) and 'name' in name:
             name = name['name']
         
+        # Validate: name should not be the tool name or operation name
+        invalid_names = {'project_memory', 'create_project', 'find_or_open_project', 
+                        'load_project', 'unload_project', 'delete_project', 'list_projects',
+                        'get_project_details', 'create_segment', 'load_segment', 
+                        'unload_segment', 'add_to_segment', 'promote_to_global',
+                        'query_memory', 'search_all_projects', 'get_active_context',
+                        'project', 'memory', 'tool', 'operation'}
+        
+        # Also check if name contains these as substrings
+        def is_invalid_name(n: str) -> bool:
+            if not n:
+                return True
+            n_lower = n.lower().strip()
+            if n_lower in invalid_names:
+                return True
+            if 'project_memory' in n_lower or 'create_project' in n_lower or 'find_or_open' in n_lower:
+                return True
+            if len(n_lower) < 2:
+                return True
+            return False
+        
+        if name and is_invalid_name(name):
+            logger.error(f"Invalid project name detected: '{name}' - this appears to be a tool/operation name, not a project name")
+            name = None
+        
         # CRITICAL FIX: Check for name in various fallback locations
         # This handles cases where LLM generates malformed XML
         if not name:
@@ -712,22 +810,24 @@ class ProjectMemoryTool(Tool):
             reserved_keys = {
                 'operation', 'project_id', 'description', 'content',
                 'segment_name', 'segment_type', 'segment_id', 'query',
-                'importance', 'auto_create', 'segment_id', 'project_name'
+                'importance', 'auto_create', 'segment_id', 'project_name',
+                'tool', 'method', 'url', 'project_memory', 'create_project',
+                'find_or_open_project'
             }
             
             for key, value in params.items():
                 if isinstance(value, str) and value.strip():
-                    if key not in reserved_keys:
+                    if key not in reserved_keys and not is_invalid_name(value.strip()):
                         # This might be the project name passed as raw text
                         name = value.strip()
                         logger.info(f"Using fallback project name from '{key}': {name[:50]}")
                         break
         
-        if not name:
+        if not name or is_invalid_name(name):
             return ToolResult(
                 success=False,
                 output=None,
-                error=f"Project name required for find_or_open_project (use 'name' or 'project_name' parameter). Received params: {list(params.keys())}. Example: <name>Bit Flip</name>",
+                error=f"Could not extract valid project name from parameters. Received: {list(params.keys())}. Please provide a clear project name using <name>YourProjectName</name> tag.",
             )
         
         # Rest of the method continues...

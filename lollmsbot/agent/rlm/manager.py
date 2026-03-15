@@ -240,9 +240,16 @@ class RLMMemoryManager:
                 display_order=0,
             ))
             
+            # Add current time entry - ALWAYS present and updated
+            self._rcb_entries.append(RCBEntry(
+                entry_type="current_time",
+                content=self._get_current_time_content(),
+                display_order=1,
+            ))
+            
             # Load top self-knowledge into RCB
             self_knowledge = await self._db.get_self_knowledge()
-            for i, entry in enumerate(self_knowledge[:5], start=1):
+            for i, entry in enumerate(self_knowledge[:5], start=2):
                 # Find or create chunk for this knowledge
                 chunk_id = f"rcb_self_{entry.get('knowledge_id', 'unknown')}"
                 
@@ -254,6 +261,18 @@ class RLMMemoryManager:
                     chunk_id=chunk_id,
                     display_order=i,
                 ))
+    
+    def _get_current_time_content(self) -> str:
+        """Get current timestamp content for RCB."""
+        from datetime import datetime
+        now = datetime.now()
+        return f"""CURRENT TIME: {now.isoformat()}
+Date: {now.strftime('%Y-%m-%d')}
+Time: {now.strftime('%H:%M:%S')}
+Day: {now.strftime('%A')}
+Timezone: Local system time
+
+This timestamp is updated every interaction. Always reference this when answering time-sensitive questions."""
     
     def _get_system_prompt_fragment(self) -> str:
         """Get the system prompt fragment explaining RLM memory."""
@@ -660,6 +679,9 @@ The actual content will be provided in your context automatically."""
         
         This is what the LLM sees as its "working memory".
         """
+        # First, update the current time entry
+        self._update_current_time_in_rcb()
+        
         lines = []
         total_chars = 0
         
@@ -677,6 +699,14 @@ The actual content will be provided in your context automatically."""
             total_chars += len(formatted) + 1  # +1 for newline
         
         return "\n".join(lines) if lines else "[Working memory empty]"
+    
+    def _update_current_time_in_rcb(self) -> None:
+        """Update the current time entry in RCB with fresh timestamp."""
+        for entry in self._rcb_entries:
+            if entry.entry_type == "current_time":
+                entry.content = self._get_current_time_content()
+                entry.loaded_at = datetime.now()
+                break
     
     async def clear_rcb(self) -> None:
         """Clear all RCB entries (keeps system prompt)."""

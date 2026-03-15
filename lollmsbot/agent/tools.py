@@ -286,7 +286,12 @@ class ToolParser:
             # Additional cleanup: remove any remaining non-word characters
             tool_name = re.sub(r'[^\w]', '', tool_name)
             
+            # CRITICAL: The tool name should NOT be used as a parameter value
+            # Initialize tool_data with just the tool identifier
             tool_data = {"tool": tool_name}
+            
+            # Track that we've seen the tool tag so we don't confuse it with param values
+            tool_data["_tool_tag_seen"] = True
             
             # Find <method> if present
             method_match = re.search(self.XML_METHOD_PATTERN, remaining_text, re.IGNORECASE)
@@ -367,6 +372,42 @@ class ToolParser:
                 tool_data["data"] = data_match.group(1)
                 end_pos = max(end_pos, tool_match.end() + data_match.end())
             
+            # Find <name> if present (CRITICAL FIX for project_memory tool)
+            name_match = re.search(r'<name>([^<]+)</name>', remaining_text, re.IGNORECASE)
+            if name_match:
+                name_value = name_match.group(1).strip()
+                # Validate: name should not be the tool name or operation name
+                invalid_names = {'project_memory', 'create_project', 'find_or_open_project', 
+                                'load_project', 'unload_project', 'delete_project', 'list_projects',
+                                'get_project_details', 'create_segment', 'load_segment', 
+                                'unload_segment', 'add_to_segment', 'promote_to_global',
+                                'query_memory', 'search_all_projects', 'get_active_context',
+                                'project', 'memory', 'tool', 'operation'}
+                if name_value.lower() not in invalid_names and len(name_value) > 1:
+                    tool_data["name"] = name_value
+                    end_pos = max(end_pos, tool_match.end() + name_match.end())
+            
+            # Find <project_name> if present (alternative name parameter)
+            project_name_match = re.search(r'<project_name>([^<]+)</project_name>', remaining_text, re.IGNORECASE)
+            if project_name_match:
+                project_name_value = project_name_match.group(1).strip()
+                # Same validation
+                invalid_names = {'project_memory', 'create_project', 'find_or_open_project', 
+                                'load_project', 'unload_project', 'delete_project', 'list_projects',
+                                'get_project_details', 'create_segment', 'load_segment', 
+                                'unload_segment', 'add_to_segment', 'promote_to_global',
+                                'query_memory', 'search_all_projects', 'get_active_context',
+                                'project', 'memory', 'tool', 'operation'}
+                if project_name_value.lower() not in invalid_names and len(project_name_value) > 1:
+                    tool_data["project_name"] = project_name_value
+                    end_pos = max(end_pos, tool_match.end() + project_name_match.end())
+            
+            # Find <project_id> if present
+            project_id_match = re.search(r'<project_id>([^<]+)</project_id>', remaining_text, re.IGNORECASE)
+            if project_id_match:
+                tool_data["project_id"] = project_id_match.group(1).strip()
+                end_pos = max(end_pos, tool_match.end() + project_id_match.end())
+            
             # Calculate overall end position - include all related tags
             # Find the furthest tag end
             furthest_end = tool_match.end()
@@ -376,6 +417,8 @@ class ToolParser:
                 self.XML_HTML_CONTENT_PATTERN, self.XML_TITLE_PATTERN, self.XML_START_PATTERN,
                 self.XML_END_PATTERN, self.XML_DESCRIPTION_PATTERN, self.XML_DATA_PATTERN,
                 self.XML_HEADERS_PATTERN, self.XML_PARAMS_PATTERN,
+                r'<name>[^<]+</name>',  # Include name pattern
+                r'<project_name>[^<]+</project_name>',  # Include project_name pattern
             ]:
                 tag_match = re.search(tag_pattern, remaining_text, re.DOTALL | re.IGNORECASE)
                 if tag_match:

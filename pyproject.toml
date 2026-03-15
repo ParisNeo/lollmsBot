@@ -1,6 +1,6 @@
 [project]
 name = "lollmsbot"
-version = "0.0.3"
+version = "0.0.4"
 description = "LoLLMS-based personal AI assistant"
 authors = [{ name = "Your Name" }]
 requires-python = ">=3.10"

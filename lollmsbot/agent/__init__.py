@@ -10,7 +10,7 @@ with full text available via semantic anchors that describe memory contents.
 """
 
 from __future__ import annotations
-
+from pathlib import Path
 import asyncio
 import json
 import traceback
@@ -235,23 +235,35 @@ class Agent:
                     import json
                     wizard_data = json.loads(config_path.read_text())
                     search_config = wizard_data.get("search", {})
-            except Exception:
-                pass
+            except Exception as e:
+                self._logger.log(f"Could not load search config: {e}", "dim")
 
             search_manager = SearchManager(search_config)
             search_tools = get_search_tools(search_config)
+            
+            self._logger.log(f"🔍 Found {len(search_tools)} search tool(s) to register", "cyan")
 
+            registered_count = 0
             for tool in search_tools:
-                # Connect search manager
-                if hasattr(tool, 'set_search_manager'):
-                    tool.set_search_manager(search_manager)
-                # Connect agent for memory storage
-                tool._agent = self
-                await self.register_tool(tool)
+                try:
+                    # Connect search manager
+                    if hasattr(tool, 'set_search_manager'):
+                        tool.set_search_manager(search_manager)
+                        self._logger.log(f"  🔗 Connected search manager to {tool.name}", "dim")
+                    
+                    # Connect agent for memory storage
+                    tool._agent = self
+                    
+                    # Register the tool
+                    await self.register_tool(tool)
+                    registered_count += 1
+                    self._logger.log(f"  ✅ Registered: {tool.name}", "green")
+                except Exception as tool_e:
+                    self._logger.log(f"  ❌ Failed to register {tool.name}: {tool_e}", "yellow")
 
             status = search_manager.get_status()
             available = [k for k, v in status.items() if v]
-            self._logger.log(f"✅ Search tools registered ({len(available)} providers: {', '.join(available)})", "green", "🔍")
+            self._logger.log(f"✅ Search tools registered ({registered_count}/{len(search_tools)} tools, {len(available)} providers: {', '.join(available) if available else 'none'})", "green", "🔍")
 
         except Exception as e:
             self._logger.log(f"Search tools not available: {e}", "yellow")
@@ -1343,6 +1355,27 @@ class Agent:
         # Add conversation history
         if conversation_history:
             parts.append(self._format_history_for_prompt(conversation_history))
+        
+        # TOOL SELECTION GUIDANCE - CRITICAL for search triggering
+        parts.append("")
+        parts.append("=" * 60)
+        parts.append("🔍 WHEN TO USE SEARCH vs INTERNAL KNOWLEDGE")
+        parts.append("=" * 60)
+        parts.append("")
+        parts.append("You have access to internet search tools. USE THEM when:")
+        parts.append("  • User asks about current events, news, or recent developments")
+        parts.append("  • Question involves facts that change over time (prices, weather, scores)")
+        parts.append("  • User asks 'what is', 'who is', 'latest', 'current', 'today'")
+        parts.append("  • You need real-time or recent information")
+        parts.append("  • The answer requires data from after your training cutoff")
+        parts.append("  • ANY question about time-sensitive topics (sports, politics, tech, etc.)")
+        parts.append("")
+        parts.append("DO NOT guess or hallucinate facts. If unsure, ALWAYS search first.")
+        parts.append("The current timestamp is shown above - use it to judge time-sensitivity.")
+        parts.append("")
+        parts.append("To search: <tool>quick_search</tool> or <tool>internet_search</tool>")
+        parts.append("  <query>your search terms</query>")
+        parts.append("")
         
         # CRITICAL: Multi-step memory reasoning section
         if loaded_memories:

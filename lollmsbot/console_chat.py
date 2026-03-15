@@ -341,8 +341,9 @@ class ConsoleChat:
         # Update session
         self.session.message_count += 1
         
-        # Show thinking indicator
-        with self.console.status("[bold cyan]Thinking...[/]", spinner="dots") as status:
+        # Show thinking indicator and wait for complete result
+        result = None
+        with self.console.status("[bold cyan]Thinking...[/]", spinner="dots"):
             try:
                 result = await self.agent.chat(
                     user_id=self.session.user_id,
@@ -352,15 +353,17 @@ class ConsoleChat:
             except Exception as e:
                 self.console.print(f"[red]❌ Error: {e}[/]")
                 return
-        # Display response
-        self._display_response(result)
         
-        # Update session stats
-        if result.get("tools_used"):
-            self.session.tools_used.update(result["tools_used"])
-        
-        if result.get("files_to_send"):
-            self.session.files_generated.extend(result["files_to_send"])
+        # Display response only after thinking completes
+        if result:
+            self._display_response(result)
+            
+            # Update session stats
+            if result.get("tools_used"):
+                self.session.tools_used.update(result["tools_used"])
+            
+            if result.get("files_to_send"):
+                self.session.files_generated.extend(result["files_to_send"])
     
     def _display_response(self, result: Dict[str, Any]) -> None:
         """Display the agent response beautifully."""
