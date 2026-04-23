@@ -35,14 +35,51 @@ body {
     line-height: 1.6;
 }
 
-/* App Container */
+/* App Container - Enhanced for Artifacts */
 .app {
     display: grid;
-    grid-template-columns: 280px 1fr;
+    grid-template-columns: 280px 1fr auto; /* Third column for Artifacts */
     grid-template-rows: 60px 1fr;
     height: 100vh;
     max-height: 100vh;
     overflow: hidden;
+}
+
+/* Artifact Pane Styling */
+.artifact-pane {
+    width: 0; /* Hidden by default */
+    background: var(--bg-card);
+    border-left: 1px solid var(--border);
+    transition: width 0.3s ease-in-out;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+.artifact-pane.open {
+    width: 45vw; /* Takes nearly half the screen when work is being done */
+}
+
+.artifact-header {
+    padding: 12px 20px;
+    background: #1e293b;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.artifact-content {
+    flex: 1;
+    padding: 0;
+    overflow: auto;
+    background: white; /* Standard for rendering HTML work */
+}
+
+.artifact-iframe {
+    width: 100%;
+    height: 100%;
+    border: none;
 }
 
 /* Header */

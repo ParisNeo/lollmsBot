@@ -88,15 +88,15 @@ from lollmsbot.agent.project_memory import (
 
 # NEW: SimplifiedAgant Integration (when available)
 try:
-    from lollmsbot.openclaw_integration import SimplifiedAgantIntegration
+    from lollmsbot.agent.simplified_agant_integration import SimplifiedAgantIntegration
     from lollmsbot.crm import CRMManager, Contact, ContactRole
     from lollmsbot.knowledge_base import KnowledgeBaseManager, KnowledgeEntry
     from lollmsbot.task_manager import TaskManager, Task, TaskPriority
     from lollmsbot.youtube_analytics import YouTubeAnalyticsManager
     from lollmsbot.business_analysis import BusinessAnalysisCouncil, CouncilReport
-    OPENCLAW_AVAILABLE = True
+    SIMPLIFIED_AGENT_INTEGRATION_AVAILABLE = True
 except ImportError:
-    OPENCLAW_AVAILABLE = False
+    SIMPLIFIED_AGENT_INTEGRATION_AVAILABLE = False
 
 __all__ = [
     # Version
@@ -169,7 +169,7 @@ __all__ = [
 ]
 
 # Add SimplifiedAgant exports if available
-if OPENCLAW_AVAILABLE:
+if SIMPLIFIED_AGENT_INTEGRATION_AVAILABLE:
     __all__.extend([
         "SimplifiedAgantIntegration",
         "CRMManager",

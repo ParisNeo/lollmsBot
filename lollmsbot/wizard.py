@@ -57,15 +57,15 @@ class BindingInfo:
     default_model: Optional[str] = None
 
 
-# Binding registry - all available bindings
+# Binding registry - all available bindings with grounded default ports
 AVAILABLE_BINDINGS: Dict[str, BindingInfo] = {
     # Remote / SaaS bindings
     "lollms": BindingInfo(
         name="lollms",
         display_name="🔗 LoLLMS (Default)",
         category="remote",
-        description="LoLLMS WebUI - Local or remote LoLLMS server",
-        default_host="http://localhost:9600",
+        description="LoLLMS WebUI - Default port 9642",
+        default_host="http://localhost:9642",
         requires_api_key=False,  # Optional for local, required for remote
         supports_ssl_verify=True,
         default_model=None,
@@ -144,11 +144,51 @@ AVAILABLE_BINDINGS: Dict[str, BindingInfo] = {
         name="ollama",
         display_name="🦙 Ollama",
         category="local_server",
-        description="Ollama local LLM server",
+        description="Ollama local server - Default port 11434",
         default_host="http://localhost:11434",
-        requires_api_key=False,  # Local by default, key optional for proxy
-        supports_ssl_verify=False,  # Usually local
+        requires_api_key=False,
+        supports_ssl_verify=False,
         default_model="llama3.2",
+    ),
+    "lm_studio": BindingInfo(
+        name="lm_studio",
+        display_name="🎨 LM Studio",
+        category="local_server",
+        description="LM Studio local server - Default port 1234",
+        default_host="http://localhost:1234/v1",
+        requires_api_key=False,
+        supports_ssl_verify=False,
+        default_model=None,
+    ),
+    "localai": BindingInfo(
+        name="localai",
+        display_name="🏠 LocalAI",
+        category="local_server",
+        description="LocalAI full-stack API - Default port 8080",
+        default_host="http://localhost:8080/v1",
+        requires_api_key=False,
+        supports_ssl_verify=False,
+        default_model=None,
+    ),
+    "gpt4all": BindingInfo(
+        name="gpt4all",
+        display_name="🧩 GPT4All",
+        category="local_server",
+        description="GPT4All API server - Default port 4891",
+        default_host="http://localhost:4891/v1",
+        requires_api_key=False,
+        supports_ssl_verify=False,
+        default_model=None,
+    ),
+    "text_generation_webui": BindingInfo(
+        name="text_generation_webui",
+        display_name="🌐 Oobabooga / TextGen",
+        category="local_server",
+        description="Text Generation WebUI API - Default port 5000",
+        default_host="http://localhost:5000/v1",
+        requires_api_key=False,
+        supports_ssl_verify=False,
+        default_model=None,
     ),
     "open_router": BindingInfo(
         name="open_router",

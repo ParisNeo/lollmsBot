@@ -84,10 +84,10 @@ def execute(url: str):
 lollmsbot chat --simplified_agant
 
 # Or programmatically
-from lollmsbot.agent import integrate_openclaw
+from lollmsbot.agent import integrate_simplified_agent_integration
 
-openclaw_agent, openclaw_tool = integrate_openclaw(your_agent)
-await your_agent.register_tool(openclaw_tool)
+simplified_agent_integration_agent, simplified_agent_integration_tool = integrate_simplified_agent_integration(your_agent)
+await your_agent.register_tool(simplified_agent_integration_tool)
 ```
 
 ### Creating Extensions

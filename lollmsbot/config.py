@@ -43,15 +43,28 @@ class LollmsSettings:
 
     @classmethod
     def from_env(cls) -> "LollmsSettings":
-        """Load from environment variables."""
-        global console
+        """Load from wizard config first, then environment variables."""
+        wizard_path = Path.home() / ".lollmsbot" / "config.json"
+        config_data = {}
+
+        if wizard_path.exists():
+            try:
+                full_config = json.loads(wizard_path.read_text())
+                config_data = full_config.get("lollms", {})
+            except Exception:
+                pass
+
+        # Helper to get value from config file OR env var OR default
+        def get_val(key, env_name, default):
+            return config_data.get(key) or os.getenv(env_name) or default
+
         return cls(
-            host_address=os.getenv("LOLLMS_HOST_ADDRESS", "http://localhost:9600"),
-            api_key=os.getenv("LOLLMS_API_KEY"),
-            verify_ssl=_get_bool("LOLLMS_VERIFY_SSL", True),
-            binding_name=os.getenv("LOLLMS_BINDING_NAME"),
-            model_name=os.getenv("LOLLMS_MODEL_NAME"),
-            context_size=int(os.getenv("LOLLMS_CONTEXT_SIZE", "32000")) or None,
+            host_address=get_val("host_address", "LOLLMS_HOST_ADDRESS", "http://localhost:9600"),
+            api_key=get_val("api_key", "LOLLMS_API_KEY", None),
+            verify_ssl=_get_bool("LOLLMS_VERIFY_SSL", config_data.get("verify_ssl", True)),
+            binding_name=get_val("binding_name", "LOLLMS_BINDING_NAME", "lollms"),
+            model_name=get_val("model_name", "LOLLMS_MODEL_NAME", None),
+            context_size=int(get_val("context_size", "LOLLMS_CONTEXT_SIZE", 32000)),
         )
 
     @classmethod
@@ -80,11 +93,26 @@ class LollmsSettings:
 class GatewaySettings:
     """Gateway server settings."""
     host: str = field(default="localhost")
-    port: int = field(default=8800)
+    port: int = field(default=9600)
 
     @classmethod
     def from_env(cls) -> "GatewaySettings":
+        """Load from wizard config first, then environment variables."""
+        wizard_path = Path.home() / ".lollmsbot" / "config.json"
+        config_data = {}
+
+        if wizard_path.exists():
+            try:
+                full_config = json.loads(wizard_path.read_text())
+                config_data = full_config.get("lollmsbot", {}) # Gateway settings are in lollmsbot block
+            except Exception:
+                pass
+
+        host = config_data.get("host") or os.getenv("LOLLMSBOT_HOST", "localhost")
+        # Ensure we handle the port as an int and fallback correctly
+        port_val = config_data.get("port") or os.getenv("LOLLMSBOT_PORT", 9600)
+
         return cls(
-            host=os.getenv("LOLLMSBOT_HOST", "localhost"),
-            port=int(os.getenv("LOLLMSBOT_PORT", "8800")),
+            host=host,
+            port=int(port_val),
         )

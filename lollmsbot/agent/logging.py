@@ -102,22 +102,11 @@ class AgentLogger:
         context: Optional[Dict[str, Any]],
         tool_count: int,
     ) -> None:
-        """Log when a command is received."""
-        # End any active status first
+        """Log when a command is received (Minimalist)."""
+        if not self.verbose: return
         self._end_current_status()
-        
-        channel = context.get("channel", "unknown") if context else "unknown"
-        msg_preview = message[:100] + "..." if len(message) > 100 else message
-        
-        panel = Panel(
-            f"[bold white]User:[/bold white] [cyan]{user_id}[/cyan]\n"
-            f"[bold white]Channel:[/bold white] [yellow]{channel}[/yellow]\n"
-            f"[bold white]Message:[/bold white] [white]{msg_preview}[/white]\n"
-            f"[dim]Length: {len(message)} chars | Tools available: {tool_count}[/dim]",
-            title="[bold blue]📥 COMMAND RECEIVED[/bold blue]",
-            border_style="blue"
-        )
-        self._console.print(panel)
+        # Just a simple, clean marker
+        self._console.print(f"[dim]📥 {user_id} ({len(message)} chars) | {tool_count} tools ready[/dim]")
     
     def log_security_check(self, is_safe: bool, event: Optional[Any]) -> None:
         """Log security screening results."""
@@ -163,18 +152,11 @@ class AgentLogger:
             self.log(f"❌ Tool '{tool_name}' failed: {error}", "red", "🔧", "error")
     
     def log_llm_call(self, prompt_length: int, system_prompt: str) -> None:
-        """Log LLM invocation."""
+        """Log LLM invocation (Minimalist)."""
+        if not self.verbose: return
         self._end_current_status()
-        
-        sys_preview = system_prompt[:80] + "..." if len(system_prompt) > 80 else system_prompt
-        
-        panel = Panel(
-            f"[bold white]Prompt length:[/bold white] [cyan]{prompt_length}[/cyan] chars\n"
-            f"[bold white]System prompt:[/bold white] [dim]{sys_preview}[/dim]",
-            title="[bold orange]🧠 LLM CALL[/bold orange]",
-            border_style="rgb(255,165,0)"
-        )
-        self._console.print(panel)
+        # Just a tiny brain icon and the length
+        self._console.print(f"[dim]🧠 Context: {prompt_length} chars... querying model[/dim]")
     
     def log_llm_response(self, response_length: int, has_tools: bool) -> None:
         """Log LLM response received."""

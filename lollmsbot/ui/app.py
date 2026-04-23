@@ -552,6 +552,7 @@ class ChatApp {
                 
                 if (data.type === 'files_ready') {
                     this.handleFilesReady(data.files);
+                    this.renderWorkToArtifact(data.files[0]); // Auto-render first file
                     return;
                 }
                 
@@ -626,6 +627,21 @@ class ChatApp {
         console.log('[ChatApp] Files ready:', files);
         this.pendingFiles = files;
         this.showFileDownloads(files);
+    }
+
+    renderWorkToArtifact(file) {
+        const pane = document.getElementById('artifact-pane');
+        const view = document.getElementById('artifact-view');
+        const title = document.getElementById('artifact-title');
+
+        if (!file || !file.filename.endsWith('.html')) return;
+
+        console.log('[Artifact] Rendering work:', file.filename);
+        title.innerText = `Active Work: ${file.filename}`;
+        pane.classList.add('open');
+
+        // Create an iframe to safely render the HTML/Game/App
+        view.innerHTML = `<iframe class="artifact-iframe" src="${file.download_url}"></iframe>`;
     }
     
     showFileDownloads(files) {

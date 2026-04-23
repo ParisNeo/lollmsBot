@@ -1,39 +1,41 @@
-# Multi-stage build for production
-FROM --platform=$BUILDPLATFORM python:3.11-slim AS builder
+# LollmsBot Sovereign Swarm Node
+FROM python:3.11-slim-bookworm
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    curl \
+    git \
+    nodejs \
+    npm \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+
+# Install Node dependencies for WhatsApp bridge (if needed)
+RUN mkdir -p /root/.lollmsbot/whatsapp-bridge
+COPY lollmsbot/channels/whatsapp.py /tmp/whatsapp.py
+# We create a dummy package.json to pre-install node deps
+RUN cd /root/.lollmsbot/whatsapp-bridge && \
+    npm install whatsapp-web.js qrcode-terminal
+
+# Copy Python project
 COPY pyproject.toml .
-COPY lollmsbot/ ./lollmsbot/
+RUN pip install --no-cache-dir -e .[all]
 
-# Install deps first (cache layer)
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --no-cache-dir -e . 
-
-# Production image
-FROM python:3.11-slim AS production
-
-# Labels
-LABEL org.opencontainers.image.title="lollmsBot"
-LABEL org.opencontainers.image.description="LoLLMS Agentic Assistant"
-LABEL org.opencontainers.image.source="https://github.com/ParisNeo/lollmsBot"
-
-WORKDIR /app
-
-# Copy from builder
-COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
-COPY --from=builder /usr/local/bin /usr/local/bin
+# Copy the source code
 COPY . .
 
-# Create non-root user
-RUN useradd --create-home --shell /bin/bash appuser && \
-    chown -R appuser:appuser /app
-USER appuser
+# Environment Defaults
+ENV LOLLMSBOT_HOST=0.0.0.0
+ENV LOLLMSBOT_PORT=8800
+ENV LOLLMSBOT_DATA_DIR=/app/data
 
-# Healthcheck
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8800/health || exit 1
+# Create directory for persistent data
+RUN mkdir -p /app/data
 
+# Expose API port
 EXPOSE 8800
 
-# Default command
+# Start the Daemon
 CMD ["lollmsbot", "gateway"]

@@ -7,8 +7,10 @@ LollmsBot is a secure, extensible AI assistant framework with persistent memory,
 
 ## ✨ Key Features
 
-- **🔐 Privacy-First**: All data stays local. No cloud dependencies for core functionality.
-- **🧠 Persistent Memory**: RLM (Recursive Language Model) architecture with SQLite-based memory that compresses, consolidates, and forgets naturally.
+- **🛡️ Sovereignty First**: Absolute privacy. Your data, your weights, your Soul.
+- **🧠 Advanced RLM Memory**: A "Double-Edged" memory system (Live Working Context + Structured Deep Memory).
+- **🔄 The Original Learning Loop**: Unlike other agents claiming "firsts," LollmsBot has featured autonomous skill acquisition and self-refinement since inception.
+- **🌙 Dreaming Cycles**: The first agent to implement autonomous "Idle Reflection." While you sleep, LollmsBot re-analyzes conversations, reorganizes facts, and builds deep wisdom.
 - **💬 Multi-Channel**: Discord, Telegram, WhatsApp, HTTP API, and console chat—unified under one agent.
 - **📚 Document Writing**: Hierarchical document management for books, reports, and long-form content.
 - **🛡️ Security Layer**: Guardian module with prompt injection detection, ethics enforcement, and self-quarantine.

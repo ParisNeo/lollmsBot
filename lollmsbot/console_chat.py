@@ -87,16 +87,16 @@ class ConsoleChat:
         agent: Optional[Agent] = None,
         config: Optional[BotConfig] = None,
         verbose: bool = True,
-        openclaw_mode: bool = False,
+        simplified_agent_integration_mode: bool = False,
     ) -> None:
         self.console = Console()
         self.config = config or BotConfig.from_env()
         self.agent = agent
         self.verbose = verbose
-        self.openclaw_mode = openclaw_mode
+        self.simplified_agent_integration_mode = simplified_agent_integration_mode
         
         # SimplifiedAgant agent (if enabled)
-        self._openclaw: Optional[Any] = None
+        self._simplified_agent: Optional[Any] = None
         
         # Session management
         self.session: Optional[ChatSession] = None
@@ -127,67 +127,68 @@ class ConsoleChat:
         }
         
         # Add SimplifiedAgant commands if enabled
-        if openclaw_mode:
+        if simplified_agent_integration_mode:
             self._commands["/branch"] = self._cmd_branch
             self._commands["/extensions"] = self._cmd_extensions
             self._commands["/reload"] = self._cmd_reload
     
     async def initialize(self) -> bool:
-        """Initialize the console chat interface."""
+        """Initialize the console chat as a Thin Client."""
         self.console.print()
-        
-        # Startup banner
-        mode_str = " [SimplifiedAgant Mode]" if self.openclaw_mode else ""
         banner = Panel(
             Text.assemble(
-                ("🤖 ", "bold cyan"),
+                ("🌐 ", "bold green"),
                 ("lollmsBot", "bold blue"),
-                (f" Console Chat{mode_str}\n", "bold white"),
-                ("Direct terminal interface to your AI agent", "dim"),
+                (" Terminal Client\n", "bold white"),
+                ("Connected to local LollmsBot Daemon", "dim"),
             ),
-            box=box.DOUBLE_EDGE,
-            border_style="bright_blue",
-            padding=(1, 4),
+            box=box.DOUBLE_EDGE, border_style="bright_blue", padding=(1, 4),
         )
         self.console.print(banner)
+
+        # Verify connection to the Daemon
+        import httpx
+        from lollmsbot.config import GatewaySettings
+        settings = GatewaySettings.from_env()
+        self.api_url = f"http://{settings.host}:{settings.port}"
+
+        try:
+            self.console.print(f"[dim]📡 Attempting to connect to: {self.api_url}...[/dim]")
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(f"{self.api_url}/health", timeout=5.0)
+                if resp.status_code == 200:
+                    self.console.print(f"[green]✅ Connected to Daemon at {self.api_url}[/]")
+                else:
+                    self.console.print(f"[red]❌ Daemon returned status {resp.status_code} at {self.api_url}[/]")
+                    return False
+        except Exception as e:
+            self.console.print(f"[red]❌ Daemon not found at {self.api_url}[/]")
+            self.console.print(f"[yellow]Details: {str(e)}[/]")
+            self.console.print(f"[dim]Hint: Ensure 'lollmsbot gateway' is running and the port matches your config.[/dim]")
+            return False
         
-        # Initialize agent if not provided
-        if self.agent is None:
-            self.console.print("[yellow]Initializing agent...[/]")
-            try:
-                self.agent = Agent(
-                    config=self.config,
-                    name="LollmsBot",
-                    default_permissions=PermissionLevel.TOOLS,  # Full tool access in console
-                    verbose_logging=self.verbose,
-                )
-                await self.agent.initialize(gateway_mode="console", host_bindings=["console"])
-                self.console.print(f"[green]✅ Agent initialized: {self.agent.name}[/]")
-            except Exception as e:
-                self.console.print(f"[red]❌ Failed to initialize agent: {e}[/]")
-                return False
-        
-        # Initialize SimplifiedAgant mode if enabled
-        if self.openclaw_mode:
+        # Initialize SimplifiedAgant mode if enabled (only if running with a local agent)
+        if self.simplified_agent_integration_mode and self.agent:
             self.console.print("[cyan]Initializing SimplifiedAgant-style minimal tool mode...[/]")
             try:
-                from lollmsbot.agent.simplified_agant_integration import integrate_openclaw
+                from lollmsbot.agent.simplified_agant_integration import integrate_simplified_agant
                 from lollmsbot.agent.simplified_agant_style import SimplifiedAgantTool
-                
-                self._openclaw, oc_tool = integrate_openclaw(self.agent)
-                
+
+                self._simplified_agent, oc_tool = await integrate_simplified_agant(self.agent)
+
                 # Register the SimplifiedAgant tool
                 await self.agent.register_tool(oc_tool)
-                
-                self.console.print(f"[green]✅ SimplifiedAgant mode active: 4 core tools + {len(self._openclaw.extensions)} extensions[/]")
+
+                self.console.print(f"[green]✅ SimplifiedAgant mode active: 4 core tools + {len(self._simplified_agent.extensions)} extensions[/]")
                 self.console.print("[dim]  Core: read, write, edit, bash | Extensions: self-written[/]")
             except Exception as e:
                 self.console.print(f"[yellow]⚠️ SimplifiedAgant init warning: {e}[/]")
                 import traceback
                 self.console.print(f"[dim]{traceback.format_exc()[:200]}[/]")
-        
-        # Setup file delivery callback
-        self.agent.set_file_delivery_callback(self._handle_file_delivery)
+
+        # Setup file delivery callback if running locally
+        if self.agent:
+            self.agent.set_file_delivery_callback(self._handle_file_delivery)
         
         # Create session
         import uuid
@@ -223,13 +224,14 @@ class ConsoleChat:
         """Print a compact status bar."""
         if not self.session:
             return
-        
+
         # Build status components
         status_parts = []
-        
+
         # Agent status
-        status_parts.append(f"[cyan]{self.agent.name}[/]")
-        
+        agent_name = self.agent.name if self.agent else self.config.name
+        status_parts.append(f"[cyan]{agent_name}[/]")
+
         # Session info
         status_parts.append(f"[dim]msgs:{self.session.message_count}[/]")
         
@@ -330,40 +332,88 @@ class ConsoleChat:
         return True
     
     async def _process_message(self, message: str) -> None:
-        """Process a user message through the agent."""
-        # Add to history
+        """Process a user message with real-time streaming and animated tool calls."""
+        import httpx
+        import re
+        self.session.message_count += 1
+
+        agent_name = self.agent.name if self.agent else self.config.name
+        self.console.print(f"\n[bold blue]{agent_name}:[/] ", end="")
+
+        full_content = ""
+        is_tool_active = False
+
+        # Use Live to update the message as it streams
+        with Live(Text(""), console=self.console, refresh_per_second=12, vertical_overflow="visible") as live:
+            try:
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    async with client.stream("POST", f"{self.api_url}/chat/stream", json={
+                        "message": message, 
+                        "user_id": self.session.user_id
+                    }) as response:
+
+                        async for line in response.aiter_lines():
+                            if not line: continue
+                            try:
+                                chunk = json.loads(line)
+                            except Exception as e:
+                                if line.strip():
+                                    self.console.print(f"[dim red]Raw Output: {line}[/]")
+                                continue
+
+                            if chunk["type"] == "status":
+                                # Just show connection status briefly
+                                live.update(Text(f"⏳ {chunk['content']}", style="dim"))
+                                continue
+
+                            if chunk["type"] == "text":
+                                content = chunk["content"]
+                                full_content += content
+
+                                # Better cleaning: Only remove completed tool blocks
+                                # Don't use sub(r'<[^>]*>', '') as it hides text during tag formation
+                                display_content = re.sub(r'<tool>.*?</tool>', '🔧 [Tool Call] ', full_content, flags=re.DOTALL)
+                                # Hide any other internal tags like <thought> but keep normal text
+                                display_content = re.sub(r'<thought>.*?</thought>', '', display_content, flags=re.DOTALL)
+
+                                if not is_tool_active:
+                                    # Ensure we don't try to render an empty Markdown block
+                                    if display_content.strip():
+                                        live.update(Markdown(display_content))
+                                    else:
+                                        live.update(Text("..."))
+
+                            elif chunk["type"] == "tool_start":
+                                is_tool_active = True
+                                live.update(Group(
+                                    Markdown(re.sub(r'<[^>]*>', '', full_content)),
+                                    Panel(Spinner("dots", text="[bold yellow]Agent is using a tool...[/]"), border_style="yellow")
+                                ))
+
+                            elif chunk["type"] == "tool_complete":
+                                is_tool_active = False
+                                tool_name = chunk.get("tool", "tool")
+                                self.session.tools_used.add(tool_name)
+                                # Momentary success indicator
+                                live.update(Group(
+                                    Markdown(re.sub(r'<[^>]*>', '', full_content)),
+                                    Panel(f"[bold green]✓ {tool_name} completed[/]", border_style="green")
+                                ))
+                                await asyncio.sleep(0.5)
+
+                            elif chunk["type"] == "error":
+                                self.console.print(f"[red]Error: {chunk['content']}[/]")
+
+            except Exception as e:
+                self.console.print(f"[red]❌ Connection Error: {e}[/]")
+                return
+
+        # Final cleanup and history storage
         self.conversation_history.append({
-            "role": "user",
-            "content": message,
+            "role": "assistant",
+            "content": full_content,
             "timestamp": datetime.now().isoformat(),
         })
-        
-        # Update session
-        self.session.message_count += 1
-        
-        # Show thinking indicator and wait for complete result
-        result = None
-        with self.console.status("[bold cyan]Thinking...[/]", spinner="dots"):
-            try:
-                result = await self.agent.chat(
-                    user_id=self.session.user_id,
-                    message=message,
-                    context={"channel": "console", "session_id": self.session.session_id},
-                )
-            except Exception as e:
-                self.console.print(f"[red]❌ Error: {e}[/]")
-                return
-        
-        # Display response only after thinking completes
-        if result:
-            self._display_response(result)
-            
-            # Update session stats
-            if result.get("tools_used"):
-                self.session.tools_used.update(result["tools_used"])
-            
-            if result.get("files_to_send"):
-                self.session.files_generated.extend(result["files_to_send"])
     
     def _display_response(self, result: Dict[str, Any]) -> None:
         """Display the agent response beautifully."""
@@ -381,7 +431,8 @@ class ConsoleChat:
         
         # Print agent header
         self.console.print()
-        self.console.print(f"[bold blue]{self.agent.name}:[/] ")
+        agent_name = self.agent.name if self.agent else self.config.name
+        self.console.print(f"[bold blue]{agent_name}:[/] ")
         
         # Display tools used in a dedicated panel
         tools_used = result.get("tools_used", [])
@@ -408,19 +459,18 @@ class ConsoleChat:
             )
             self.console.print(tool_panel)
         
-        # Display thinking content in a separate panel if present
-        if thinking_content and self.show_tool_details:
-            from rich.syntax import Syntax
+        # Render the 'Dreaming/Thinking' block with a more sophisticated, less 'debug' feel
+        if thinking_content:
+            # We use a slim border and dimmed italic text for the internal monologue
+            thought_text = Text(thinking_content, style="italic dim")
             thinking_panel = Panel(
-                Syntax(thinking_content, "markdown", theme="monokai", word_wrap=True),
-                title="[bold magenta]💭 Thinking Process[/bold magenta]",
+                thought_text,
+                title="[bold magenta]✧ Internal Monologue[/bold magenta]",
                 border_style="magenta",
-                box=box.ROUNDED,
-                padding=(1, 2),
+                box=box.MINIMAL,
+                padding=(0, 2)
             )
             self.console.print(thinking_panel)
-            self.console.print()
-        
         # Clean response of tool calls for display
         clean_response = self._clean_tool_calls_from_response(response)
         
@@ -575,7 +625,7 @@ class ConsoleChat:
 [bold]/exit[/] or [bold]/quit[/]  Exit the console chat
 """
         
-        if self.openclaw_mode:
+        if self.simplified_agent_integration_mode:
             help_text += """
 [bold cyan]SimplifiedAgant Commands:[/]
 
@@ -660,9 +710,13 @@ class ConsoleChat:
         
         # Agent info
         agent_branch = tree.add("[cyan]Agent[/]")
-        agent_branch.add(f"Name: {self.agent.name}")
-        agent_branch.add(f"State: {self.agent.state.name}")
-        agent_branch.add(f"Tools: {len(self.agent.tools)}")
+        if self.agent:
+            agent_branch.add(f"Name: {self.agent.name}")
+            agent_branch.add(f"State: {self.agent.state.name}")
+            agent_branch.add(f"Tools: {len(self.agent.tools)}")
+        else:
+            agent_branch.add(f"Name: {self.config.name} (Remote)")
+            agent_branch.add("Mode: Thin Client")
         
         # Session info
         session_branch = tree.add("[cyan]Session[/]")
@@ -744,7 +798,8 @@ class ConsoleChat:
             if role == "user":
                 lines.append(f"## User {time_str}\n\n{content}\n\n")
             elif role == "assistant":
-                lines.append(f"## {self.agent.name} {time_str}\n\n{content}\n\n")
+                agent_name = self.agent.name if self.agent else self.config.name
+                lines.append(f"## {agent_name} {time_str}\n\n{content}\n\n")
                 # Add tool info if present
                 tools = msg.get("tools_used", [])
                 if tools:
@@ -776,20 +831,20 @@ class ConsoleChat:
     
     async def _cmd_branch(self, args: List[str]) -> None:
         """Create a new session branch (SimplifiedAgant-style)."""
-        if not self._openclaw:
+        if not self._simplified_agent:
             self.console.print("[red]SimplifiedAgant mode not active[/]")
             return
         
         summary = " ".join(args) if args else "Experimental branch"
-        branch = self._openclaw.branch_session(summary=summary)
+        branch = self._simplified_agent.branch_session(summary=summary)
         
-        tree = self._openclaw.get_branch_tree()
+        tree = self._simplified_agent.get_branch_tree()
         
         self.console.print(Panel(
             f"[bold green]Created branch: {branch.branch_id}[/]\n"
             f"Parent: {branch.parent_branch_id}\n"
             f"Summary: {branch.summary}\n"
-            f"Active branches: {len(self._openclaw.branches)}",
+            f"Active branches: {len(self._simplified_agent.branches)}",
             title="Session Branch",
             border_style="green"
         ))
@@ -809,11 +864,11 @@ class ConsoleChat:
     
     async def _cmd_extensions(self, args: List[str]) -> None:
         """List SimplifiedAgant extensions."""
-        if not self._openclaw:
+        if not self._simplified_agent:
             self.console.print("[red]SimplifiedAgant mode not active[/]")
             return
         
-        if not self._openclaw.extensions:
+        if not self._simplified_agent.extensions:
             self.console.print("[dim]No extensions yet. Create one with:[/]")
             self.console.print("[cyan]  <tool>simplified_agant</tool>[/]")
             self.console.print("[cyan]  <operation>create_extension</operation>[/]")
@@ -827,24 +882,24 @@ class ConsoleChat:
         table.add_column("Status", style="green")
         table.add_column("Description", style="white", max_width=50)
         
-        for ext in self._openclaw.extensions.values():
+        for ext in self._simplified_agent.extensions.values():
             status = "✅ active" if ext.is_active else "❌ inactive"
             table.add_row(ext.name, str(ext.version), status, ext.description[:50])
         
         self.console.print(table)
-        self.console.print(f"\n[dim]Total: {len(self._openclaw.extensions)} extensions[/]")
+        self.console.print(f"\n[dim]Total: {len(self._simplified_agent.extensions)} extensions[/]")
         self.console.print("[dim]Create new: use simplified_agant tool with operation=create_extension[/]")
     
     async def _cmd_reload(self, args: List[str]) -> None:
         """Hot reload extensions."""
-        if not self._openclaw:
+        if not self._simplified_agent:
             self.console.print("[red]SimplifiedAgant mode not active[/]")
             return
         
         ext_name = args[0] if args else None
         
         with self.console.status("[bold green]Hot reloading...[/]"):
-            result = await self._openclaw.hot_reload(ext_name)
+            result = await self._simplified_agent.hot_reload(ext_name)
         
         if result["failed"]:
             self.console.print(Panel(
@@ -893,10 +948,10 @@ def run_console_chat(
     agent: Optional[Agent] = None,
     config: Optional[BotConfig] = None,
     verbose: bool = True,
-    openclaw_mode: bool = False,
+    simplified_agent_integration_mode: bool = False,
 ) -> None:
     """Entry point for console chat."""
-    chat = ConsoleChat(agent=agent, config=config, verbose=verbose, openclaw_mode=openclaw_mode)
+    chat = ConsoleChat(agent=agent, config=config, verbose=verbose, simplified_agent_integration_mode=simplified_agent_integration_mode)
     
     try:
         asyncio.run(chat.run())

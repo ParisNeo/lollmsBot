@@ -85,7 +85,32 @@
                     </div>
                 </div>
             </div>
+            
+            <div class="input-area">
+                <div class="input-container">
+                    <textarea 
+                        class="message-input" 
+                        id="message-input"
+                        placeholder="Message LollmsBot..."
+                        rows="1"
+                    ></textarea>
+                    <div class="input-actions">
+                        <button class="send-btn" id="send-btn" title="Send">➤</button>
+                    </div>
+                </div>
+            </div>
         </main>
+
+        <!-- NEW: Artifact Side-Pane -->
+        <aside class="artifact-pane" id="artifact-pane">
+            <div class="artifact-header">
+                <span id="artifact-title" style="font-weight: bold; color: var(--accent);">Artifact: Idle</span>
+                <button class="btn-icon" onclick="document.getElementById('artifact-pane').classList.remove('open')">✕</button>
+            </div>
+            <div class="artifact-content" id="artifact-view">
+                <!-- Live work will be rendered here -->
+            </div>
+        </aside>
     </div>
     
     <!-- Settings Modal -->

@@ -1,45 +1,51 @@
 version: '3.8'
 
 services:
-  lollmsbot:
+  # AGENT ALPHA: The Lead Researcher
+  alpha-agent:
     build: .
-    container_name: lollmsbot
-    restart: unless-stopped
-    ports:
-      - "8800:8800"
+    container_name: alpha-agent
     volumes:
-      - ./lollmsbot-data:/app/data  # Persistent storage
-      - ./.env:/app/.env:ro        # Config
+      - ./swarm_data/alpha:/root/.lollmsbot
+      - ./swarm_souls/alpha_soul.md:/root/.lollmsbot/soul.md
     environment:
-      - LOLLMSBOT_HOST=0.0.0.0
-      - LOLLMSBOT_PORT=8800
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8800/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 20s
+      - LOLLMSBOT_NAME=Alpha
+      - LOLLMS_HOST_ADDRESS=http://your-llm-provider:9600
     networks:
-      - lollms-network
-
-  # Example: LoLLMS companion service (optional)
-  lollms:
-    image: ghcr.io/parisneo/lollms-webui:latest
-    container_name: lollms-webui
-    restart: unless-stopped
+      - swarm-net
     ports:
-      - "7860:7860"
-    volumes:
-      - lollms-data:/app/models
-    environment:
-      - BIND_ADDRESS=0.0.0.0
-    networks:
-      - lollms-network
+      - "8801:8800"
 
-volumes:
-  lollmsbot-data:
-  lollms-data:
+  # AGENT BETA: The Code Architect
+  beta-agent:
+    build: .
+    container_name: beta-agent
+    volumes:
+      - ./swarm_data/beta:/root/.lollmsbot
+      - ./swarm_souls/beta_soul.md:/root/.lollmsbot/soul.md
+    environment:
+      - LOLLMSBOT_NAME=Beta
+      - LOLLMS_HOST_ADDRESS=http://your-llm-provider:9600
+    networks:
+      - swarm-net
+    ports:
+      - "8802:8800"
+
+  # AGENT GAMMA: The Security Guardian
+  gamma-agent:
+    build: .
+    container_name: gamma-agent
+    volumes:
+      - ./swarm_data/gamma:/root/.lollmsbot
+      - ./swarm_souls/gamma_soul.md:/root/.lollmsbot/soul.md
+    environment:
+      - LOLLMSBOT_NAME=Gamma
+      - LOLLMS_HOST_ADDRESS=http://your-llm-provider:9600
+    networks:
+      - swarm-net
+    ports:
+      - "8803:8800"
 
 networks:
-  lollms-network:
+  swarm-net:
     driver: bridge

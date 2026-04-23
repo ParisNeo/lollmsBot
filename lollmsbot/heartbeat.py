@@ -50,13 +50,14 @@ class MaintenanceTask(Enum):
     """Categories of self-maintenance operations."""
     DIAGNOSTIC = auto()      # Health checks, connectivity tests
     MEMORY = auto()          # Memory compression, archiving, forgetting
-    RLM_MAINTENANCE = auto() # NEW: RLM deduplication and consolidation
+    RLM_MAINTENANCE = auto() # RLM deduplication and consolidation
+    DREAMING = auto()        # NEW: Autonomous memory reflection and re-analysis
     SECURITY = auto()         # Audit log review, permission verification
     SKILL = auto()           # Skill documentation, dependency updates
     UPDATE = auto()          # Code update checks, patch application
     OPTIMIZATION = auto()    # Performance tuning, cache cleaning
     HEALING = auto()         # Self-correction of detected drift
-    OPENCLAW_WORKFLOW = auto()  # NEW: SimplifiedAgant daily automation workflow
+    SIMPLIFIED_AGENT_INTEGRATION_WORKFLOW = auto()  # SimplifiedAgant daily automation workflow
 
 
 @dataclass
@@ -189,8 +190,8 @@ class Heartbeat:
         self.config_path = config_path or self.DEFAULT_CONFIG_PATH
         
         # Ensure SimplifiedAgant workflow is in default tasks if not explicitly disabled
-        if MaintenanceTask.OPENCLAW_WORKFLOW not in self.config.tasks_enabled:
-            self.config.tasks_enabled[MaintenanceTask.OPENCLAW_WORKFLOW] = True
+        if MaintenanceTask.SIMPLIFIED_AGENT_INTEGRATION_WORKFLOW not in self.config.tasks_enabled:
+            self.config.tasks_enabled[MaintenanceTask.SIMPLIFIED_AGENT_INTEGRATION_WORKFLOW] = True
         
         # Subsystems
         self.memory_monitor = MemoryMonitor()
@@ -222,7 +223,7 @@ class Heartbeat:
             MaintenanceTask.UPDATE: self._run_update_check,
             MaintenanceTask.OPTIMIZATION: self._run_optimization,
             MaintenanceTask.HEALING: self._run_healing,
-            MaintenanceTask.OPENCLAW_WORKFLOW: self._run_openclaw_workflow,  # NEW
+            MaintenanceTask.SIMPLIFIED_AGENT_INTEGRATION_WORKFLOW: self._run_simplified_agent_integration_workflow,  # NEW
         }
         
         # Load or save config
@@ -238,9 +239,9 @@ class Heartbeat:
             self._rlm_maintenance = MemoryMaintenance(memory_manager)
             logger.info("✅ RLM Memory Maintenance connected to Heartbeat")
     
-    def set_openclaw_integration(self, simplified_agant: Any) -> None:
+    def set_simplified_agent_integration_integration(self, simplified_agant: Any) -> None:
         """Set the SimplifiedAgant integration for daily workflows."""
-        self._openclaw = simplified_agant
+        self._simplified_agent = simplified_agant
         logger.info("✅ SimplifiedAgant integration connected to Heartbeat")
     
     def _load_config(self) -> None:
@@ -373,16 +374,16 @@ class Heartbeat:
             duration_seconds=time.time() - start,
         )
     
-    async def _run_openclaw_workflow(self) -> TaskResult:
+    async def _run_simplified_agent_integration_workflow(self) -> TaskResult:
         """Run SimplifiedAgant daily workflow."""
         start = time.time()
         findings = []
         actions = []
         warnings = []
         
-        if not hasattr(self, '_openclaw') or not self._openclaw:
+        if not hasattr(self, '_simplified_agent') or not self._simplified_agent:
             return TaskResult(
-                task=MaintenanceTask.OPENCLAW_WORKFLOW,
+                task=MaintenanceTask.SIMPLIFIED_AGENT_INTEGRATION_WORKFLOW,
                 executed_at=datetime.now(),
                 success=True,
                 findings=["SimplifiedAgant integration not configured"],
@@ -391,33 +392,48 @@ class Heartbeat:
             )
         
         try:
-            results = await self._openclaw.daily_workflow()
-            
+            results = await self._simplified_agent.daily_workflow()
+
+            if not results:
+                warnings.append("Workflow returned no data")
+                return TaskResult(
+                    task=MaintenanceTask.SIMPLIFIED_AGENT_INTEGRATION_WORKFLOW,
+                    executed_at=datetime.now(),
+                    success=False,
+                    findings=["Workflow execution returned None"],
+                    warnings=warnings,
+                    duration_seconds=time.time() - start,
+                )
+
             findings.append(f"SimplifiedAgant daily workflow completed")
             findings.append(f"Steps completed: {', '.join(results.get('steps_completed', []))}")
             
-            if "youtube_snapshot" in results:
-                yt = results["youtube_snapshot"]
-                findings.append(f"YouTube: {yt.get('views', 0):,} views, {yt.get('subscribers', 0):,} subscribers")
+            # Use safe truthy check and getattr for Dataclass attributes
+            yt = results.get("youtube_snapshot")
+            if yt:
+                views = getattr(yt, 'total_views', 0)
+                subs = getattr(yt, 'total_subscribers', 0)
+                findings.append(f"YouTube: {views:,} views, {subs:,} subscribers")
             
-            if "business_analysis" in results:
-                ba = results["business_analysis"]
-                findings.append(f"Business analysis: {ba.get('priorities', 0)} priorities, {ba.get('confidence')} confidence")
+            ba = results.get("business_analysis")
+            if ba:
+                # ba is a CouncilReport Dataclass
+                p_count = len(getattr(ba, 'strategic_priorities', []))
+                conf = getattr(ba, 'confidence_level', 'unknown')
+                findings.append(f"Business analysis: {p_count} priorities, {conf} confidence")
                 actions.append("Business council report generated")
             
-            if "crm_error" in results:
-                warnings.append(f"CRM workflow issue: {results['crm_error']}")
-            if "youtube_error" in results:
-                warnings.append(f"YouTube analytics issue: {results['youtube_error']}")
-            if "analysis_error" in results:
-                warnings.append(f"Business analysis issue: {results['analysis_error']}")
-            
+            # SimplifiedAgantIntegration results uses a unified 'errors' list
+            if results.get("errors"):
+                for error in results["errors"]:
+                    warnings.append(f"Workflow issue: {error}")
+                    
         except Exception as e:
             warnings.append(f"SimplifiedAgant workflow failed: {str(e)}")
             logger.error(f"SimplifiedAgant daily workflow error: {e}")
         
         return TaskResult(
-            task=MaintenanceTask.OPENCLAW_WORKFLOW,
+            task=MaintenanceTask.SIMPLIFIED_AGENT_INTEGRATION_WORKFLOW,
             executed_at=datetime.now(),
             success=len(warnings) == 0,
             findings=findings,

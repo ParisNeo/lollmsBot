@@ -15,12 +15,13 @@ import asyncio
 import json
 import traceback
 import re
+import time
+from datetime import datetime
 from dataclasses import field, dataclass
-from typing import Any, Dict, List, Optional, Set, Callable, Awaitable
+from typing import Any, Dict, List, Optional, Set, Callable, Awaitable, AsyncGenerator
 
-from lollmsbot.config import BotConfig
-from lollmsbot.lollms_client import LollmsClient, build_lollms_client
-
+from lollmsbot.lollms_client import build_lollms_client
+from lollmsbot.config import BotConfig, LollmsSettings
 from lollmsbot.guardian import get_guardian, Guardian
 
 
@@ -37,22 +38,25 @@ from lollmsbot.agent.config import (
     ToolError,
     AgentError,
 )
-
-# Import RLM Memory package (new modular structure)
-from lollmsbot.agent.rlm import (
-    RLMMemoryManager,
-    MemoryChunk,
-    MemoryChunkType,
-    RCBEntry,
-    PromptInjectionSanitizer,
-)
-
 from lollmsbot.agent.project_memory import (
     ProjectMemoryManager,
     Project,
     MemorySegment,
     ProjectStatus,
     get_project_memory_manager,
+)
+
+# Import RLM Memory package (new modular structure)
+from lollms_client import LollmsClient, LollmsDiscussion, LollmsDataManager
+from lollms_client.lollms_types import MSG_TYPE
+from lollms_client.lollms_discussion import ArtefactType
+
+from lollmsbot.agent.rlm import (
+    RLMMemoryManager,
+    MemoryChunk,
+    MemoryChunkType,
+    RCBEntry,
+    PromptInjectionSanitizer,
 )
 
 from lollmsbot.agent.identity import IdentityDetector
@@ -117,16 +121,17 @@ class Agent:
             if self._guardian.is_quarantined:
                 self._state = AgentState.QUARANTINED
         
-        # RLM MEMORY SYSTEM
+        # DATA AND DISCUSSION MANAGEMENT
+        self._db_manager: Optional[LollmsDataManager] = None
+        self._discussion: Optional[LollmsDiscussion] = None
+        self._memory_db_path = memory_db_path or (Path.home() / ".lollmsbot" / "discussion_vault.db")
+
+        # RLM MEMORY SYSTEM (Bridged to Discussion)
         self._memory: Optional[RLMMemoryManager] = None
         self._memory_lock: asyncio.Lock = asyncio.Lock()
-        self._memory_db_path = memory_db_path
         
-        # PROJECT MEMORY SYSTEM
-        self._project_memory: Optional[ProjectMemoryManager] = None
-        
-        # OPENCLAW INTEGRATION
-        self._openclaw: Optional[Any] = None
+        # SIMPLIFIED_AGENT_INTEGRATION INTEGRATION
+        self._simplified_agent: Optional[Any] = None
         
         self._identity_detector = IdentityDetector()
         self._prompt_builder = PromptBuilder(agent_name=self.name)
@@ -200,13 +205,29 @@ class Agent:
     async def initialize(self, gateway_mode: str = "unknown", host_bindings: Optional[List[str]] = None) -> None:
         if self._initialized:
             return
-        
+
         self._environment_info = detect_environment(gateway_mode, host_bindings)
-        self._logger.log(
-            f"🌍 Environment: {self._environment_detector.get_summary()}",
-            "cyan", "🖥️"
+        self._logger.log(f"🌍 Environment: {self._environment_detector.get_summary()}", "cyan", "🖥️")
+
+        # 1. Initialize Data Manager and Discussion
+        db_path = f"sqlite:///{self._memory_db_path}"
+        self._db_manager = LollmsDataManager(db_path)
+
+        client = self._ensure_lollms_client()
+
+        # Pull context size from LollmsSettings, not BotConfig
+        lollms_settings = LollmsSettings.from_env()
+        ctx_size = lollms_settings.context_size or 8192
+
+        self._discussion = LollmsDiscussion.create_new(
+            lollms_client=client,
+            db_manager=self._db_manager,
+            autosave=True,
+            system_prompt=self._prompt_builder.build_system_prompt(tools={}, soul=self._ensure_soul()),
+            max_context_size=ctx_size
         )
-        
+
+        # 2. Bridge legacy RLM memory
         await self._ensure_memory()
         await self._store_environment_knowledge()
         
@@ -270,18 +291,23 @@ class Agent:
             import traceback
             self._logger.log(f"Traceback: {traceback.format_exc()}", "dim")
         
-        # Initialize simplified_agent integration
+        # NEW: Swarm Bridge Registration
+        from lollmsbot.tools.swarm import SwarmBridgeTool
+        await self.register_tool(SwarmBridgeTool())
+        self._logger.log("🐝 Swarm Bridge active. Inter-agent communication enabled.", "cyan", "🌐")
+
+        # Initialize simplified_agant integration
         try:
-            from lollmsbot.simplified_agent_integration import simplified_agentIntegration
-            self._simplified_agent = simplified_agentIntegration(self)
+            from lollmsbot.agent.simplified_agant_integration import SimplifiedAgantIntegration
+            self._simplified_agent = SimplifiedAgantIntegration(self)
             await self._simplified_agent.initialize()
-            
-            # Register simplified_agent tools
-            await self._register_simplified_agent_tools()
-            
-            self._logger.log("✅ simplified_agent integration initialized", "green", "🚀")
+
+            # Register simplified_agant tools
+            await self._register_simplified_agent_integration_tools()
+
+            self._logger.log("✅ SimplifiedAgant integration initialized", "green", "🚀")
         except Exception as e:
-            self._logger.log(f"simplified_agent integration not available: {e}", "yellow")
+            self._logger.log(f"SimplifiedAgant integration not available: {e}", "yellow")
             self._simplified_agent = None
         
         self._initialized = True
@@ -912,44 +938,160 @@ class Agent:
         message: str,
         context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        if not self._initialized:
-            await self.initialize()
-        
-        self._logger.log_command_received(user_id, message, context, len(self._tools))
-        
-        if self._state == AgentState.QUARANTINED:
-            return self._quarantine_response()
-        
-        security_result = await self._security_check(user_id, message)
-        if security_result:
-            return security_result
-        
-        if not await self.check_permission(user_id, PermissionLevel.BASIC):
-            return self._permission_denied_response()
-        
-        state_ok = await self._set_processing_state()
-        if not state_ok:
-            return self._busy_response()
-        
-        try:
-            result = await self._process_message_rlm(user_id, message, context)
-            return result
-            
-        except Exception as exc:
-            if self._dev_mode:
-                tb_str = traceback.format_exc()
-                self._logger.log_critical(f"🚨 DEV MODE FULL TRACEBACK:\n{tb_str}")
-                print(f"\n{'='*60}")
-                print("DEV MODE ERROR TRACEBACK:")
-                print(tb_str)
-                print(f"{'='*60}\n")
-            
-            self._logger.log_error("Error in chat processing", exc)
-            await self._set_error_state()
-            return self._error_response(str(exc))
-        
-        finally:
-            await self._return_to_idle()
+        """Synchronous chat wrapper around streaming core."""
+        full_response = ""
+        tools_used = []
+        files_to_send = []
+
+        async for chunk in self.chat_stream(user_id, message, context):
+            if chunk["type"] == "text":
+                full_response += chunk["content"]
+            elif chunk["type"] == "tool_complete":
+                tools_used.append(chunk["tool"])
+                if chunk.get("files"):
+                    files_to_send.extend(chunk["files"])
+            elif chunk["type"] == "error":
+                return self._error_response(chunk["content"])
+
+        return {
+            "success": True,
+            "response": full_response,
+            "tools_used": tools_used,
+            "files_to_send": files_to_send
+        }
+
+    async def chat_stream(
+        self,
+        user_id: str,
+        message: str,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Streaming chat core using lollms_discussion orchestration."""
+        async with self._state_lock:
+            if not self._initialized:
+                await self.initialize()
+
+            if self._state == AgentState.QUARANTINED:
+                yield {"type": "error", "content": "System quarantined"}
+                return
+
+            await self._set_processing_state()
+            try:
+                # 1. Memory retrieval
+                memory = await self._ensure_memory()
+                loaded_memories = await self._search_and_load_memories(memory, user_id, message)
+
+                # 2. Update discussion layers with RLM context and current tools
+                self._discussion.personality_data_zone = "\n".join([m.get("content", "") for m in loaded_memories])
+
+                # Re-build system prompt to include current tools and soul
+                current_system_prompt = self._prompt_builder.build_system_prompt(
+                    tools=self._tools, 
+                    soul=self._ensure_soul()
+                )
+                self._discussion.system_prompt = current_system_prompt
+
+                # 3. Map tools to discussion format
+                discussion_tools = self._get_discussion_tools()
+
+                # 4. Execution loop via LollmsDiscussion
+                loop = asyncio.get_event_loop()
+                event_queue = asyncio.Queue()
+
+                def discussion_callback(text: str, msg_type: MSG_TYPE, meta: dict):
+                    loop.call_soon_threadsafe(event_queue.put_nowait, (text, msg_type, meta))
+                    return True
+
+                # Run discussion.chat in a thread to keep gateway responsive
+                gen_task = asyncio.create_task(asyncio.to_thread(
+                    self._discussion.chat,
+                    user_message=message,
+                    tools=discussion_tools,
+                    streaming_callback=discussion_callback,
+                    enable_repl_tools=True,
+                    enable_inline_widgets=True,
+                    enable_notes=True,
+                    enable_silent_artefact_explanation=True
+                ))
+
+                yield {"type": "status", "content": "Connected to Discussion Engine..."}
+
+                while True:
+                    try:
+                        # Check if background task crashed
+                        if gen_task.done() and gen_task.exception():
+                            raise gen_task.exception()
+
+                        # Wait for an event with a timeout
+                        text, msg_type, meta = await asyncio.wait_for(event_queue.get(), timeout=0.2)
+
+                        # Map discussion types to UI chunks
+                        if msg_type == MSG_TYPE.MSG_TYPE_CHUNK:
+                            # Handle processing announcements from the unified protocol
+                            if meta.get("type") == "processing_open":
+                                yield {"type": "tool_start", "content": f"Brain: {meta.get('title') or meta.get('processing_type')}..."}
+                            elif not text and meta.get("type") == "artefact_update":
+                                yield {"type": "tool_start", "content": f"Building {meta['content']['title']}..."}
+                            else:
+                                # Normal text stream
+                                yield {"type": "text", "content": text}
+
+                        elif msg_type == MSG_TYPE.MSG_TYPE_THOUGHT_CHUNK:
+                            # Forward thinking blocks (chain of thought)
+                            yield {"type": "text", "content": text}
+
+                        elif msg_type == MSG_TYPE.MSG_TYPE_TOOL_CALL:
+                            yield {"type": "tool_start", "content": f"Executing tool: {meta.get('tool')}..."}
+
+                        elif msg_type == MSG_TYPE.MSG_TYPE_TOOL_OUTPUT:
+                            yield {"type": "tool_complete", "tool": meta.get("tool"), "files": []}
+
+                        elif msg_type == MSG_TYPE.MSG_TYPE_ERROR:
+                            yield {"type": "error", "content": text}
+
+                        elif msg_type == MSG_TYPE.MSG_TYPE_EXCEPTION:
+                            yield {"type": "error", "content": f"Lollms Exception: {text}"}
+
+                    except asyncio.TimeoutError:
+                        # Ensure the queue is fully drained before breaking, even if task is done
+                        if gen_task.done() and event_queue.empty():
+                            # Check for background task exceptions
+                            try:
+                                gen_task.result()
+                            except Exception as e:
+                                yield {"type": "error", "content": f"Generation failed: {str(e)}"}
+                            break
+                        continue
+
+            except Exception as e:
+                self._logger.log_error("Discussion error", e)
+                yield {"type": "error", "content": str(e)}
+            finally:
+                await self._return_to_idle()
+
+    def _get_discussion_tools(self) -> Dict[str, Any]:
+        """Convert Tool objects into LollmsDiscussion-compatible dictionary."""
+        disc_tools = {}
+        for name, tool in self._tools.items():
+            # Extract parameters for discussion schema
+            params = []
+            props = tool.parameters.get("properties", {})
+            req = tool.parameters.get("required", [])
+            for p_name, p_val in props.items():
+                params.append({
+                    "name": p_name,
+                    "type": p_val.get("type", "str"),
+                    "optional": p_name not in req,
+                    "description": p_val.get("description", "")
+                })
+
+            disc_tools[name] = {
+                "name": name,
+                "description": tool.description,
+                "parameters": params,
+                "callable": tool.execute
+            }
+        return disc_tools
     
     def _quarantine_response(self) -> Dict[str, Any]:
         return {
@@ -1304,7 +1446,17 @@ class Agent:
             self._logger.log(f"Failed to store conversation: {e}", "yellow")
         
         await self._deliver_files(user_id, files_to_send)
-        
+
+        # NEW: Autonomous Skill Compounding
+        if len(tools_used) >= 2 and result.get("success"):
+            self._logger.log("🧠 Complex success detected. Compounding into a reusable Skill...", "magenta", "📚")
+            asyncio.create_task(self._skill_learner.learn_from_description(
+                name=f"auto_skill_{int(time.time())}",
+                description=f"Automated skill generated from successful task: {message[:50]}",
+                example_inputs=[{"message": message}],
+                expected_outputs=[{"response": response}]
+            ))
+
         final_response = self._build_final_response(response, files_to_send)
         self._logger.log_response_sent(user_id, len(final_response), tools_used)
         
@@ -1495,17 +1647,22 @@ class Agent:
         parts.append("")
         
         if is_file_request:
-            parts.append("FILE GENERATION: Use filesystem tool to create files when requested.")
+            parts.append("ARTIFACT GENERATION: You have a live visual side-pane.")
+            parts.append("When creating games, websites, or visual apps, use the 'filesystem' tool to create '.html' files.")
+            parts.append("The user will see your work RENDERED LIVE in the side-pane immediately.")
         
         # Final synthesis instruction
         parts.append("")
         parts.append("=" * 60)
-        parts.append("RESPONSE PROTOCOL")
+        parts.append("HERMES-LEVEL RESPONSE PROTOCOL")
         parts.append("=" * 60)
-        parts.append("1. First, analyze your memories in <thinking> tags (not shown to user)")
-        parts.append("2. Then provide your actual response")
-        parts.append("3. If you found relevant information, use it naturally")
-        parts.append("4. Never reveal technical details about your memory system")
+        parts.append("1. INTERNAL MONOLOGUE: You MUST start every response with <thought> tags.")
+        parts.append("   - Decompose the request.")
+        parts.append("   - Identify missing data.")
+        parts.append("   - Plan tool execution.")
+        parts.append("2. TOOL CALLS: Use the XML format if tools are needed.")
+        parts.append("3. REASONING: If tools fail, explain why in <thought> before retrying.")
+        parts.append("4. OUTPUT: Provide the final answer ONLY after the internal monologue.")
         
         if context:
             channel = context.get("channel", "unknown")
@@ -1953,16 +2110,16 @@ class Agent:
             "stats": stats,
         }
     
-    async def _register_openclaw_tools(self) -> None:
+    async def _register_simplified_agent_integration_tools(self) -> None:
         """Register tools for SimplifiedAgant features."""
-        if not self._openclaw:
+        if not self._simplified_agent:
             return
         
         # CRM tools
         try:
             from lollmsbot.tools.crm_tools import CRMQueryTool, MeetingPrepTool
-            await self.register_tool(CRMQueryTool(self._openclaw.crm))
-            await self.register_tool(MeetingPrepTool(self._openclaw.crm))
+            await self.register_tool(CRMQueryTool(self._simplified_agent.crm))
+            await self.register_tool(MeetingPrepTool(self._simplified_agent.crm))
             self._logger.log("✅ CRM tools registered", "green", "🔧")
         except Exception as e:
             self._logger.log(f"CRM tools not available: {e}", "dim")
@@ -1970,8 +2127,8 @@ class Agent:
         # Knowledge base tools
         try:
             from lollmsbot.tools.knowledge_tools import KnowledgeQueryTool, IngestContentTool
-            await self.register_tool(KnowledgeQueryTool(self._openclaw.knowledge_base))
-            await self.register_tool(IngestContentTool(self._openclaw.knowledge_base))
+            await self.register_tool(KnowledgeQueryTool(self._simplified_agent.knowledge_base))
+            await self.register_tool(IngestContentTool(self._simplified_agent.knowledge_base))
             self._logger.log("✅ Knowledge base tools registered", "green", "🔧")
         except Exception as e:
             self._logger.log(f"Knowledge tools not available: {e}", "dim")
@@ -1979,8 +2136,8 @@ class Agent:
         # Task management tools
         try:
             from lollmsbot.tools.task_tools import CreateTaskTool, GetTasksTool
-            await self.register_tool(CreateTaskTool(self._openclaw.task_manager))
-            await self.register_tool(GetTasksTool(self._openclaw.task_manager))
+            await self.register_tool(CreateTaskTool(self._simplified_agent.task_manager))
+            await self.register_tool(GetTasksTool(self._simplified_agent.task_manager))
             self._logger.log("✅ Task tools registered", "green", "🔧")
         except Exception as e:
             self._logger.log(f"Task tools not available: {e}", "dim")
@@ -1988,7 +2145,7 @@ class Agent:
         # YouTube analytics tools
         try:
             from lollmsbot.tools.youtube_tools import YouTubeReportTool
-            await self.register_tool(YouTubeReportTool(self._openclaw.youtube_analytics))
+            await self.register_tool(YouTubeReportTool(self._simplified_agent.youtube_analytics))
             self._logger.log("✅ YouTube tools registered", "green", "🔧")
         except Exception as e:
             self._logger.log(f"YouTube tools not available: {e}", "dim")
@@ -1996,7 +2153,7 @@ class Agent:
         # Business analysis tools
         try:
             from lollmsbot.tools.business_tools import BusinessReportTool
-            await self.register_tool(BusinessReportTool(self._openclaw.business_council))
+            await self.register_tool(BusinessReportTool(self._simplified_agent.business_council))
             self._logger.log("✅ Business analysis tools registered", "green", "🔧")
         except Exception as e:
             self._logger.log(f"Business tools not available: {e}", "dim")
@@ -2009,12 +2166,6 @@ class Agent:
 
 # Re-export for convenience
 from lollmsbot.agent.integrated_document_agent import IntegratedDocumentAgent
-from lollmsbot.agent.project_memory import (
-    ProjectMemoryManager,
-    Project,
-    MemorySegment,
-    ProjectStatus,
-)
 
 # simplified_agent-style exports
 from lollmsbot.agent.simplified_agant_style import (

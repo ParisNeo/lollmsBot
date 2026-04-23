@@ -61,7 +61,7 @@ class CodeExtension:
     """
     A self-written extension created by the agent.
     
-    OpenClaw-style: The agent writes Python code to add functionality.
+    SimplifiedAgantIntegration-style: The agent writes Python code to add functionality.
     Extensions are stored as Python modules and can be hot-reloaded.
     """
     name: str
@@ -99,7 +99,7 @@ class SessionBranch:
     """
     A branch in the session tree for experimentation.
     
-    OpenClaw feature: Tree-structured sessions allow trying things
+    SimplifiedAgantIntegration feature: Tree-structured sessions allow trying things
     without polluting the main conversation context.
     """
     branch_id: str
@@ -132,7 +132,7 @@ class SessionBranch:
 
 class MinimalToolSet:
     """
-    OpenClaw's minimal 4-tool philosophy.
+    SimplifiedAgantIntegration's minimal 4-tool philosophy.
     
     Instead of many specialized tools, provide just the essentials
     that can be composed to achieve any task.
@@ -179,7 +179,7 @@ class MinimalToolSet:
         """Generate instructions for the minimal tool set."""
         lines = [
             "╔══════════════════════════════════════════════════════════════════╗",
-            "║  MINIMAL TOOL SET - OpenClaw Style                              ║",
+            "║  MINIMAL TOOL SET - SimplifiedAgantIntegration Style                              ║",
             "╠══════════════════════════════════════════════════════════════════╣",
             "",
             "You have exactly 4 tools. All tasks must be accomplished",
@@ -213,7 +213,7 @@ class MinimalToolSet:
             "",
             "Then reload extensions with: /reload",
             "",
-            "This is how OpenClaw works - you write your own tools!",
+            "This is how SimplifiedAgantIntegration works - you write your own tools!",
             "",
         ])
         
@@ -222,7 +222,7 @@ class MinimalToolSet:
 
 class SimplifiedAgantStyle:
     """
-    Main class implementing OpenClaw-style architecture.
+    Main class implementing SimplifiedAgantIntegration-style architecture.
     
     Features:
     - Minimal 4-tool mode
@@ -367,7 +367,7 @@ class SimplifiedAgantStyle:
         """
         Create a new self-written extension.
         
-        OpenClaw style: The agent writes Python code that becomes a tool.
+        SimplifiedAgantIntegration style: The agent writes Python code that becomes a tool.
         """
         # Validate name
         name = re.sub(r'[^\w]', '_', name.lower())
@@ -441,7 +441,7 @@ class SimplifiedAgantStyle:
         """
         Hot reload extensions without restarting.
         
-        OpenClaw feature: Extensions can be reloaded on the fly.
+        SimplifiedAgantIntegration feature: Extensions can be reloaded on the fly.
         """
         reloaded = []
         failed = []
@@ -508,7 +508,7 @@ class SimplifiedAgantStyle:
         """
         Create a new branch for experimentation.
         
-        OpenClaw feature: Tree-structured sessions allow safe experimentation.
+        SimplifiedAgantIntegration feature: Tree-structured sessions allow safe experimentation.
         """
         branch_id = f"branch_{hashlib.sha256(f'{summary}{time.time()}'.encode()).hexdigest()[:12]}"
         
@@ -750,14 +750,14 @@ class SimplifiedAgantStyle:
     
     def get_skill_instructions(self) -> str:
         """
-        Explain Skills vs Tools distinction (OpenClaw concept).
+        Explain Skills vs Tools distinction (SimplifiedAgantIntegration concept).
         
         Tools: Loaded into LLM context (for the AI to use)
         Skills: Agent-maintained functionality (no context overhead)
         """
         return """
 ╔══════════════════════════════════════════════════════════════════╗
-║  SKILLS vs TOOLS - OpenClaw Architecture                        ║
+║  SKILLS vs TOOLS - SimplifiedAgantIntegration Architecture                        ║
 ╠══════════════════════════════════════════════════════════════════╣
 
 TOOLS (LLM Context):
@@ -783,7 +783,7 @@ When you need new functionality:
   2. Can it be a Skill? → Agent manages it internally
   3. Complex? → Compose Tools + Skills
 
-The agent writes Skills through code - this is the OpenClaw way!
+The agent writes Skills through code - this is the SimplifiedAgantIntegration way!
         """.strip()
     
     # ========== INTEGRATION WITH AGENT ==========
@@ -793,7 +793,7 @@ The agent writes Skills through code - this is the OpenClaw way!
         lines = [
             "",
             "=" * 70,
-            "SIMPLIFIEDAGANT MODE ACTIVE - OpenClaw Architecture",
+            "SIMPLIFIEDAGANT MODE ACTIVE - SimplifiedAgantIntegration Architecture",
             "=" * 70,
             "",
             MinimalToolSet.get_tool_instructions(),

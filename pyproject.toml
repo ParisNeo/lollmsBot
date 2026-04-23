@@ -2,7 +2,7 @@
 name = "lollmsbot"
 version = "0.0.4"
 description = "LoLLMS-based personal AI assistant"
-authors = [{ name = "Your Name" }]
+authors = [{ name = "ParisNeo" }]
 requires-python = ">=3.10"
 dependencies = [
     "lollms-client>=1.11.4",   # LoLLMS client[web:41]

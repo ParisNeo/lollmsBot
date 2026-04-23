@@ -30,9 +30,9 @@ try:
     from lollmsbot.tools.task_tools import CreateTaskTool, GetTasksTool
     from lollmsbot.tools.youtube_tools import YouTubeReportTool
     from lollmsbot.tools.business_tools import BusinessReportTool
-    OPENCLAW_TOOLS_AVAILABLE = True
+    SIMPLIFIED_AGENT_INTEGRATION_TOOLS_AVAILABLE = True
 except ImportError:
-    OPENCLAW_TOOLS_AVAILABLE = False
+    SIMPLIFIED_AGENT_INTEGRATION_TOOLS_AVAILABLE = False
 
 class ToolRegistry:
     """Dynamic registry for tool registration and discovery.
@@ -168,7 +168,7 @@ __all__ = [
 ]
 
 
-if OPENCLAW_TOOLS_AVAILABLE:
+if SIMPLIFIED_AGENT_INTEGRATION_TOOLS_AVAILABLE:
     __all__.extend([
         "CRMQueryTool",
         "MeetingPrepTool",

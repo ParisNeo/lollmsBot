@@ -17,7 +17,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request, status, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse, JSONResponse
+from fastapi.responses import RedirectResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from rich.console import Console
@@ -107,12 +107,8 @@ async def get_agent() -> Agent:
                     console.print(f"[green]✅ Document management initialized with {len(writing_tools)} writing tools[/]")
                     console.print(f"[dim]   Available tools: {', '.join(t.name for t in writing_tools)}[/]")
                 
-                # Log all registered tools
-                console.print(f"[dim]   Total agent tools: {len(_agent.tools)}[/]")
-                console.print(f"[dim]   Tool names: {', '.join(_agent.tools.keys())}[/]")
-                
-                console.print(f"[green]✅ Agent initialized: {_agent.name}[/]")
-                console.print(f"[dim]   Environment: {_agent._environment_detector.get_summary() if _agent.environment_info else 'unknown'}[/]")
+        init_summary = f"[bold green]✓ {_agent.name} Ready[/bold green] [dim]({len(_agent.tools)} tools)[/dim]"
+        console.print(init_summary)
     return _agent
 
 # ========== SHARED LOLLMS CLIENT ==========
@@ -154,7 +150,7 @@ def _get_config(service: str, key: str, env_name: str, default: Any = None) -> A
 # Security settings
 DEFAULT_HOST = "127.0.0.1"
 HOST = _get_config("lollmsbot", "host", "LOLLMSBOT_HOST", DEFAULT_HOST)
-PORT = int(_get_config("lollmsbot", "port", "LOLLMSBOT_PORT", "8800"))
+PORT = int(_get_config("lollmsbot", "port", "LOLLMSBOT_PORT", "9600"))
 API_KEY = _get_config("lollmsbot", "api_key", "LOLLMSBOT_API_KEY", None)
 
 if HOST not in ("127.0.0.1", "localhost", "::1") and not API_KEY:
@@ -725,7 +721,22 @@ async def chat(req: ChatReq):
         file_downloads=file_downloads,
     )
 
-# ========== DOCUMENT MANAGEMENT ENDPOINTS ==========
+@app.post("/chat/stream", dependencies=[Depends(require_auth)])
+async def chat_stream(req: ChatReq):
+    """Process a chat message with real-time streaming and tool notifications."""
+    agent = await get_agent()
+
+    async def event_generator():
+        async for chunk in agent.chat_stream(
+            user_id=req.user_id or "anonymous",
+            message=req.message,
+            context={"channel": "gateway_streaming", "source": "api"},
+        ):
+            yield json.dumps(chunk) + "\n"
+
+    return StreamingResponse(event_generator(), media_type="application/x-ndjson")
+
+    # ========== DOCUMENT MANAGEMENT ENDPOINTS ==========
 
 @app.get("/documents")
 async def list_documents():
@@ -1084,9 +1095,13 @@ async def lifespan(app_: FastAPI):
             box=box.DOUBLE
         ))
     
-    # Initialize shared Agent (this triggers async initialization with env detection)
-    # This also initializes document manager and ALL tools including writing tools
+    # Initialize the Sovereign Brain
     agent = await get_agent()
+
+    # NEW: Link Dreaming to Gateway Lifespan
+    from lollmsbot.agent.dreaming import DreamEngine
+    dreamer = DreamEngine(agent._memory)
+    console.print("[dim]🌙 Dreaming Engine linked to Hub life-cycle[/dim]")
 
     # NEW: Initialize power management before heartbeat (so it stays awake during long operations)
     from lollmsbot.power_management import get_power_manager
@@ -1108,8 +1123,8 @@ async def lifespan(app_: FastAPI):
         heartbeat = get_heartbeat()
         
         # Connect SimplifiedAgant integration to heartbeat if available
-        if hasattr(agent, '_openclaw') and agent._openclaw:
-            heartbeat.set_openclaw_integration(agent._openclaw)
+        if hasattr(agent, '_simplified_agent') and agent._simplified_agent:
+            heartbeat.set_simplified_agent_integration_integration(agent._simplified_agent)
             console.print("[dim]  💓 SimplifiedAgant workflow connected to heartbeat[/]")
         
         if heartbeat.config.enabled:
@@ -1177,6 +1192,16 @@ async def lifespan(app_: FastAPI):
     
     global _active_channels, _channel_tasks, _agent, _document_manager
     
+    # NEW: Register SimplifiedAgant components if available
+    try:
+        from lollmsbot.agent.simplified_agant_integration import integrate_simplified_agant
+        integration, oc_tool = await integrate_simplified_agant(agent)
+        await agent.register_tool(oc_tool)
+        agent._simplified_agent = integration
+        console.print("[green]✅ SimplifiedAgant integration active (read/write/edit/bash)[/]")
+    except ImportError as e:
+        console.print(f"[yellow]⚠️ SimplifiedAgant tools partially unavailable: {e}[/]")
+
     # Discord with full agent capabilities
     if "discord" in DISABLED_CHANNELS:
         console.print("[dim]ℹ️  Discord disabled via LOLLMSBOT_DISABLE_CHANNELS[/]")
@@ -1382,16 +1407,30 @@ async def lifespan(app_: FastAPI):
     else:
         console.print("[dim]ℹ️  Slack disabled (no SLACK_BOT_TOKEN)[/]")
     
+    # AI Brain Detailed Summary
+    brain_settings = LollmsSettings.from_env()
+    # Explicitly log to console for debugging context window issues
+    logger.info(f"AI Brain initialized: Binding={brain_settings.binding_name}, Model={brain_settings.model_name}, Context={brain_settings.context_size}")
+
+    brain_table = Table(show_header=False, box=box.ROUNDED, border_style="bright_magenta", title="[bold magenta]🧠 AI Brain Configuration[/bold magenta]")
+    brain_table.add_row("Binding", f"[bold cyan]{brain_settings.binding_name or 'lollms'}[/]")
+    brain_table.add_row("Server URL", f"[white]{brain_settings.host_address}[/]")
+    brain_table.add_row("Model", f"[bold green]{brain_settings.model_name or 'Default'}[/]")
+    brain_table.add_row("Context Window", f"[yellow]{brain_settings.context_size or 'Unknown'} tokens[/]")
+    console.print(brain_table)
+
     # Summary
     console.print(f"[bold green]📊 Active channels: {len(_active_channels)}[/]")
     console.print(f"[bold green]🤖 Agent: {agent.name} ({len(agent.tools)} tools)[/]")
     if _document_manager:
         doc_count = len(_document_manager.list_documents())
         console.print(f"[bold green]📚 Documents: {doc_count} indexed[/]")
+
     if lollms_client:
-        console.print(f"[bold green]🔗 LoLLMS: Connected ({LollmsSettings.from_env().host_address})[/]")
+        console.print(f"[bold green]🔗 Connection Status: [ONLINE][/]")
     else:
-        console.print(f"[yellow]⚠️  LoLLMS: Not connected - tools will work but chat uses fallback mode[/]")
+        console.print(f"[bold red]❌ Connection Status: [OFFLINE][/]")
+        console.print(f"[yellow]⚠️  Warning: Chat requires an active LLM backend.[/]")
     
     # NEW: Power management status
     from lollmsbot.power_management import get_power_manager

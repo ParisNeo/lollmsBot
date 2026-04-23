@@ -155,7 +155,7 @@ def main(argv: List[str] | None = None) -> None:
         description="Start the main API gateway with optional channels and UI"
     )
     gateway_parser.add_argument("--host", type=str, default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
-    gateway_parser.add_argument("--port", type=int, default=8800, help="Port number (default: 8800)")
+    gateway_parser.add_argument("--port", type=int, default=9600, help="Port number (default: 9600)")
     gateway_parser.add_argument("--ui", action="store_true", help="Also start web UI at /ui")
     gateway_parser.add_argument("--debug", action="store_true", help="Enable debug mode with rich memory display")
 
@@ -298,7 +298,7 @@ def main(argv: List[str] | None = None) -> None:
             run_console_chat(
                 config=config,
                 verbose=args.verbose,
-                openclaw_mode=args.simplified_agant,
+                simplified_agent_integration_mode=args.simplified_agant,
             )
             
         elif args.command == "channels":

@@ -982,13 +982,12 @@ def get_search_tools(config: Optional[Dict[str, Any]] = None) -> List[Tool]:
     
     if has_providers:
         tools.append(InternetSearchTool(search_manager))
-    
+
     # Log what we're returning
     import logging
     logger = logging.getLogger(__name__)
     logger.info(f"get_search_tools returning {len(tools)} tool(s): {[t.name for t in tools]}")
     logger.info(f"  - DDGS_AVAILABLE: {DDGS_AVAILABLE}")
     logger.info(f"  - has_providers: {has_providers}")
-    
+
     return tools
-```

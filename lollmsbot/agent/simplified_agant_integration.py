@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 class SimplifiedAgantTool(Tool):
     """
-    Unified tool for all OpenClaw-style operations.
+    Unified tool for all SimplifiedAgantIntegration-style operations.
     
     Single tool that handles: read, write, edit, bash, extension management,
     and session branching.
@@ -28,7 +28,7 @@ class SimplifiedAgantTool(Tool):
     
     name: str = "simplified_agant"
     description: str = (
-        "OpenClaw-style unified tool for minimal operations and extension management. "
+        "SimplifiedAgantIntegration-style unified tool for minimal operations and extension management. "
         "Operations: read, write, edit, bash, create_extension, list_extensions, "
         "reload_extensions, create_branch, switch_branch, get_branches."
     )
@@ -63,7 +63,7 @@ class SimplifiedAgantTool(Tool):
         self._style = style
     
     async def execute(self, operation: str, args: Optional[Dict[str, Any]] = None, **kwargs) -> ToolResult:
-        """Execute OpenClaw-style operation."""
+        """Execute SimplifiedAgantIntegration-style operation."""
         if self._style is None:
             return ToolResult(
                 success=False,
@@ -363,7 +363,7 @@ class SimplifiedAgantTool(Tool):
 
 class SimplifiedAgantIntegration:
     """
-    High-level integration for OpenClaw-style features.
+    High-level integration for SimplifiedAgantIntegration-style features.
     
     Manages:
     - Daily workflows (YouTube, CRM, Business Analysis)
@@ -376,16 +376,27 @@ class SimplifiedAgantIntegration:
         self.agent = agent
         self.style: Optional[Any] = None
         self.tool: Optional[SimplifiedAgantTool] = None
-        
+
         # Workflow components (lazy loaded)
         self._youtube: Optional[Any] = None
         self._crm: Optional[Any] = None
         self._business_council: Optional[Any] = None
         self._knowledge_base: Optional[Any] = None
         self._task_manager: Optional[Any] = None
+
+    @property
+    def crm(self): return self._crm
+    @property
+    def youtube_analytics(self): return self._youtube
+    @property
+    def business_council(self): return self._business_council
+    @property
+    def knowledge_base(self): return self._knowledge_base
+    @property
+    def task_manager(self): return self._task_manager
     
     async def initialize(self) -> None:
-        """Initialize OpenClaw-style components."""
+        """Initialize SimplifiedAgantIntegration-style components."""
         from lollmsbot.agent.simplified_agant_style import SimplifiedAgantStyle
         
         self.style = SimplifiedAgantStyle(
@@ -413,17 +424,11 @@ class SimplifiedAgantIntegration:
             return self.style.get_system_prompt_addon()
         return ""
     
-    # ========== DAILY WORKFLOW (OpenClaw-style automation) ==========
+    # ========== DAILY WORKFLOW (SimplifiedAgantIntegration-style automation) ==========
     
     async def daily_workflow(self) -> Dict[str, Any]:
         """
-        Execute daily OpenClaw-style workflow.
-        
-        Inspired by OpenClaw's autonomous capabilities:
-        1. Check YouTube analytics
-        2. Process CRM tasks
-        3. Run business analysis
-        4. Update knowledge base
+        Execute daily SimplifiedAgantIntegration-style workflow.
         """
         results = {
             "steps_completed": [],
@@ -432,20 +437,15 @@ class SimplifiedAgantIntegration:
             "business_analysis": None,
             "errors": [],
         }
-        
-        # Step 1: YouTube Analytics (if available)
+
+        # Ensure managers are initialized
+        await self._ensure_managers()
+
+        # Step 1: YouTube Analytics
         try:
-            if self._youtube is None:
-                try:
-                    from lollmsbot.youtube_analytics import YouTubeAnalyticsManager
-                    self._youtube = YouTubeAnalyticsManager(
-                        memory_manager=self.agent._memory if self.agent else None
-                    )
-                except ImportError:
-                    pass
-            
             if self._youtube:
-                snapshot = await self._youtube.get_channel_snapshot()
+                # Use daily ingestion instead of snapshot if snapshot method is missing
+                snapshot = await self._youtube.ingest_daily_analytics()
                 results["youtube_snapshot"] = snapshot
                 results["steps_completed"].append("youtube_analytics")
         except Exception as e:
@@ -453,60 +453,81 @@ class SimplifiedAgantIntegration:
         
         # Step 2: CRM Tasks (if available)
         try:
-            if self._crm is None:
-                try:
-                    from lollmsbot.crm import CRMManager
-                    self._crm = CRMManager(
-                        memory_manager=self.agent._memory if self.agent else None
-                    )
-                except ImportError:
-                    pass
-            
+            # CRMManager is initialized via _ensure_managers()
             if self._crm:
-                tasks = await self._crm.get_today_tasks()
-                results["crm_tasks"] = tasks
+                # Use get_daily_digest for the summary if get_today_tasks is not present
+                tasks_summary = await self._crm.get_daily_digest()
+                results["crm_tasks"] = tasks_summary
                 results["steps_completed"].append("crm_tasks")
         except Exception as e:
             results["errors"].append(f"CRM: {str(e)}")
         
         # Step 3: Business Analysis (if available)
         try:
-            if self._business_council is None:
-                try:
-                    from lollmsbot.business_analysis import BusinessAnalysisCouncil
-                    self._business_council = BusinessAnalysisCouncil(
-                        memory_manager=self.agent._memory if self.agent else None
-                    )
-                except ImportError:
-                    pass
-            
             if self._business_council:
-                analysis = await self._business_council.generate_daily_report()
+                # Actual method is run_council_analysis, which returns a CouncilReport
+                analysis = await self._business_council.run_council_analysis(period_days=1)
                 results["business_analysis"] = analysis
                 results["steps_completed"].append("business_analysis")
         except Exception as e:
             results["errors"].append(f"Business: {str(e)}")
         
+        # Step 3: Business Analysis (if available)
+        try:
+            # Managers are initialized at start of daily_workflow via _ensure_managers()
+            if self._business_council:
+                # Actual method is run_council_analysis, not generate_daily_report
+                analysis = await self._business_council.run_council_analysis(period_days=1)
+                results["business_analysis"] = analysis
+                results["steps_completed"].append("business_analysis")
+        except Exception as e:
+            results["errors"].append(f"Business: {str(e)}")
+
         # Step 4: Knowledge Base Update (if available)
         try:
-            if self._knowledge_base is None:
-                try:
-                    from lollmsbot.knowledge_base import KnowledgeBaseManager
-                    self._knowledge_base = KnowledgeBaseManager(
-                        memory_manager=self.agent._memory if self.agent else None
-                    )
-                except ImportError:
-                    pass
-            
             if self._knowledge_base:
-                # Ingest any pending sources
-                ingested = await self._knowledge_base.process_pending()
-                results["steps_completed"].append(f"knowledge_base ({ingested} items)")
+                # Ingest any pending sources (e.g. from auto-monitored feeds)
+                # Note: process_pending is a placeholder for actual knowledge iteration
+                if hasattr(self._knowledge_base, 'process_pending'):
+                    ingested = await self._knowledge_base.process_pending()
+                    results["steps_completed"].append(f"knowledge_base ({ingested} items)")
+                else:
+                    results["steps_completed"].append("knowledge_base (checked)")
         except Exception as e:
             results["errors"].append(f"Knowledge: {str(e)}")
         
         return results
     
+    async def _ensure_managers(self):
+        """Initialize all sub-managers if not already done."""
+        if not self.agent or not self.agent._memory:
+            return
+
+        if self._crm is None:
+            from lollmsbot.crm import CRMManager
+            self._crm = CRMManager(self.agent._memory)
+            await self._crm.initialize()
+
+        if self._youtube is None:
+            from lollmsbot.youtube_analytics import YouTubeAnalyticsManager
+            self._youtube = YouTubeAnalyticsManager(self.agent._memory)
+            await self._youtube.initialize()
+
+        if self._knowledge_base is None:
+            from lollmsbot.knowledge_base import KnowledgeBaseManager
+            self._knowledge_base = KnowledgeBaseManager(self.agent._memory)
+            await self._knowledge_base.initialize()
+
+        if self._task_manager is None:
+            from lollmsbot.task_manager import TaskManager
+            self._task_manager = TaskManager(self.agent._memory, self._crm)
+            await self._task_manager.initialize()
+
+        if self._business_council is None:
+            from lollmsbot.business_analysis import BusinessAnalysisCouncil
+            self._business_council = BusinessAnalysisCouncil(self.agent._memory)
+            await self._business_council.initialize()
+
     def get_branch_tree_display(self) -> str:
         """Get formatted branch tree for display."""
         if not self.style:
@@ -535,12 +556,13 @@ class SimplifiedAgantIntegration:
 
 
 # Integration helper
-def integrate_simplified_agant(agent: Any) -> Tuple[SimplifiedAgantIntegration, SimplifiedAgantTool]:
+async def integrate_simplified_agant(agent: Any) -> Tuple[SimplifiedAgantIntegration, SimplifiedAgantTool]:
     """
-    Integrate OpenClaw-style features into LollmsBot Agent.
-    
+    Integrate SimplifiedAgantIntegration-style features into LollmsBot Agent.
+
     Returns:
         Tuple of (integration, tool) for registration
     """
     integration = SimplifiedAgantIntegration(agent)
+    await integration.initialize()
     return integration, integration.get_tool()

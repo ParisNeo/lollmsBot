@@ -81,42 +81,46 @@ class RLMDatabase:
         """Check if database has correct schema, delete if not."""
         if not self.db_path.exists():
             return
-        
+
+        should_delete = False
+        reason = ""
+
         try:
             # Try to open and check schema
-            conn = await aiosqlite.connect(str(self.db_path))
-            
-            # Check if memory_chunks table exists and has correct columns
-            async with conn.execute("PRAGMA table_info(memory_chunks)") as cursor:
-                columns = {row[1]: row for row in await cursor.fetchall()}
-                
-                # Check if the critical column exists
-                has_content_compressed = "content_compressed" in columns
-                has_content = "content" in columns
-                
-                if has_content and not has_content_compressed:
-                    # Old schema detected - close and delete
-                    await conn.close()
-                    logger.warning("Old database schema detected (content column). Deleting and recreating...")
-                    self.db_path.unlink()  # Delete the file
-                    return
-                elif not has_content_compressed:
-                    # Missing critical column
-                    await conn.close()
-                    logger.warning("Corrupted database schema (missing content_compressed). Deleting and recreating...")
-                    self.db_path.unlink()
-                    return
-            
-            await conn.close()
-            
+            async with aiosqlite.connect(str(self.db_path)) as conn:
+                # Check if memory_chunks table exists
+                async with conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='memory_chunks'") as cursor:
+                    if not await cursor.fetchone():
+                        # Table doesn't exist, this is fine (new DB)
+                        return
+
+                # Check if memory_chunks table has correct columns
+                async with conn.execute("PRAGMA table_info(memory_chunks)") as cursor:
+                    columns = {row[1]: row for row in await cursor.fetchall()}
+
+                    # Check if the critical column exists
+                    has_content_compressed = "content_compressed" in columns
+                    has_content = "content" in columns
+
+                    if has_content and not has_content_compressed:
+                        should_delete = True
+                        reason = "Old database schema detected (content column)."
+                    elif not has_content_compressed:
+                        should_delete = True
+                        reason = "Corrupted database schema (missing content_compressed)."
+
+            if should_delete:
+                logger.warning(f"{reason} Deleting and recreating...")
+                self.db_path.unlink()
+
         except Exception as e:
-            # Database might be corrupted
-            logger.warning(f"Database check failed: {e}. Will attempt to recreate...")
+            # Database might be corrupted or locked
+            logger.warning(f"Database integrity check failed: {e}. Will attempt to recreate if possible...")
             try:
                 if self.db_path.exists():
                     self.db_path.unlink()
-            except:
-                pass
+            except Exception as unlink_err:
+                logger.error(f"Failed to delete corrupted database: {unlink_err}")
     
     async def _create_schema(self) -> None:
         """Create database tables and indexes (safe for existing databases)."""
